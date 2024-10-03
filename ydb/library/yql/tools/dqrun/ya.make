@@ -99,6 +99,9 @@ ENDIF()
         ydb/core/external_sources
 
         ydb/library/yql/udfs/common/clickhouse/client
+        ydb/library/yql/udfs/common/yson2
+        ydb/library/yql/udfs/common/json2
+        ydb/library/yql/udfs/common/json
     )
 
     YQL_LAST_ABI_VERSION()

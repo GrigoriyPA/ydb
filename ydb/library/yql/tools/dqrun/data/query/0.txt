@@ -1,7 +1,7 @@
 -- pragma UseBlocks="true";
 -- pragma config.flags("LLVM", "ON");
 PRAGMA dq.MaxTasksPerStage="1";
-$match = SELECT *
+/*$match = */SELECT *
 FROM pq.`match`
 WITH (
     FORMAT=json_each_row,
@@ -12,5 +12,5 @@ WITH (
 )
 WHERE c0 == "swiqjaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-INSERT INTO pq.`match`
-SELECT ToBytes(Unwrap(Yson::SerializeJson(Yson::From(TableRow())))) FROM $match;
+-- INSERT INTO pq.`match`
+-- SELECT ToBytes(Unwrap(Yson::SerializeJson(Yson::From(TableRow())))) FROM $match;

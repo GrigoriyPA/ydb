@@ -79,7 +79,7 @@ private:
 
 class TFileTopicReadSession : public NYdb::NTopic::IReadSession {
 
-constexpr static auto FILE_POLL_PERIOD = TDuration::MilliSeconds(5);    
+constexpr static auto FILE_POLL_PERIOD = TDuration::MilliSeconds(10000);    
 
 public:
     TFileTopicReadSession(TFile file, NYdb::NTopic::TPartitionSession::TPtr session, const TString& producerId = ""): 
@@ -184,7 +184,9 @@ private:
             TVector<TMessage> msgs;
             size_t size = 0;
 
-            ui64 maxBatchRowSize = 100;
+            auto start = TInstant::Now();
+            ui64 maxBatchRowSize = 2200001;
+            msgs.reserve(2200001);
             while (size_t read = fi.ReadLine(rawMsg)) {
                 msgs.emplace_back(MakeNextMessage(rawMsg));
                 MsgOffset_++;
@@ -194,7 +196,9 @@ private:
                 size += rawMsg.size();
             }
             if (!msgs.empty()) {
+                Cerr << "---------------------------------- Readed batch: " << msgs.size() << ", spent time: " << (TInstant::Now() - start).SecondsFloat() << Endl;
                 EventsQ_.Push(NYdb::NTopic::TReadSessionEvent::TDataReceivedEvent(msgs, {}, Session_), size);
+                continue;
             }
 
             Sleep(FILE_POLL_PERIOD);

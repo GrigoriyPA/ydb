@@ -133,6 +133,7 @@ private:
 
         TTopicSession& Self;
         const TString& LogPrefix;    
+        inline static TInstant Start = TInstant::Now();
     };
 
     const TString TopicPath;
@@ -380,15 +381,15 @@ void TTopicSession::Handle(NFq::TEvPrivate::TEvDataParsed::TPtr& ev) {
         LOG_ROW_DISPATCHER_TRACE("v " << v);
     }
 
-    // static int counter = 0;
-    // counter++;
-    // if (counter % 100000 == 0 || counter >= 2100000) {
-    //     Cerr << "Counter: " << counter << Endl;
-    // }
-    
-    // if (counter != 2200000) {
-    //     return;
-    // }
+    static int counter = 0;
+    counter++;
+    if (counter % 1 == 0) {
+        Cerr << "---------------------------------- TEvDataParsed, counter: " << counter << ", time: " << TInstant::Now() << Endl;
+    }
+
+    if (counter != 2200000) {
+        return;
+    }
 
     for (auto& [actorId, info] : Clients) {
         try {
@@ -487,6 +488,13 @@ void TTopicSession::CloseTopicSession() {
 }
 
 void TTopicSession::TTopicEventProcessor::operator()(NYdb::NTopic::TReadSessionEvent::TDataReceivedEvent& event) {
+    static bool started = false;
+
+    if (!started) {
+        started = true;
+        Cerr << "---------------------------------- Started, intialization time: " << (TInstant::Now() - Start).SecondsFloat() << ", time: " << TInstant::Now() << Endl;
+    }
+
     Self.Metrics.RowsRead->Add(event.GetMessages().size());
     for (const auto& message : event.GetMessages()) {
         const TString& data = message.GetData();
@@ -561,10 +569,10 @@ void TTopicSession::SendToParsing(ui64 offset, const TString& message) {
 
     // static int counter = 0;
     // counter++;
-    // if (counter % 100000 == 0 || counter >= 2100000) {
-    //     Cerr << "Counter: " << counter << Endl;
+    // if (counter % 100000 == 0) {
+    //     Cerr << "---------------------------------- SendToParsing, counter: " << counter << ", time: " << TInstant::Now() << Endl;
     // }
-    
+
     // if (counter != 2200000) {
     //     return;
     // }
