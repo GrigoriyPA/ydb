@@ -744,6 +744,10 @@ bool IsKikimrPureNode(const TExprNode::TPtr& node) {
         return true;
     }
 
+    if (TMaybeNode<TCoCons>(node)) {
+        return true;
+    }
+
     if (TMaybeNode<TCoDataSource>(node) ||
         TMaybeNode<TCoDataSink>(node))
     {
