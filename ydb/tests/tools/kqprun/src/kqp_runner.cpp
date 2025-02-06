@@ -11,6 +11,7 @@
 #include <ydb/public/lib/ydb_cli/common/format.h>
 #include <ydb/public/lib/ydb_cli/common/plan2svg.h>
 
+using namespace NKikimrRun;
 
 namespace NKqpRun {
 
@@ -242,7 +243,7 @@ public:
                 if (ResultSets_.size() > 1 && Options_.YdbSettings.VerboseLevel >= EVerbose::Info) {
                     *Options_.ResultOutput << CoutColors_.Cyan() << "Result set " << i + 1 << ":" << CoutColors_.Default() << Endl;
                 }
-                PrintScriptResult(ResultSets_[i]);
+                PrintResultSet(Options_.ResultOutputFormat, *Options_.ResultOutput, ResultSets_[i]);
             }
         }
     }
@@ -407,36 +408,6 @@ private:
             ExecutionMeta_.Plan = plan;
             PrintScriptProgress(queryId, plan);
         };
-    }
-
-    void PrintScriptResult(const Ydb::ResultSet& resultSet) const {
-        switch (Options_.ResultOutputFormat) {
-        case TRunnerOptions::EResultOutputFormat::RowsJson: {
-            NYdb::TResultSet result(resultSet);
-            NYdb::TResultSetParser parser(result);
-            while (parser.TryNextRow()) {
-                NJsonWriter::TBuf writer(NJsonWriter::HEM_UNSAFE, Options_.ResultOutput);
-                writer.SetWriteNanAsString(true);
-                NYdb::FormatResultRowJson(parser, result.GetColumnsMeta(), writer, NYdb::EBinaryStringEncoding::Unicode);
-                *Options_.ResultOutput << Endl;
-            }
-            break;
-        }
-
-        case TRunnerOptions::EResultOutputFormat::FullJson:
-            resultSet.PrintJSON(*Options_.ResultOutput);
-            *Options_.ResultOutput << Endl;
-            break;
-
-        case TRunnerOptions::EResultOutputFormat::FullProto:
-            TString resultSetString;
-            google::protobuf::TextFormat::Printer printer;
-            printer.SetSingleLineMode(false);
-            printer.SetUseUtf8StringEscaping(true);
-            printer.PrintToString(resultSet, &resultSetString);
-            *Options_.ResultOutput << resultSetString;
-            break;
-        }
     }
 
     void PrintScriptFinish(const TQueryMeta& meta, const TString& queryType) const {
