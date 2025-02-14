@@ -591,7 +591,7 @@ NActors::IActor* CreatePendingFetcher(
         tenantName,
         monitoring,
         std::move(s3ActorsFactory),
-        defaultPqGateway);
+        std::move(defaultPqGateway));
 }
 
 TActorId MakePendingFetcherId(ui32 nodeId) {
