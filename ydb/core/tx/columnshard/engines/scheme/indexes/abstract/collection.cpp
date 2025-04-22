@@ -1,12 +1,12 @@
 #include "collection.h"
 #include "meta.h"
 
-#include <ydb/core/tx/columnshard/engines/storage/indexes/portions/meta.h>
+#include <ydb/core/tx/columnshard/engines/storage/indexes/skip_index/meta.h>
 
 namespace NKikimr::NOlap::NIndexes {
 
 std::shared_ptr<IIndexMeta> TIndexesCollection::FindIndexFor(
-    const NRequest::TOriginalDataAddress& address, const NArrow::NSSA::EIndexCheckOperation op) const {
+    const NRequest::TOriginalDataAddress& address, const NArrow::NSSA::TIndexCheckOperation& op) const {
     auto it = IndexByOriginalData.find(address);
     if (it == IndexByOriginalData.end()) {
         return nullptr;

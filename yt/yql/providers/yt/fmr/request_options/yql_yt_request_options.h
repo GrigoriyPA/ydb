@@ -1,5 +1,6 @@
 #pragma once
 
+#include <library/cpp/yson/node/node.h>
 #include <util/digest/numeric.h>
 #include <util/generic/maybe.h>
 #include <util/generic/string.h>
@@ -40,12 +41,19 @@ enum class EFmrComponent {
     Job
 };
 
+enum class EFmrErrorReason {
+    ReasonUnknown,
+    UserError  // TODO Add more reasons
+};
+
 struct TFmrError {
     EFmrComponent Component;
+    EFmrErrorReason Reason;
     TString ErrorMessage;
     TMaybe<ui32> WorkerId;
     TMaybe<TString> TaskId;
     TMaybe<TString> OperationId;
+    TMaybe<TString> JobId;
 };
 
 struct TError {
@@ -55,11 +63,25 @@ struct TError {
 struct TYtTableRef {
     TString Path;
     TString Cluster;
+    TMaybe<TString> FilePath = Nothing();
+
     bool operator == (const TYtTableRef&) const = default;
 };
 
+struct TFmrTableId {
+    TString Id;
+
+    TFmrTableId() = default;
+
+    TFmrTableId(const TString& id);
+
+    TFmrTableId(const TString& cluster, const TString& path);
+
+    bool operator == (const TFmrTableId&) const = default;
+};
+
 struct TFmrTableRef {
-    TString TableId;
+    TFmrTableId FmrTableId;
 };
 
 struct TTableRange {
@@ -98,6 +120,14 @@ struct TTableStats {
 } // namespace NYql::NFmr
 
 namespace std {
+
+    template<>
+    struct hash<NYql::NFmr::TFmrTableId> {
+        size_t operator()(const NYql::NFmr::TFmrTableId& tableId) const {
+            return hash<TString>()(tableId.Id);
+        }
+    };
+
     template<>
     struct hash<NYql::NFmr::TFmrTableOutputRef> {
         size_t operator()(const NYql::NFmr::TFmrTableOutputRef& ref) const {
@@ -166,8 +196,8 @@ struct TClusterConnection {
 struct TTask: public TThrRefBase {
     TTask() = default;
 
-    TTask(ETaskType taskType, const TString& taskId, const TTaskParams& taskParams, const TString& sessionId, const TClusterConnection& clusterConnection, ui32 numRetries = 1)
-        : TaskType(taskType), TaskId(taskId), TaskParams(taskParams), SessionId(sessionId), ClusterConnection(clusterConnection), NumRetries(numRetries)
+    TTask(ETaskType taskType, const TString& taskId, const TTaskParams& taskParams, const TString& sessionId, const std::unordered_map<TFmrTableId, TClusterConnection>& clusterConnections, const TMaybe<NYT::TNode> & jobSettings = Nothing(), ui32 numRetries = 1)
+        : TaskType(taskType), TaskId(taskId), TaskParams(taskParams), SessionId(sessionId), ClusterConnections(clusterConnections), JobSettings(jobSettings), NumRetries(numRetries)
     {
     }
 
@@ -175,7 +205,8 @@ struct TTask: public TThrRefBase {
     TString TaskId;
     TTaskParams TaskParams = {};
     TString SessionId;
-    TClusterConnection ClusterConnection = {};
+    std::unordered_map<TFmrTableId, TClusterConnection> ClusterConnections = {};
+    TMaybe<NYT::TNode> JobSettings = {};
     ui32 NumRetries; // Not supported yet
 
     using TPtr = TIntrusivePtr<TTask>;
@@ -196,7 +227,7 @@ struct TTaskState: public TThrRefBase {
 
     using TPtr = TIntrusivePtr<TTaskState>;
 };
-TTask::TPtr MakeTask(ETaskType taskType, const TString& taskId, const TTaskParams& taskParams, const TString& sessionId, const TClusterConnection& clusterConnection = TClusterConnection{});
+TTask::TPtr MakeTask(ETaskType taskType, const TString& taskId, const TTaskParams& taskParams, const TString& sessionId, const std::unordered_map<TFmrTableId, TClusterConnection>& clusterConnections = {}, const TMaybe<NYT::TNode>& jobSettings = Nothing());
 
 TTaskState::TPtr MakeTaskState(ETaskStatus taskStatus, const TString& taskId, const TMaybe<TFmrError>& taskErrorMessage = Nothing(), const TStatistics& stats = TStatistics());
 

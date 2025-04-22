@@ -75,8 +75,8 @@ struct TKikimrSettings {
 
     NCommon::TConfSetting<ui32, false> MaxDPHypDPTableSize;
 
-
     NCommon::TConfSetting<ui32, false> MaxTasksPerStage;
+    NCommon::TConfSetting<ui64, false> DataSizePerPartition;
     NCommon::TConfSetting<ui32, false> MaxSequentialReadsInFlight;
 
     NCommon::TConfSetting<ui32, false> KMeansTreeSearchTopSize;
@@ -158,7 +158,6 @@ struct TKikimrConfiguration : public TKikimrSettings, public NCommon::TSettingDi
     NKikimrConfig::TFeatureFlags FeatureFlags;
 
     bool EnableKqpScanQuerySourceRead = false;
-    bool EnableKqpDataQueryStreamLookup = false;
     bool EnableKqpScanQueryStreamIdxLookupJoin = false;
     bool EnableKqpDataQueryStreamIdxLookupJoin = false;
     NSQLTranslation::EBindingsMode BindingsMode = NSQLTranslation::EBindingsMode::ENABLED;

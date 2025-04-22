@@ -87,6 +87,8 @@ DEFINE_ENUM(ESerializationDumpMode,
     (Checksum)
 );
 
+using TSerializationDumpScopeFilter = std::optional<THashSet<std::string>>;
+
 template <class TKey, class TComparer>
 class TSkipList;
 
@@ -111,8 +113,7 @@ DECLARE_REFCOUNTED_STRUCT(TSingletonsConfig)
 DECLARE_REFCOUNTED_STRUCT(TSingletonsDynamicConfig)
 
 DECLARE_REFCOUNTED_STRUCT(TFairShareHierarchicalSchedulerDynamicConfig)
-
-class TSignalRegistry;
+DECLARE_REFCOUNTED_STRUCT(IFairShareHierarchicalSlotQueueResource)
 
 class TBloomFilterBuilder;
 class TBloomFilter;
@@ -160,6 +161,8 @@ class TSummary;
 
 template <class TTask>
 struct IFairScheduler;
+
+using TFairShareSlotId = TGuid;
 
 template <class TTask>
 using IFairSchedulerPtr = TIntrusivePtr<IFairScheduler<TTask>>;

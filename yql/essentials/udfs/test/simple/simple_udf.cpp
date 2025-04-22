@@ -1,4 +1,4 @@
-#include <util/generic/bt_exception.h>
+#include <util/generic/yexception.h>
 #include <util/generic/hash.h>
 #include <util/string/cast.h>
 #include <yql/essentials/public/udf/udf_helpers.h>
@@ -241,9 +241,9 @@ private:
 
 class TLogging : public TBoxedValue {
 public:
-    TLogging(TLoggerPtr logger)
+    TLogging(TLoggerPtr logger, TLogComponentId component)
         : Logger(logger)
-        , Component(logger->RegisterComponent(Name()))
+        , Component(component)
     {}
 
     TUnboxedValue Run(const IValueBuilder* valueBuilder, const TUnboxedValuePod* args) const final {
@@ -266,8 +266,11 @@ public:
             argBuilder->Add<char*>();
             argBuilder->Done().Returns<TVoid>();
 
+            auto logger = builder.MakeLogger(false);
+            auto component = logger->RegisterComponent(Name());
+            logger->Log(component, ELogLevel::Debug, "DeclareSignature");
             if (!typesOnly) {
-                builder.Implementation(new TLogging(builder.MakeLogger(false)));
+                builder.Implementation(new TLogging(logger, component));
             }
             return true;
         }

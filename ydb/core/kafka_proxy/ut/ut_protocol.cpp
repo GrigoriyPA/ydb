@@ -5,6 +5,7 @@
 #include <ydb/core/kafka_proxy/kafka_messages.h>
 #include <ydb/core/kafka_proxy/kafka_constants.h>
 #include <ydb/core/kafka_proxy/actors/actors.h>
+#include <ydb/core/kafka_proxy/kafka_transactional_producers_initializers.h>
 
 #include <ydb/services/ydb/ydb_common_ut.h>
 #include <ydb/services/ydb/ydb_keys_ut.h>
@@ -131,6 +132,7 @@ public:
         if (enableNativeKafkaBalancing) {
             KikimrServer->GetRuntime()->GetAppData().FeatureFlags.SetEnableKafkaNativeBalancing(true);
         }
+        KikimrServer->GetRuntime()->GetAppData().FeatureFlags.SetEnableKafkaTransactions(true);
 
         TClient client(*(KikimrServer->ServerSettings));
         if (secure) {
@@ -1490,6 +1492,72 @@ Y_UNIT_TEST_SUITE(KafkaProtocol) {
         }
     } // Y_UNIT_TEST(CreatePartitionsScenario)
 
+    Y_UNIT_TEST(DescribeConfigsScenario) {
+        TInsecureTestServer testServer("2");
+
+        TString topic0Name = "/Root/topic-0-test";
+        TString shortTopic0Name = "topic-0-test";
+        TString topic1Name = "/Root/topic-1-test";
+        TString shortTopic1Name = "topic-1-test";
+        TString notExistsTopicName = "/Root/not-exists";
+        //ui64 minActivePartitions = 10;
+
+        NYdb::NTopic::TTopicClient pqClient(*testServer.Driver);
+        {
+            auto result0 = pqClient.CreateTopic(
+                topic0Name,
+                NYdb::NTopic::TCreateTopicSettings().PartitioningSettings(5, 5).RetentionPeriod(TDuration::Hours(10))
+            ).ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL(result0.IsTransportError(), false);
+            UNIT_ASSERT_VALUES_EQUAL_C(result0.GetStatus(), EStatus::SUCCESS, result0.GetIssues().ToString());
+
+            auto result1 = pqClient.CreateTopic(
+                topic1Name,
+                NYdb::NTopic::TCreateTopicSettings().PartitioningSettings(10, 10).RetentionStorageMb(51200)
+            ).ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL(result1.IsTransportError(), false);
+            UNIT_ASSERT_VALUES_EQUAL_C(result1.GetStatus(), EStatus::SUCCESS, result1.GetIssues().ToString());
+        }
+
+        TKafkaTestClient client(testServer.Port);
+
+        client.AuthenticateToKafka();
+
+        auto getConfigsMap = [&](const auto& describeResult) {
+            THashMap<TString, TDescribeConfigsResponseData::TDescribeConfigsResult::TDescribeConfigsResourceResult> configs;
+            for (const auto& config : describeResult.Configs) {
+                configs[TString(config.Name->data())] = config;
+            }
+            return configs;
+        };
+        {
+            auto msg = client.DescribeConfigs({ shortTopic0Name, notExistsTopicName, shortTopic1Name});
+            const auto& res0 = msg->Results[0];
+            UNIT_ASSERT_VALUES_EQUAL(res0.ResourceName.value(), shortTopic0Name);
+            UNIT_ASSERT_VALUES_EQUAL(res0.ErrorCode, NONE_ERROR);
+            auto configs0 = getConfigsMap(res0);
+            UNIT_ASSERT_VALUES_EQUAL(configs0.size(), 33);
+            UNIT_ASSERT_VALUES_EQUAL(FromString<ui64>(configs0.find("retention.ms")->second.Value->data()), TDuration::Hours(10).MilliSeconds());
+            UNIT_ASSERT_VALUES_EQUAL(configs0.find("cleanup.policy")->second.Value->data(), "delete");
+
+            UNIT_ASSERT_VALUES_EQUAL(msg->Results[1].ResourceName.value(), notExistsTopicName);
+            UNIT_ASSERT_VALUES_EQUAL(msg->Results[1].ErrorCode, UNKNOWN_TOPIC_OR_PARTITION);
+
+            UNIT_ASSERT_VALUES_EQUAL(msg->Results[2].ResourceName.value(), shortTopic1Name);
+            UNIT_ASSERT_VALUES_EQUAL(msg->Results[2].ErrorCode, NONE_ERROR);
+            auto configs1 = getConfigsMap(msg->Results[2]);
+            UNIT_ASSERT_VALUES_EQUAL(FromString<ui64>(configs1.find("retention.bytes")->second.Value->data()), 51200 * 1_MB);
+            UNIT_ASSERT_VALUES_EQUAL(FromString<ui64>(configs1.find("max.message.bytes")->second.Value->data()), 1_KB);
+        }
+        {
+            auto msg = client.DescribeConfigs({ shortTopic0Name, shortTopic0Name});
+            UNIT_ASSERT_VALUES_EQUAL(msg->Results.size(), 1);
+            const auto& res0 = msg->Results[0];
+            UNIT_ASSERT_VALUES_EQUAL(res0.ResourceName.value(), shortTopic0Name);
+            UNIT_ASSERT_VALUES_EQUAL(res0.ErrorCode, NONE_ERROR);
+        }
+    }
+
     Y_UNIT_TEST(AlterConfigsScenario) {
         TInsecureTestServer testServer("2");
 
@@ -2087,6 +2155,119 @@ Y_UNIT_TEST_SUITE(KafkaProtocol) {
             UNIT_ASSERT_VALUES_EQUAL(noMasterSyncResponse->ErrorCode, (TKafkaInt16)EKafkaErrors::REBALANCE_IN_PROGRESS);
         }
 
+    }
+
+    Y_UNIT_TEST(InitProducerId_withoutTransactionalIdShouldReturnRandomInt) {
+        TInsecureTestServer testServer;
+
+        TKafkaTestClient kafkaClient(testServer.Port);
+
+        auto resp1 = kafkaClient.InitProducerId();
+        auto resp2 = kafkaClient.InitProducerId();
+
+        // validate first response
+        UNIT_ASSERT_VALUES_EQUAL(resp1->ErrorCode, EKafkaErrors::NONE_ERROR);
+        UNIT_ASSERT_GT(resp1->ProducerId, 0);
+        UNIT_ASSERT_VALUES_EQUAL(resp1->ProducerEpoch, 0);
+        // validate second response
+        UNIT_ASSERT_VALUES_EQUAL(resp2->ErrorCode, EKafkaErrors::NONE_ERROR);
+        UNIT_ASSERT_GT(resp2->ProducerId, 0);
+        UNIT_ASSERT_VALUES_EQUAL(resp2->ProducerEpoch, 0);
+        // validate different values for different responses
+        UNIT_ASSERT_VALUES_UNEQUAL(resp1->ProducerId, resp2->ProducerId);
+    }
+
+    Y_UNIT_TEST(InitProducerId_forNewTransactionalIdShouldReturnIncrementingInt) {
+        TInsecureTestServer testServer;
+
+        TKafkaTestClient kafkaClient(testServer.Port);
+
+        // use random transactional id for each request top avoid parallel execution problems
+        auto resp1 = kafkaClient.InitProducerId(TStringBuilder() << "my-tx-producer-" << RandomNumber<ui64>());
+        auto resp2 = kafkaClient.InitProducerId(TStringBuilder() << "my-tx-producer-" << RandomNumber<ui64>());
+
+        // validate first response
+        UNIT_ASSERT_VALUES_EQUAL(resp1->ErrorCode, EKafkaErrors::NONE_ERROR);
+        UNIT_ASSERT_GT(resp1->ProducerId, 0);
+        UNIT_ASSERT_VALUES_EQUAL(resp1->ProducerEpoch, 0);
+        // validate second response
+        UNIT_ASSERT_VALUES_EQUAL(resp2->ErrorCode, EKafkaErrors::NONE_ERROR);
+        UNIT_ASSERT_GT(resp2->ProducerId, 0);
+        UNIT_ASSERT_VALUES_EQUAL(resp2->ProducerEpoch, 0);
+        // validate different values for different responses
+        UNIT_ASSERT_VALUES_UNEQUAL(resp1->ProducerId, resp2->ProducerId);
+    }
+
+    Y_UNIT_TEST(InitProducerId_forSqlInjectionShouldReturnWithoutDropingDatabase) {
+        TInsecureTestServer testServer;
+
+        TKafkaTestClient kafkaClient(testServer.Port);
+
+        auto resp1 = kafkaClient.InitProducerId("; DROP TABLE kafka_transactional_producers");
+
+        // validate first response
+        UNIT_ASSERT_VALUES_EQUAL(resp1->ErrorCode, EKafkaErrors::NONE_ERROR);
+        UNIT_ASSERT_GT(resp1->ProducerId, 0);
+        UNIT_ASSERT_VALUES_EQUAL(resp1->ProducerEpoch, 0);
+    }
+
+    Y_UNIT_TEST(InitProducerId_forPreviouslySeenTransactionalIdShouldReturnSameProducerIdAndIncrementEpoch) {
+        TInsecureTestServer testServer;
+
+        TKafkaTestClient kafkaClient(testServer.Port);
+        // use random transactional id for each request top avoid parallel execution problems
+        auto transactionalId = TStringBuilder() << "my-tx-producer-" << RandomNumber<ui64>();
+
+        auto resp1 = kafkaClient.InitProducerId(transactionalId);
+        auto resp2 = kafkaClient.InitProducerId(transactionalId);
+
+        // validate first response
+        UNIT_ASSERT_VALUES_EQUAL(resp1->ErrorCode, EKafkaErrors::NONE_ERROR);
+        UNIT_ASSERT_GT(resp1->ProducerId, 0);
+        UNIT_ASSERT_VALUES_EQUAL(resp1->ProducerEpoch, 0);
+        // validate second response
+        UNIT_ASSERT_VALUES_EQUAL(resp2->ErrorCode, EKafkaErrors::NONE_ERROR);
+        UNIT_ASSERT_VALUES_EQUAL(resp2->ProducerId, resp1->ProducerId);
+        UNIT_ASSERT_VALUES_EQUAL(resp2->ProducerEpoch, 1);
+    }
+
+    Y_UNIT_TEST(InitProducerId_forPreviouslySeenTransactionalIdShouldReturnNewProducerIdIfEpochOverflown) {
+        TInsecureTestServer testServer;
+
+        TKafkaTestClient kafkaClient(testServer.Port);
+        // use random transactional id for each request top avoid parallel execution problems
+        auto transactionalId = TStringBuilder() << "my-tx-producer-" << RandomNumber<ui64>();
+
+        // this first request will init table
+        auto resp1 = kafkaClient.InitProducerId(transactionalId);
+        // update epoch to be last available
+        NYdb::NTable::TTableClient tableClient(*testServer.Driver);
+        TValueBuilder rows;
+        rows.BeginList();
+        rows.AddListItem()
+            .BeginStruct()
+                .AddMember("database").Utf8("/Root")
+                .AddMember("transactional_id").Utf8(transactionalId)
+                .AddMember("producer_id").Int64(resp1->ProducerId)
+                .AddMember("producer_epoch").Int16(std::numeric_limits<i16>::max() - 1)
+                .AddMember("updated_at").Datetime(TInstant::Now())
+            .EndStruct();
+        rows.EndList();
+        auto upsertResult = tableClient.BulkUpsert("//Root/.metadata/kafka_transactional_producers", rows.Build()).GetValueSync();
+        UNIT_ASSERT_EQUAL(upsertResult.GetStatus(), EStatus::SUCCESS);
+
+        auto resp2 = kafkaClient.InitProducerId(transactionalId);
+
+        // validate first response
+        UNIT_ASSERT_VALUES_EQUAL(resp1->ErrorCode, EKafkaErrors::NONE_ERROR);
+        UNIT_ASSERT_GT(resp1->ProducerId, 0);
+        UNIT_ASSERT_VALUES_EQUAL(resp1->ProducerEpoch, 0);
+        // validate second response
+        UNIT_ASSERT_VALUES_EQUAL(resp2->ErrorCode, EKafkaErrors::NONE_ERROR);
+        UNIT_ASSERT_GT(resp2->ProducerId, 0);
+        UNIT_ASSERT_VALUES_EQUAL(resp2->ProducerEpoch, 0);
+        // new producer.id should be given
+        UNIT_ASSERT_VALUES_UNEQUAL(resp1->ProducerId, resp2->ProducerId);
     }
 
 } // Y_UNIT_TEST_SUITE(KafkaProtocol)

@@ -676,6 +676,14 @@ ids {
   severity: S_WARNING
 }
 ids {
+  code: CORE_DEPRECATED_LANG_VER
+  severity: S_WARNING
+}
+ids {
+  code: CORE_UNSUPPORTED_LANG_VER
+  severity: S_WARNING
+}
+ids {
   code: YT_SECURE_DATA_IN_COMMON_TMP
   severity: S_WARNING
 }
@@ -685,6 +693,10 @@ ids {
 }
 ids {
   code: CORE_TOP_UNSUPPORTED_BLOCK_CALLABLES
+  severity: S_INFO
+}
+ids {
+  code: CORE_UDF_RESOLVER
   severity: S_INFO
 }
 ids {
