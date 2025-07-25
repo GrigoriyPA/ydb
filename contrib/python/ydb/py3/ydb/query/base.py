@@ -25,6 +25,7 @@ from ydb._grpc.grpcwrapper.common_utils import to_thread
 
 if typing.TYPE_CHECKING:
     from .transaction import BaseQueryTxContext
+    from .session import BaseQuerySession
 
 
 class QuerySyntax(enum.IntEnum):
@@ -41,7 +42,7 @@ class QueryExecMode(enum.IntEnum):
     EXECUTE = 50
 
 
-class StatsMode(enum.IntEnum):
+class QueryStatsMode(enum.IntEnum):
     UNSPECIFIED = 0
     NONE = 10
     BASIC = 20
@@ -132,43 +133,47 @@ def create_execute_query_request(
     tx_mode: Optional[BaseQueryTxMode],
     syntax: Optional[QuerySyntax],
     exec_mode: Optional[QueryExecMode],
+    stats_mode: Optional[QueryStatsMode],
     parameters: Optional[dict],
     concurrent_result_sets: Optional[bool],
 ) -> ydb_query.ExecuteQueryRequest:
-    syntax = QuerySyntax.YQL_V1 if not syntax else syntax
-    exec_mode = QueryExecMode.EXECUTE if not exec_mode else exec_mode
-    stats_mode = StatsMode.NONE  # TODO: choise is not supported yet
+    try:
+        syntax = QuerySyntax.YQL_V1 if not syntax else syntax
+        exec_mode = QueryExecMode.EXECUTE if not exec_mode else exec_mode
+        stats_mode = QueryStatsMode.NONE if stats_mode is None else stats_mode
 
-    tx_control = None
-    if not tx_id and not tx_mode:
         tx_control = None
-    elif tx_id:
-        tx_control = ydb_query.TransactionControl(
-            tx_id=tx_id,
-            commit_tx=commit_tx,
-            begin_tx=None,
-        )
-    else:
-        tx_control = ydb_query.TransactionControl(
-            begin_tx=ydb_query.TransactionSettings(
-                tx_mode=tx_mode,
-            ),
-            commit_tx=commit_tx,
-            tx_id=None,
-        )
+        if not tx_id and not tx_mode:
+            tx_control = None
+        elif tx_id:
+            tx_control = ydb_query.TransactionControl(
+                tx_id=tx_id,
+                commit_tx=commit_tx,
+                begin_tx=None,
+            )
+        else:
+            tx_control = ydb_query.TransactionControl(
+                begin_tx=ydb_query.TransactionSettings(
+                    tx_mode=tx_mode,
+                ),
+                commit_tx=commit_tx,
+                tx_id=None,
+            )
 
-    return ydb_query.ExecuteQueryRequest(
-        session_id=session_id,
-        query_content=ydb_query.QueryContent.from_public(
-            query=query,
-            syntax=syntax,
-        ),
-        tx_control=tx_control,
-        exec_mode=exec_mode,
-        parameters=parameters,
-        concurrent_result_sets=concurrent_result_sets,
-        stats_mode=stats_mode,
-    )
+        return ydb_query.ExecuteQueryRequest(
+            session_id=session_id,
+            query_content=ydb_query.QueryContent.from_public(
+                query=query,
+                syntax=syntax,
+            ),
+            tx_control=tx_control,
+            exec_mode=exec_mode,
+            parameters=parameters,
+            concurrent_result_sets=concurrent_result_sets,
+            stats_mode=stats_mode,
+        )
+    except BaseException as e:
+        raise issues.ClientInternalError("Unable to prepare execute request") from e
 
 
 def bad_session_handler(func):
@@ -189,6 +194,7 @@ def wrap_execute_query_response(
     response_pb: _apis.ydb_query.ExecuteQueryResponsePart,
     session_state: IQuerySessionState,
     tx: Optional["BaseQueryTxContext"] = None,
+    session: Optional["BaseQuerySession"] = None,
     commit_tx: Optional[bool] = False,
     settings: Optional[QueryClientSettings] = None,
 ) -> convert.ResultSet:
@@ -198,8 +204,18 @@ def wrap_execute_query_response(
     elif tx and response_pb.tx_meta and not tx.tx_id:
         tx._move_to_beginned(response_pb.tx_meta.id)
 
+    if response_pb.HasField("exec_stats"):
+        if tx is not None:
+            tx._last_query_stats = response_pb.exec_stats
+        if session is not None:
+            session._last_query_stats = response_pb.exec_stats
+
     if response_pb.HasField("result_set"):
-        return convert.ResultSet.from_message(response_pb.result_set, settings)
+        return convert.ResultSet.from_message(
+            response_pb.result_set,
+            settings,
+            index=response_pb.result_set_index,
+        )
 
     return None
 

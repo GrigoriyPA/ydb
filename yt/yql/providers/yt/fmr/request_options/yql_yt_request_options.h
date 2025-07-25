@@ -7,6 +7,8 @@
 #include <util/string/builder.h>
 #include <vector>
 
+#include <yt/cpp/mapreduce/interface/common.h>
+
 namespace NYql::NFmr {
 
 enum class EOperationStatus {
@@ -31,7 +33,8 @@ enum class ETaskType {
     Unknown,
     Download,
     Upload,
-    Merge
+    Merge,
+    Map
 };
 
 enum class EFmrComponent {
@@ -43,7 +46,8 @@ enum class EFmrComponent {
 
 enum class EFmrErrorReason {
     ReasonUnknown,
-    UserError  // TODO Add more reasons
+    UserError
+    // TODO - return FallbackQuery or FallbackOperation instead of UserError, pass info to gateway.
 };
 
 struct TFmrError {
@@ -65,8 +69,23 @@ struct TYtTableRef {
     TString Cluster;
     TMaybe<TString> FilePath = Nothing();
 
+    // TODO - maybe just use TRichYPath here also instead of Path and Cluster?
+
     bool operator == (const TYtTableRef&) const = default;
 };
+
+void SaveRichPath(IOutputStream* buffer, const NYT::TRichYPath& path);
+void LoadRichPath(IInputStream* buffer, NYT::TRichYPath& path);
+
+struct TYtTableTaskRef {
+    std::vector<NYT::TRichYPath> RichPaths;
+    std::vector<TString> FilePaths;
+
+    void Save(IOutputStream* buffer) const;
+    void Load(IInputStream* buffer);
+
+    bool operator == (const TYtTableTaskRef&) const = default;
+}; // corresponds to a partition of several yt input tables.
 
 struct TFmrTableId {
     TString Id;
@@ -77,35 +96,44 @@ struct TFmrTableId {
 
     TFmrTableId(const TString& cluster, const TString& path);
 
+    void Save(IOutputStream* buffer) const;
+    void Load(IInputStream* buffer);
+
     bool operator == (const TFmrTableId&) const = default;
 };
 
 struct TFmrTableRef {
     TFmrTableId FmrTableId;
+    bool operator == (const TFmrTableRef&) const = default;
 };
 
 struct TTableRange {
     TString PartId;
     ui64 MinChunk = 0;
     ui64 MaxChunk = 1;
-};
 
-struct TFmrChunkMeta {
-    TString TableId;
-    TString PartId;
-    ui64 Chunk = 0;
+    void Save(IOutputStream* buffer) const;
+    void Load(IInputStream* buffer);
 
-    TString ToString() const;
-};
+    bool operator == (const TTableRange&) const = default;
+}; // Corresnponds to range [MinChunk, MaxChunk)
 
 struct TFmrTableInputRef {
     TString TableId;
     std::vector<TTableRange> TableRanges;
-};
+
+    void Save(IOutputStream* buffer) const;
+    void Load(IInputStream* buffer);
+
+    bool operator == (const TFmrTableInputRef&) const = default;
+}; // Corresponds to part of table with fixed TableId but several PartIds, Empty TablesRanges means that this table is not present in task.
 
 struct TFmrTableOutputRef {
     TString TableId;
     TString PartId;
+
+    void Save(IOutputStream* buffer) const;
+    void Load(IInputStream* buffer);
 
     bool operator == (const TFmrTableOutputRef&) const = default;
 };
@@ -116,6 +144,18 @@ struct TTableStats {
     ui64 DataWeight = 0;
     bool operator == (const TTableStats&) const = default;
 };
+
+struct TChunkStats {
+    ui64 Rows = 0;
+    ui64 DataWeight = 0;
+    bool operator == (const TChunkStats&) const = default;
+};
+
+struct TTableChunkStats {
+    TString PartId;
+    std::vector<TChunkStats> PartIdChunkStats;
+    bool operator == (const TTableChunkStats&) const = default;
+}; // detailed statistics for all chunks in partition
 
 } // namespace NYql::NFmr
 
@@ -146,12 +186,14 @@ namespace std {
 namespace NYql::NFmr {
 
 struct TStatistics {
-    std::unordered_map<TFmrTableOutputRef, TTableStats> OutputTables;
+    std::unordered_map<TFmrTableOutputRef, TTableChunkStats> OutputTables;
 };
 
 using TOperationTableRef = std::variant<TYtTableRef, TFmrTableRef>;
 
-using TTaskTableRef = std::variant<TYtTableRef, TFmrTableInputRef>;
+using TTaskTableRef = std::variant<TYtTableTaskRef, TFmrTableInputRef>;
+
+// TODO - TYtTableTaskRef может быть из нескольких входных таблиц, но TFmrTableInputRef - часть одной таблицы, подумать как лучше
 
 struct TUploadOperationParams {
     TFmrTableRef Input;
@@ -169,7 +211,7 @@ struct TDownloadOperationParams {
 };
 
 struct TDownloadTaskParams {
-    TYtTableRef Input;
+    TYtTableTaskRef Input;
     TFmrTableOutputRef Output;
 };
 
@@ -178,19 +220,41 @@ struct TMergeOperationParams {
     TFmrTableRef Output;
 };
 
+struct TTaskTableInputRef {
+    std::vector<TTaskTableRef> Inputs;
+
+    void Save(IOutputStream* buffer) const;
+    void Load(IInputStream* buffer);
+}; // Corresponds to task input tables, which can consist parts of either fmr or yt input tables.
+
 struct TMergeTaskParams {
-    std::vector<TTaskTableRef> Input;
+    TTaskTableInputRef Input;
     TFmrTableOutputRef Output;
 };
 
-using TOperationParams = std::variant<TUploadOperationParams, TDownloadOperationParams, TMergeOperationParams>;
+struct TMapOperationParams {
+    std::vector<TOperationTableRef> Input;
+    std::vector<TFmrTableRef> Output;
+    TString SerializedMapJobState;
+};
 
-using TTaskParams = std::variant<TUploadTaskParams, TDownloadTaskParams, TMergeTaskParams>;
+struct TMapTaskParams {
+    TTaskTableInputRef Input;
+    std::vector<TFmrTableOutputRef> Output;
+    TString SerializedMapJobState;
+};
+
+using TOperationParams = std::variant<TUploadOperationParams, TDownloadOperationParams, TMergeOperationParams, TMapOperationParams>;
+
+using TTaskParams = std::variant<TUploadTaskParams, TDownloadTaskParams, TMergeTaskParams, TMapTaskParams>;
 
 struct TClusterConnection {
     TString TransactionId;
     TString YtServerName;
     TMaybe<TString> Token;
+
+    void Save(IOutputStream* buffer) const;
+    void Load(IInputStream* buffer);
 };
 
 struct TTask: public TThrRefBase {

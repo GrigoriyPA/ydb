@@ -33,8 +33,8 @@ ELSEIF (OS_IOS)
     PEERDIR(
         contrib/libs/cxxsupp/builtins
     )
-ELSEIF (OS_LINUX OR OS_DARWIN)
-    IF (ARCH_ARM7)
+ELSEIF (OS_LINUX OR OS_DARWIN OR OS_FREEBSD)
+    IF (ARCH_ARM6 OR ARCH_ARM7)
         # libcxxrt support for ARM is currently broken, use libcxxabi instead
         SET(CXX_RT "libcxxabi")
     ELSE()

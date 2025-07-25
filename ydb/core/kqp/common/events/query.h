@@ -96,8 +96,16 @@ public:
         return Record.GetRequest().GetTopicOperations();
     }
 
+    const ::NKikimrKqp::TKafkaApiOperationsRequest& GetKafkaApiOperations() const {
+        return Record.GetRequest().GetKafkaApiOperations();
+    }
+
     bool HasTopicOperations() const {
         return Record.GetRequest().HasTopicOperations();
+    }
+
+    bool HasKafkaApiOperations() const {
+        return Record.GetRequest().HasKafkaApiOperations();
     }
 
     bool GetKeepSession() const {
@@ -295,23 +303,14 @@ public:
         return Record.SerializeToZeroCopyStream(chunker);
     }
 
-    static NActors::IEventBase* Load(TEventSerializedData* data) {
-        auto pbEv = THolder<TEvQueryRequestRemote>(static_cast<TEvQueryRequestRemote*>(TEvQueryRequestRemote::Load(data)));
+    static TEvQueryRequest* Load(const TEventSerializedData* data) {
+        auto pbEv = THolder<TEvQueryRequestRemote>(TEvQueryRequestRemote::Load(data));
         auto req = new TEvQueryRequest();
         req->Record.Swap(&pbEv->Record);
         return req;
     }
 
-    void SetClientLostAction(TActorId actorId, NActors::TActorSystem* as) {
-        if (RequestCtx) {
-            RequestCtx->SetFinishAction([actorId, as]() {
-                as->Send(actorId, new NGRpcService::TEvClientLost());
-                });
-        } else if (Record.HasCancelationActor()) {
-            auto cancelationActor = ActorIdFromProto(Record.GetCancelationActor());
-            NGRpcService::SubscribeRemoteCancel(cancelationActor, actorId, as);
-        }
-    }
+    void SetClientLostAction(TActorId actorId, NActors::TActorSystem* as);
 
     void SetUserRequestContext(TIntrusivePtr<TUserRequestContext> userRequestContext) {
         UserRequestContext = userRequestContext;

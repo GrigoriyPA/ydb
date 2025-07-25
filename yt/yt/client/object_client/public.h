@@ -1,6 +1,7 @@
 #pragma once
 
 #include <yt/yt/client/election/public.h>
+
 #include <yt/yt/client/job_tracker_client/public.h>
 
 #include <library/cpp/yt/misc/enum.h>
@@ -18,6 +19,7 @@ namespace NYT::NObjectClient {
 
 namespace NProto {
 
+class TPrerequisiteRevision;
 class TUserDirectory;
 
 } // namespace NProto
@@ -342,6 +344,7 @@ DEFINE_ENUM(EObjectType,
     ((ChaosReplicatedTable)                        (1206))
     ((ReplicationCardCollocation)                  (1207))
     ((VirtualChaosCellMap)                         (1208))
+    ((ChaosLease)                                  (1209))
 
     // Other cluster components stuff
     ((ClusterProxyNode)                            (1500))

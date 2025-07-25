@@ -132,6 +132,7 @@ NActors::NLog::EPriority PriorityForStatusInbound(NKikimrProto::EReplyStatus sta
     XX(TEvBlobStorage::TEvStatus) \
     XX(TEvBlobStorage::TEvPatch) \
     XX(TEvBlobStorage::TEvAssimilate) \
+    XX(TEvBlobStorage::TEvCheckIntegrity) \
 //
 
 #define DSPROXY_ENUM_DISK_EVENTS(XX) \
@@ -227,6 +228,8 @@ public:
             ParentSpan.Link(Span.GetTraceId());
             Span.Attribute("GroupId", Info->GroupID.GetRawId());
             Span.Attribute("RestartCounter", RestartCounter);
+            Span.Attribute("database", AppData()->TenantName);
+            Span.Attribute("storagePool", Info->GetStoragePoolName());
             params.Common.Event->ToSpan(Span);
         }
 
@@ -426,6 +429,16 @@ struct TBlobStorageGroupRestoreGetParameters {
     };
 };
 IActor* CreateBlobStorageGroupIndexRestoreGetRequest(TBlobStorageGroupRestoreGetParameters params);
+
+struct TBlobStorageGroupCheckIntegrityParameters {
+    TBlobStorageGroupRequestActor::TCommonParameters<TEvBlobStorage::TEvCheckIntegrity> Common;
+    TBlobStorageGroupRequestActor::TTypeSpecificParameters TypeSpecific = {
+        .LogComponent = NKikimrServices::BS_PROXY_CHECKINTEGRITY,
+        .Name = "DSProxy.CheckIntegrity",
+        .Activity = NKikimrServices::TActivity::BS_PROXY_CHECKINTEGRITY_ACTOR,
+    };
+};
+IActor* CreateBlobStorageGroupCheckIntegrityRequest(TBlobStorageGroupCheckIntegrityParameters params);
 
 struct TBlobStorageGroupDiscoverParameters {
     TBlobStorageGroupRequestActor::TCommonParameters<TEvBlobStorage::TEvDiscover> Common;

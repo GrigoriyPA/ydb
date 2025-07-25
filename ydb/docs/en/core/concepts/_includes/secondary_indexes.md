@@ -15,7 +15,7 @@ A synchronous index is updated simultaneously with the table that it indexes. Th
 
 ## Asynchronous Secondary Index {#async}
 
-Unlike a synchronous index, an asynchronous index doesn't use distributed transactions. Instead, it receives changes from an indexed table in the background. Write transactions to a table using this index are performed with no planning overheads due to reduced guarantees: an asynchronous index provides [eventual consistency](https://en.wikipedia.org/wiki/Eventual_consistency), but no strict consistency. You can only use asynchronous indexes in read transactions in [Stale Read Only](transactions.md#modes) mode.
+Unlike a synchronous index, an asynchronous index doesn't use distributed transactions. Instead, it receives changes from an indexed table in the background. Write transactions to a table using this index are performed with no planning overheads due to reduced guarantees: an asynchronous index provides [eventual consistency](https://en.wikipedia.org/wiki/Eventual_consistency), but no strict consistency. You can only use asynchronous indexes in read transactions in [Stale Read Only](../transactions.md#modes) mode.
 
 ## Covering Secondary Index {#covering}
 
@@ -33,9 +33,9 @@ Currently, a unique index cannot be added to an existing table.
 
 ## Vector Index
 
-[Vector Index](vector_indexes.md) is a special type of secondary index.
+[Vector Index](../../dev/vector-indexes.md) is a special type of secondary index.
 
-Unlike secondary indexes, which optimize equality or range searches, vector indexes allow similarity searches based on distance or similarity functions.
+Unlike secondary indexes, which optimize equality or range searches, vector indexes allow [vector search](../vector_search.md) based on distance or similarity functions.
 
 ### Creating a Secondary Index Online {#index-add}
 
@@ -54,6 +54,15 @@ Online index creation consists of the following steps:
 1. Publishing the results and deleting the snapshot.
 
    The index is ready to use.
+
+{% note info %}
+
+The user account that is used to create a secondary index must have the following [permissions](../../yql/reference/syntax/grant.md#permissions-list):
+
+* `ydb.generic.read`
+* `ydb.generic.write`
+
+{% endnote %}
 
 Possible impact on user transactions:
 

@@ -1,18 +1,18 @@
 PY3TEST()
-ENV(YDB_DRIVER_BINARY="ydb/apps/ydbd/ydbd")
+INCLUDE(${ARCADIA_ROOT}/ydb/tests/ydbd_dep.inc)
 ENV(MOTO_SERVER_PATH="contrib/python/moto/bin/moto_server")
 ENV(YDB_ADDITIONAL_LOG_CONFIGS="TX_TIERING:DEBUG")
 
-FORK_TEST_FILES()
+FORK_TESTS()
 
 TEST_SRCS(
     base.py
     data_correctness.py
+    data_migration_when_alter_ttl.py
+    tier_delete.py
     ttl_delete_s3.py
     ttl_unavailable_s3.py
-    data_migration_when_alter_ttl.py
     unstable_connection.py
-    tier_delete.py
 )
 
 SIZE(MEDIUM)
@@ -29,7 +29,6 @@ PEERDIR(
 )
 
 DEPENDS(
-    ydb/apps/ydbd
     contrib/python/moto/bin
 )
 

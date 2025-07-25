@@ -16,7 +16,6 @@ IF (SANITIZER_TYPE OR WITH_VALGRIND)
     TAG(
         ya:fat
         sb:ttl=2
-        ya:large_tests_on_multi_slots
     )
 ELSE()
     TIMEOUT(600)
@@ -48,10 +47,6 @@ PEERDIR(
 )
 
 NO_CHECK_IMPORTS()
-
-IF (SANITIZER_TYPE == "memory")
-    TAG(ya:not_autocheck) # YQL-15385
-ENDIF()
 
 END()
 

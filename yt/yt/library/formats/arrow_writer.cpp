@@ -1,10 +1,8 @@
 #include "arrow_writer.h"
 
-#include <yt/yt/client/arrow/fbs/Message.fbs.h>
-#include <yt/yt/client/arrow/fbs/Schema.fbs.h>
+#include "schemaless_writer_adapter.h"
 
 #include <yt/yt/client/formats/public.h>
-#include <yt/yt/library/formats/schemaless_writer_adapter.h>
 
 #include <yt/yt/client/table_client/columnar.h>
 #include <yt/yt/client/table_client/logical_type.h>
@@ -23,6 +21,9 @@
 
 #include <library/cpp/yt/memory/range.h>
 
+#include <contrib/libs/apache/arrow/cpp/src/generated/Message.fbs.h>
+#include <contrib/libs/apache/arrow/cpp/src/generated/Schema.fbs.h>
+
 #include <vector>
 
 namespace NYT::NFormats {
@@ -31,7 +32,7 @@ using namespace NColumnConverters;
 using namespace NComplexTypes;
 using namespace NTableClient;
 
-static constexpr auto& Logger = FormatsLogger;
+constinit const auto Logger = FormatsLogger;
 
 using TBodyWriter = std::function<void(TMutableRef)>;
 using TBatchColumn = IUnversionedColumnarRowBatch::TColumn;
@@ -65,7 +66,7 @@ std::tuple<org::apache::arrow::flatbuf::Type, flatbuffers::Offset<void>> Seriali
         case ESimpleLogicalValueType::Null:
         case ESimpleLogicalValueType::Void:
             return std::tuple(
-                org::apache::arrow::flatbuf::Type_Null,
+                org::apache::arrow::flatbuf::Type::Null,
                 org::apache::arrow::flatbuf::CreateNull(*flatbufBuilder)
                     .Union());
 
@@ -78,7 +79,7 @@ std::tuple<org::apache::arrow::flatbuf::Type, flatbuffers::Offset<void>> Seriali
         case ESimpleLogicalValueType::Int32:
         case ESimpleLogicalValueType::Uint32:
             return std::tuple(
-                org::apache::arrow::flatbuf::Type_Int,
+                org::apache::arrow::flatbuf::Type::Int,
                 org::apache::arrow::flatbuf::CreateInt(
                     *flatbufBuilder,
                     GetIntegralTypeBitWidth(simpleType),
@@ -87,7 +88,7 @@ std::tuple<org::apache::arrow::flatbuf::Type, flatbuffers::Offset<void>> Seriali
 
         case ESimpleLogicalValueType::Interval:
             return std::tuple(
-                org::apache::arrow::flatbuf::Type_Int,
+                org::apache::arrow::flatbuf::Type::Int,
                 org::apache::arrow::flatbuf::CreateInt(
                     *flatbufBuilder,
                     64,
@@ -96,61 +97,61 @@ std::tuple<org::apache::arrow::flatbuf::Type, flatbuffers::Offset<void>> Seriali
 
         case ESimpleLogicalValueType::Date:
             return std::tuple(
-                org::apache::arrow::flatbuf::Type_Date,
+                org::apache::arrow::flatbuf::Type::Date,
                 org::apache::arrow::flatbuf::CreateDate(
                     *flatbufBuilder,
-                    org::apache::arrow::flatbuf::DateUnit_DAY)
+                    org::apache::arrow::flatbuf::DateUnit::DAY)
                     .Union());
 
         case ESimpleLogicalValueType::Datetime:
             return std::tuple(
-                org::apache::arrow::flatbuf::Type_Date,
+                org::apache::arrow::flatbuf::Type::Date,
                 org::apache::arrow::flatbuf::CreateDate(
                     *flatbufBuilder,
-                    org::apache::arrow::flatbuf::DateUnit_MILLISECOND)
+                    org::apache::arrow::flatbuf::DateUnit::MILLISECOND)
                     .Union());
 
         case ESimpleLogicalValueType::Timestamp:
             return std::tuple(
-                org::apache::arrow::flatbuf::Type_Timestamp,
+                org::apache::arrow::flatbuf::Type::Timestamp,
                 org::apache::arrow::flatbuf::CreateTimestamp(
                     *flatbufBuilder,
-                    org::apache::arrow::flatbuf::TimeUnit_MICROSECOND)
+                    org::apache::arrow::flatbuf::TimeUnit::MICROSECOND)
                     .Union());
 
         case ESimpleLogicalValueType::Double:
             return std::tuple(
-                org::apache::arrow::flatbuf::Type_FloatingPoint,
+                org::apache::arrow::flatbuf::Type::FloatingPoint,
                 org::apache::arrow::flatbuf::CreateFloatingPoint(
                     *flatbufBuilder,
-                    org::apache::arrow::flatbuf::Precision_DOUBLE)
+                    org::apache::arrow::flatbuf::Precision::DOUBLE)
                     .Union());
 
         case ESimpleLogicalValueType::Float:
             return std::tuple(
-                org::apache::arrow::flatbuf::Type_FloatingPoint,
+                org::apache::arrow::flatbuf::Type::FloatingPoint,
                 org::apache::arrow::flatbuf::CreateFloatingPoint(
                     *flatbufBuilder,
-                    org::apache::arrow::flatbuf::Precision_SINGLE)
+                    org::apache::arrow::flatbuf::Precision::SINGLE)
                     .Union());
 
         case ESimpleLogicalValueType::Boolean:
             return std::tuple(
-                org::apache::arrow::flatbuf::Type_Bool,
+                org::apache::arrow::flatbuf::Type::Bool,
                 org::apache::arrow::flatbuf::CreateBool(*flatbufBuilder)
                     .Union());
 
         case ESimpleLogicalValueType::String:
         case ESimpleLogicalValueType::Any:
             return std::tuple(
-                org::apache::arrow::flatbuf::Type_Binary,
+                org::apache::arrow::flatbuf::Type::Binary,
                 org::apache::arrow::flatbuf::CreateBinary(*flatbufBuilder)
                     .Union());
 
         case ESimpleLogicalValueType::Utf8:
         case ESimpleLogicalValueType::Json:
             return std::tuple(
-                org::apache::arrow::flatbuf::Type_Utf8,
+                org::apache::arrow::flatbuf::Type::Utf8,
                 org::apache::arrow::flatbuf::CreateUtf8(*flatbufBuilder)
                     .Union());
 
@@ -171,6 +172,10 @@ int ExtractTableIndexFromColumn(const TBatchColumn* column)
 
     const auto* valueColumn = column->Rle->ValueColumn;
     auto values = valueColumn->GetTypedValues<ui64>();
+    TRef nullBitmap;
+    if (valueColumn->NullBitmap) {
+        nullBitmap = valueColumn->NullBitmap->Data;
+    }
 
     // Expecting only one element.
     YT_VERIFY(values.size() == 1);
@@ -187,12 +192,14 @@ int ExtractTableIndexFromColumn(const TBatchColumn* column)
         valueColumn->Values->ZigZagEncoded,
         TRange<ui32>(),
         rleIndexes,
+        nullBitmap,
         [&] (auto index) {
             return values[index];
         },
         [&] (auto value) {
             tableIndex = value;
         });
+
     return tableIndex;
 }
 
@@ -497,6 +504,11 @@ void SerializeIntegerColumn(
 
             auto startIndex = column->StartIndex;
 
+            TRef nullBitmap;
+            if (valueColumn->NullBitmap) {
+                nullBitmap = valueColumn->NullBitmap->Data;
+            }
+
             switch (simpleType) {
 #define XX(cppType, ytType)                                 \
     case ESimpleLogicalValueType::ytType: {                 \
@@ -509,6 +521,7 @@ void SerializeIntegerColumn(
             valueColumn->Values->ZigZagEncoded,             \
             TRange<ui32>(),                                 \
             rleIndexes,                                     \
+            nullBitmap,                                     \
             [&] (auto index) {                              \
                 return values[index];                       \
             },                                              \
@@ -565,6 +578,11 @@ void SerializeDateColumn(
                 ? column->GetTypedValues<ui64>()
                 : TRange<ui64>();
 
+            TRef nullBitmap;
+            if (valueColumn->NullBitmap) {
+                nullBitmap = valueColumn->NullBitmap->Data;
+            }
+
             auto startIndex = column->StartIndex;
 
             auto dstValues = GetTypedValues<i32>(dstRef);
@@ -576,6 +594,7 @@ void SerializeDateColumn(
                 valueColumn->Values->ZigZagEncoded,
                 TRange<ui32>(),
                 rleIndexes,
+                nullBitmap,
                 [&] (auto index) {
                     return values[index];
                 },
@@ -616,6 +635,11 @@ void SerializeDatetimeColumn(
                 ? column->GetTypedValues<ui64>()
                 : TRange<ui64>();
 
+            TRef nullBitmap;
+            if (valueColumn->NullBitmap) {
+                nullBitmap = valueColumn->NullBitmap->Data;
+            }
+
             auto startIndex = column->StartIndex;
 
             auto dstValues = GetTypedValues<i64>(dstRef);
@@ -627,6 +651,7 @@ void SerializeDatetimeColumn(
                 valueColumn->Values->ZigZagEncoded,
                 TRange<ui32>(),
                 rleIndexes,
+                nullBitmap,
                 [&] (auto index) {
                     return values[index];
                 },
@@ -666,6 +691,11 @@ void SerializeTimestampColumn(
                 ? column->GetTypedValues<ui64>()
                 : TRange<ui64>();
 
+            TRef nullBitmap;
+            if (valueColumn->NullBitmap) {
+                nullBitmap = valueColumn->NullBitmap->Data;
+            }
+
             auto startIndex = column->StartIndex;
 
             auto dstValues = GetTypedValues<i64>(dstRef);
@@ -677,6 +707,7 @@ void SerializeTimestampColumn(
                 valueColumn->Values->ZigZagEncoded,
                 TRange<ui32>(),
                 rleIndexes,
+                nullBitmap,
                 [&] (auto index) {
                     return values[index];
                 },
@@ -1258,7 +1289,7 @@ private:
         std::function<void(TMutableRef)> bodyWriter = nullptr)
     {
         YT_LOG_DEBUG("Message registered (Type: %v, MessageSize: %v, BodySize: %v)",
-            org::apache::arrow::flatbuf::EnumNamesMessageHeader()[type],
+            org::apache::arrow::flatbuf::EnumNameMessageHeader(type),
             flatbufBuilder.GetSize(),
             bodySize);
 
@@ -1319,21 +1350,21 @@ private:
 
         auto schemaOffset = org::apache::arrow::flatbuf::CreateSchema(
             flatbufBuilder,
-            org::apache::arrow::flatbuf::Endianness_Little,
+            org::apache::arrow::flatbuf::Endianness::Little,
             fieldsOffset,
             flatbufBuilder.CreateVector(customMetadata));
 
         auto messageOffset = org::apache::arrow::flatbuf::CreateMessage(
             flatbufBuilder,
-            org::apache::arrow::flatbuf::MetadataVersion_V4,
-            org::apache::arrow::flatbuf::MessageHeader_Schema,
+            org::apache::arrow::flatbuf::MetadataVersion::V4,
+            org::apache::arrow::flatbuf::MessageHeader::Schema,
             schemaOffset.Union(),
             0);
 
         flatbufBuilder.Finish(messageOffset);
 
         RegisterMessage(
-            org::apache::arrow::flatbuf::MessageHeader_Schema,
+            org::apache::arrow::flatbuf::MessageHeader::Schema,
             std::move(flatbufBuilder));
     }
 
@@ -1409,15 +1440,15 @@ private:
 
         auto messageOffset = org::apache::arrow::flatbuf::CreateMessage(
             flatbufBuilder,
-            org::apache::arrow::flatbuf::MetadataVersion_V4,
-            org::apache::arrow::flatbuf::MessageHeader_DictionaryBatch,
+            org::apache::arrow::flatbuf::MetadataVersion::V4,
+            org::apache::arrow::flatbuf::MessageHeader::DictionaryBatch,
             dictionaryBatchOffset.Union(),
             bodySize);
 
         flatbufBuilder.Finish(messageOffset);
 
         RegisterMessage(
-            org::apache::arrow::flatbuf::MessageHeader_DictionaryBatch,
+            org::apache::arrow::flatbuf::MessageHeader::DictionaryBatch,
             std::move(flatbufBuilder),
             bodySize,
             std::move(bodyWriter));
@@ -1434,15 +1465,15 @@ private:
 
         auto messageOffset = org::apache::arrow::flatbuf::CreateMessage(
             flatbufBuilder,
-            org::apache::arrow::flatbuf::MetadataVersion_V4,
-            org::apache::arrow::flatbuf::MessageHeader_RecordBatch,
+            org::apache::arrow::flatbuf::MetadataVersion::V4,
+            org::apache::arrow::flatbuf::MessageHeader::RecordBatch,
             recordBatchOffset.Union(),
             bodySize);
 
         flatbufBuilder.Finish(messageOffset);
 
         RegisterMessage(
-            org::apache::arrow::flatbuf::MessageHeader_RecordBatch,
+            org::apache::arrow::flatbuf::MessageHeader::RecordBatch,
             std::move(flatbufBuilder),
             bodySize,
             std::move(bodyWriter));

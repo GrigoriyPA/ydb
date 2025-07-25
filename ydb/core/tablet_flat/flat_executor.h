@@ -14,8 +14,8 @@
 #include "flat_exec_commit.h"
 #include "flat_executor_misc.h"
 #include "flat_executor_compaction_logic.h"
-#include "flat_executor_data_cleanup_logic.h"
 #include "flat_executor_gclogic.h"
+#include "flat_executor_vacuum_logic.h"
 #include "flat_bio_events.h"
 #include "flat_bio_stats.h"
 #include "flat_fwd_sieve.h"
@@ -279,9 +279,9 @@ struct TPendingPartSwitch {
     }
 };
 
-enum class EPageCollectionRequest : ui64 {
+enum class ESharedCacheRequestType : ui64 {
     Undefined = 0,
-    Cache = 1,
+    Transaction = 1,
     InMemPages,
     PendingInit,
     BootLogic,
@@ -292,7 +292,7 @@ struct TExecutorStatsImpl : public TExecutorStats {
     ui64 PacksMetaBytes = 0;    /* Memory occupied by NPageCollection::TMeta */
 };
 
-struct TTransactionWaitPad : public TPrivatePageCacheWaitPad {
+struct TTransactionWaitPad : public NPageCollection::TPagesWaitPad {
     TSeat* Seat;
     NWilson::TSpan WaitingSpan;
 
@@ -333,6 +333,7 @@ class TExecutor
             EvBrokenTransaction,
             EvLeaseExtend,
             EvActivateLowExecution,
+            EvRetryGcRequest,
 
             EvEnd
         };
@@ -347,6 +348,15 @@ class TExecutor
         struct TEvActivateCompactionChanges : public TEventLocal<TEvActivateCompactionChanges, EvActivateCompactionChanges> {};
         struct TEvBrokenTransaction : public TEventLocal<TEvBrokenTransaction, EvBrokenTransaction> {};
         struct TEvLeaseExtend : public TEventLocal<TEvLeaseExtend, EvLeaseExtend> {};
+
+        struct TEvRetryGcRequest : public TEventLocal<TEvRetryGcRequest, EvRetryGcRequest> {
+            const ui32 Channel;
+
+            explicit TEvRetryGcRequest(ui32 channel)
+                : Channel(channel)
+            {}
+        };
+
     };
 
     enum class ETxMode {
@@ -383,22 +393,29 @@ class TExecutor
     // Counts the number of times LeaseDuration was increased
     size_t LeaseDurationIncreases = 0;
 
-    struct TLeaseCommit {
+    struct TLeaseCommit : public TIntrusiveListItem<TLeaseCommit> {
+        using TByEndMap = std::multimap<TMonotonic, TLeaseCommit*>;
+
+        // Note: for lightweight read-only confirmations Step == 0
         const ui32 Step;
         const TMonotonic Start;
         TMonotonic LeaseEnd;
         TVector<std::function<void()>> Callbacks;
-        std::multimap<TMonotonic, TLeaseCommit*>::iterator ByEndIterator;
+        TByEndMap::iterator ByEndIterator;
+        const ui64 Cookie;
 
-        TLeaseCommit(ui32 step, TMonotonic start, TMonotonic leaseEnd)
+        TLeaseCommit(ui32 step, TMonotonic start, TMonotonic leaseEnd, ui64 cookie)
             : Step(step)
             , Start(start)
             , LeaseEnd(leaseEnd)
+            , Cookie(cookie)
         { }
     };
 
     TList<TLeaseCommit> LeaseCommits;
-    std::multimap<TMonotonic, TLeaseCommit*> LeaseCommitsByEnd;
+    TLeaseCommit::TByEndMap LeaseCommitsByEnd;
+    TIntrusiveList<TLeaseCommit> LeaseCommitsByStep;
+    ui64 LeaseCommitsCounter = 0;
 
     // TSeat's UniqID to an owned pointer
     absl::flat_hash_map<ui64, std::unique_ptr<TSeat>> Transactions;
@@ -450,7 +467,7 @@ class TExecutor
     THolder<TExecutorGCLogic> GcLogic;
     THolder<TCompactionLogic> CompactionLogic;
     THolder<TExecutorBorrowLogic> BorrowLogic;
-    THolder<TDataCleanupLogic> DataCleanupLogic;
+    THolder<TVacuumLogic> VacuumLogic;
 
     TLoadBlobQueue PendingBlobQueue;
 
@@ -461,7 +478,7 @@ class TExecutor
 
     TActorId Launcher;
 
-    THashMap<TPrivatePageCacheWaitPad*, THolder<TTransactionWaitPad>> TransactionWaitPads;
+    THashMap<NPageCollection::TPagesWaitPad*, TIntrusivePtr<TTransactionWaitPad>> TransactionWaitPads;
 
     ui64 TransactionUniqCounter = 0;
 
@@ -505,6 +522,7 @@ class TExecutor
     void CheckCollectionBarrier(TIntrusivePtr<TBarrier> &barrier);
     void UtilizeSubset(const NTable::TSubset&, const NTable::NFwd::TSeen&,
         THashSet<TLogoBlobID> reusedBundles, TLogCommit *commit);
+    void UtilizeSubset(const NTable::TSubset&, TLogCommit *commit);
     bool PrepareExternalPart(TPendingPartSwitch &partSwitch, NTable::TPartComponents &&pc);
     bool PrepareExternalPart(TPendingPartSwitch &partSwitch, TPendingPartSwitch::TNewBundle &bundle);
     bool PrepareExternalTxStatus(TPendingPartSwitch &partSwitch, const NPageCollection::TLargeGlobId &dataId, NTable::TEpoch epoch, const TString &data);
@@ -529,7 +547,9 @@ class TExecutor
     void EnqueueActivation(TSeat* seat, bool activate);
     void PlanTransactionActivation();
     void MakeLogSnapshot();
-    void ActivateWaitingTransactions(TPrivatePageCache::TPage::TWaitQueuePtr waitPadsQueue);
+    void TryActivateWaitingTransaction(TIntrusivePtr<NPageCollection::TPagesWaitPad>&& waitPad);
+    void ActivateWaitingTransaction(TIntrusivePtr<NPageCollection::TPagesWaitPad>&& waitPad);
+    void LogWaitingTransaction(TIntrusivePtr<NPageCollection::TPagesWaitPad>&& waitPad);
     void AddCachesOfBundle(const NTable::TPartView &partView);
     void AddSingleCache(const TIntrusivePtr<TPrivatePageCache::TInfo> &info);
     void DropCachesOfBundle(const NTable::TPart &part);
@@ -540,8 +560,6 @@ class TExecutor
     void RequestInMemPagesForPartStore(ui32 tableId, const NTable::TPartView &partView, const THashSet<NTable::TTag> &stickyColumns);
     void StickInMemPages(NSharedCache::TEvResult *msg);
     THashSet<NTable::TTag> GetStickyColumns(ui32 tableId);
-    void RequestFromSharedCache(TAutoPtr<NPageCollection::TFetch> fetch,
-        NBlockIO::EPriority way, EPageCollectionRequest requestCategory);
     THolder<TScanSnapshot> PrepareScanSnapshot(ui32 table,
         const NTable::TCompactionParams* params, TRowVersion snapshot = TRowVersion::Max());
     void ReleaseScanLocks(TIntrusivePtr<TBarrier>, const NTable::TSubset&);
@@ -560,12 +578,14 @@ class TExecutor
     void Wakeup(TEvents::TEvWakeup::TPtr &ev, const TActorContext &ctx);
     void Handle(TEvTablet::TEvDropLease::TPtr &ev, const TActorContext &ctx);
     void Handle(TEvPrivate::TEvLeaseExtend::TPtr &ev, const TActorContext &ctx);
+    void Handle(TEvTablet::TEvConfirmLeaderResult::TPtr &ev);
     void Handle(TEvTablet::TEvCommitResult::TPtr &ev, const TActorContext &ctx);
     void Handle(TEvPrivate::TEvActivateExecution::TPtr &ev, const TActorContext &ctx);
     void Handle(TEvPrivate::TEvActivateLowExecution::TPtr &ev, const TActorContext &ctx);
     void Handle(TEvPrivate::TEvBrokenTransaction::TPtr &ev, const TActorContext &ctx);
     void Handle(TEvents::TEvFlushLog::TPtr &ev);
     void Handle(TEvBlobStorage::TEvCollectGarbageResult::TPtr&);
+    void Handle(TEvPrivate::TEvRetryGcRequest::TPtr &ev, const TActorContext &ctx);
     void Handle(NSharedCache::TEvResult::TPtr &ev);
     void Handle(NSharedCache::TEvUpdated::TPtr &ev);
     void Handle(NResourceBroker::TEvResourceBroker::TEvResourceAllocated::TPtr&);
@@ -641,6 +661,8 @@ public:
     ui64 EnqueueLowPriority(TAutoPtr<ITransaction> transaction) override;
     bool CancelTransaction(ui64 id) override;
 
+    void LeaseConfirmed(ui64 confirmedCookie);
+    TLeaseCommit* AddLeaseConfirm();
     TLeaseCommit* AttachLeaseCommit(TLogCommit* commit, bool force = false);
     TLeaseCommit* EnsureReadOnlyLease(TMonotonic at);
     void ConfirmReadOnlyLease(TMonotonic at) override;
@@ -662,7 +684,7 @@ public:
     ui64 CompactTable(ui32 tableId) override;
     bool CompactTables() override;
 
-    void CleanupData(ui64 dataCleanupGeneration) override;
+    void StartVacuum(ui64 vacuumGeneration) override;
 
     void Handle(NMemory::TEvMemTableRegistered::TPtr &ev);
     void Handle(NMemory::TEvMemTableCompact::TPtr &ev);
@@ -706,7 +728,7 @@ public:
     TExecutor(NFlatExecutorSetup::ITablet *owner, const TActorId& ownerActorId);
     ~TExecutor();
 
-    bool OnUnhandledException(const std::exception&) override;
+    bool OnUnhandledException(const std::exception& exc) override;
 
     STFUNC(StateInit);
     STFUNC(StateBoot);

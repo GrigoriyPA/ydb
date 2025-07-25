@@ -2,6 +2,8 @@
 
 #include "defs.h"
 
+#include <yql/essentials/sql/v1/complete/core/input.h>
+
 #include <util/generic/fwd.h>
 #include <util/generic/string.h>
 #include <util/generic/vector.h>
@@ -34,10 +36,13 @@ namespace NSQLComplete {
         struct TConfig {
             std::unordered_set<TTokenId> IgnoredTokens;
             std::unordered_set<TRuleId> PreferredRules;
+            std::unordered_set<TRuleId> IgnoredRules;
+            std::unordered_map<TTokenId, std::unordered_set<TTokenId>> DisabledPreviousByToken;
+            std::unordered_map<TTokenId, std::unordered_set<TTokenId>> ForcedPreviousByToken;
         };
 
-        virtual TC3Candidates Complete(TStringBuf prefix) = 0;
         virtual ~IC3Engine() = default;
+        virtual TC3Candidates Complete(TStringBuf text, size_t caretTokenIndex) = 0;
     };
 
 } // namespace NSQLComplete

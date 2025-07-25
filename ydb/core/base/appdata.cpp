@@ -45,6 +45,7 @@ struct TAppData::TImpl {
     NKikimrStream::TStreamingConfig StreamingConfig;
     NKikimrPQ::TPQConfig PQConfig;
     NKikimrPQ::TPQClusterDiscoveryConfig PQClusterDiscoveryConfig;
+    NKikimrConfig::TKafkaProxyConfig KafkaProxyConfig;
     NKikimrNetClassifier::TNetClassifierConfig NetClassifierConfig;
     NKikimrNetClassifier::TNetClassifierDistributableConfig NetClassifierDistributableConfig;
     NKikimrConfig::TSqsConfig SqsConfig;
@@ -70,9 +71,11 @@ struct TAppData::TImpl {
     NKikimrConfig::TMemoryControllerConfig MemoryControllerConfig;
     NKikimrReplication::TReplicationDefaults ReplicationConfig;
     NKikimrProto::TDataIntegrityTrailsConfig DataIntegrityTrailsConfig;
-    NKikimrConfig::TDataErasureConfig DataErasureConfig;
+    NKikimrConfig::TDataErasureConfig ShredConfig;
     NKikimrConfig::THealthCheckConfig HealthCheckConfig;
     NKikimrConfig::TWorkloadManagerConfig WorkloadManagerConfig;
+    NKikimrConfig::TQueryServiceConfig QueryServiceConfig;
+    NKikimrConfig::TBridgeConfig BridgeConfig;
 };
 
 TAppData::TAppData(
@@ -104,6 +107,7 @@ TAppData::TAppData(
     , StreamingConfig(Impl->StreamingConfig)
     , PQConfig(Impl->PQConfig)
     , PQClusterDiscoveryConfig(Impl->PQClusterDiscoveryConfig)
+    , KafkaProxyConfig(Impl->KafkaProxyConfig)
     , NetClassifierConfig(Impl->NetClassifierConfig)
     , NetClassifierDistributableConfig(Impl->NetClassifierDistributableConfig)
     , SqsConfig(Impl->SqsConfig)
@@ -129,9 +133,11 @@ TAppData::TAppData(
     , MemoryControllerConfig(Impl->MemoryControllerConfig)
     , ReplicationConfig(Impl->ReplicationConfig)
     , DataIntegrityTrailsConfig(Impl->DataIntegrityTrailsConfig)
-    , DataErasureConfig(Impl->DataErasureConfig)
+    , ShredConfig(Impl->ShredConfig)
     , HealthCheckConfig(Impl->HealthCheckConfig)
     , WorkloadManagerConfig(Impl->WorkloadManagerConfig)
+    , QueryServiceConfig(Impl->QueryServiceConfig)
+    , BridgeConfig(Impl->BridgeConfig)
     , KikimrShouldContinue(kikimrShouldContinue)
     , TracingConfigurator(MakeIntrusive<NJaegerTracing::TSamplingThrottlingConfigurator>(TimeProvider, RandomProvider))
 {}

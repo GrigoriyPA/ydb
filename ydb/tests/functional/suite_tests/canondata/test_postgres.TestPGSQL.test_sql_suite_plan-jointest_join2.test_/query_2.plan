@@ -29,7 +29,7 @@
                                 "PlanNodeType": "Connection",
                                 "Plans": [
                                     {
-                                        "CTE Name": "precompute_0_0",
+                                        "CTE Name": "precompute",
                                         "Node Type": "TopSort-InnerJoin (MapJoin)-ConstantExpr-Filter",
                                         "Operators": [
                                             {
@@ -57,7 +57,7 @@
                                             {
                                                 "Inputs": [],
                                                 "Name": "ToFlow",
-                                                "ToFlow": "precompute_0_0"
+                                                "ToFlow": "precompute"
                                             },
                                             {
                                                 "Inputs": [
@@ -76,9 +76,9 @@
                                                     "n",
                                                     "name"
                                                 ],
-                                                "E-Cost": "No estimate",
-                                                "E-Rows": "No estimate",
-                                                "E-Size": "No estimate",
+                                                "E-Cost": "0",
+                                                "E-Rows": "0",
+                                                "E-Size": "0",
                                                 "LookupKeyColumns": [
                                                     "name"
                                                 ],
@@ -88,7 +88,7 @@
                                                 "PlanNodeType": "Connection",
                                                 "Plans": [
                                                     {
-                                                        "CTE Name": "precompute_0_0",
+                                                        "CTE Name": "precompute",
                                                         "Node Type": "ConstantExpr-Aggregate",
                                                         "Operators": [
                                                             {
@@ -101,7 +101,7 @@
                                                                 "Name": "Iterator"
                                                             },
                                                             {
-                                                                "Input": "precompute_0_0",
+                                                                "Input": "precompute",
                                                                 "Inputs": [],
                                                                 "Name": "PartitionByKey"
                                                             }
@@ -149,10 +149,6 @@
                                                         "Name": "TableFullScan",
                                                         "Path": "/Root/postgres_jointest/join2.test_plan/t2",
                                                         "ReadColumns": [
-                                                            "n",
-                                                            "name"
-                                                        ],
-                                                        "ReadRanges": [
                                                             "name (-\u221e, +\u221e)",
                                                             "n (-\u221e, +\u221e)"
                                                         ],
@@ -173,7 +169,7 @@
                         ]
                     }
                 ],
-                "Subplan Name": "CTE precompute_0_0"
+                "Subplan Name": "CTE precompute"
             }
         ],
         "Stats": {

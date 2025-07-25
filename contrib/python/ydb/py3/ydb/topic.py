@@ -16,6 +16,7 @@ __all__ = [
     "TopicReader",
     "TopicReaderAsyncIO",
     "TopicReaderBatch",
+    "TopicReaderEvents",
     "TopicReaderMessage",
     "TopicReaderSelector",
     "TopicReaderSettings",
@@ -42,6 +43,8 @@ from . import aio, Credentials, _apis, issues
 
 from . import driver
 
+from ._topic_reader import events as TopicReaderEvents
+
 from ._topic_reader.datatypes import (
     PublicBatch as TopicReaderBatch,
     PublicMessage as TopicReaderMessage,
@@ -52,7 +55,9 @@ from ._topic_reader.topic_reader import (
     PublicTopicSelector as TopicReaderSelector,
 )
 
-from ._topic_reader.topic_reader_sync import TopicReaderSync as TopicReader
+from ._topic_reader.topic_reader_sync import (
+    TopicReaderSync as TopicReader,
+)
 
 from ._topic_reader.topic_reader_asyncio import (
     PublicAsyncIOReader as TopicReaderAsyncIO,
@@ -117,7 +122,7 @@ class TopicClientAsyncIO:
     def __del__(self):
         if not self._closed:
             try:
-                logger.warning("Topic client was not closed properly. Consider using method close().")
+                logger.debug("Topic client was not closed properly. Consider using method close().")
                 self.close()
             except BaseException:
                 logger.warning("Something went wrong during topic client close in __del__")
@@ -156,6 +161,7 @@ class TopicClientAsyncIO:
         :param consumers: List of consumers for this topic
         :param metering_mode: Metering mode for the topic in a serverless database
         """
+        logger.debug("Create topic request: path=%s", path)
         args = locals().copy()
         del args["self"]
         req = _ydb_topic_public_types.CreateTopicRequestParams(**args)
@@ -205,6 +211,7 @@ class TopicClientAsyncIO:
         :param set_supported_codecs: List of allowed codecs for writers. Writes with codec not from this list are forbidden.
             Empty list mean disable codec compatibility checks for the topic.
         """
+        logger.debug("Alter topic request: path=%s", path)
         args = locals().copy()
         del args["self"]
         req = _ydb_topic_public_types.AlterTopicRequestParams(**args)
@@ -217,6 +224,7 @@ class TopicClientAsyncIO:
         )
 
     async def describe_topic(self, path: str, include_stats: bool = False) -> TopicDescription:
+        logger.debug("Describe topic request: path=%s", path)
         args = locals().copy()
         del args["self"]
         req = _ydb_topic_public_types.DescribeTopicRequestParams(**args)
@@ -229,6 +237,7 @@ class TopicClientAsyncIO:
         return res.to_public()
 
     async def drop_topic(self, path: str):
+        logger.debug("Drop topic request: path=%s", path)
         req = _ydb_topic_public_types.DropTopicRequestParams(path=path)
         await self._driver(
             req.to_proto(),
@@ -240,7 +249,7 @@ class TopicClientAsyncIO:
     def reader(
         self,
         topic: Union[str, TopicReaderSelector, List[Union[str, TopicReaderSelector]]],
-        consumer: str,
+        consumer: Optional[str],
         buffer_size_bytes: int = 50 * 1024 * 1024,
         # decoders: map[codec_code] func(encoded_bytes)->decoded_bytes
         # the func will be called from multiply threads in parallel
@@ -249,13 +258,33 @@ class TopicClientAsyncIO:
         # if max_worker in the executor is 1 - then decoders will be called from the thread without parallel
         decoder_executor: Optional[concurrent.futures.Executor] = None,
         auto_partitioning_support: Optional[bool] = True,  # Auto partitioning feature flag. Default - True.
+        event_handler: Optional[TopicReaderEvents.EventHandler] = None,
     ) -> TopicReaderAsyncIO:
+
+        logger.debug("Create reader for topic=%s consumer=%s", topic, consumer)
 
         if not decoder_executor:
             decoder_executor = self._executor
 
         args = locals().copy()
         del args["self"]
+
+        if consumer == "":
+            raise issues.Error(
+                "Consumer name could not be empty! To use reader without consumer specify consumer as None."
+            )
+
+        if consumer is None:
+            if not isinstance(topic, TopicReaderSelector) or topic.partitions is None:
+                raise issues.Error(
+                    "To use reader without consumer it is required to specify partition_ids in topic selector."
+                )
+
+            if event_handler is None:
+                raise issues.Error(
+                    "To use reader without consumer it is required to specify event_handler with "
+                    "on_partition_get_start_offset method."
+                )
 
         settings = TopicReaderSettings(**args)
 
@@ -278,6 +307,7 @@ class TopicClientAsyncIO:
         # If max_worker in the executor is 1 - then encoders will be called from the thread without parallel.
         encoder_executor: Optional[concurrent.futures.Executor] = None,
     ) -> TopicWriterAsyncIO:
+        logger.debug("Create writer for topic=%s producer_id=%s", topic, producer_id)
         args = locals().copy()
         del args["self"]
 
@@ -306,6 +336,7 @@ class TopicClientAsyncIO:
         # If max_worker in the executor is 1 - then encoders will be called from the thread without parallel.
         encoder_executor: Optional[concurrent.futures.Executor] = None,
     ) -> TopicTxWriterAsyncIO:
+        logger.debug("Create tx writer for topic=%s tx=%s", topic, tx)
         args = locals().copy()
         del args["self"]
         del args["tx"]
@@ -317,10 +348,36 @@ class TopicClientAsyncIO:
 
         return TopicTxWriterAsyncIO(tx=tx, driver=self._driver, settings=settings, _client=self)
 
+    async def commit_offset(
+        self, path: str, consumer: str, partition_id: int, offset: int, read_session_id: Optional[str] = None
+    ) -> None:
+        logger.debug(
+            "Commit offset: path=%s partition_id=%s offset=%s consumer=%s",
+            path,
+            partition_id,
+            offset,
+            consumer,
+        )
+        req = _ydb_topic.CommitOffsetRequest(
+            path=path,
+            consumer=consumer,
+            partition_id=partition_id,
+            offset=offset,
+            read_session_id=read_session_id,
+        )
+
+        await self._driver(
+            req.to_proto(),
+            _apis.TopicService.Stub,
+            _apis.TopicService.CommitOffset,
+            _wrap_operation,
+        )
+
     def close(self):
         if self._closed:
             return
 
+        logger.debug("Close topic client")
         self._closed = True
         self._executor.shutdown(wait=False)
 
@@ -392,6 +449,7 @@ class TopicClient:
         :param consumers: List of consumers for this topic
         :param metering_mode: Metering mode for the topic in a serverless database
         """
+        logger.debug("Create topic request: path=%s", path)
         args = locals().copy()
         del args["self"]
         self._check_closed()
@@ -443,6 +501,7 @@ class TopicClient:
         :param set_supported_codecs: List of allowed codecs for writers. Writes with codec not from this list are forbidden.
             Empty list mean disable codec compatibility checks for the topic.
         """
+        logger.debug("Alter topic request: path=%s", path)
         args = locals().copy()
         del args["self"]
         self._check_closed()
@@ -457,6 +516,7 @@ class TopicClient:
         )
 
     def describe_topic(self, path: str, include_stats: bool = False) -> TopicDescription:
+        logger.debug("Describe topic request: path=%s", path)
         args = locals().copy()
         del args["self"]
         self._check_closed()
@@ -473,6 +533,8 @@ class TopicClient:
     def drop_topic(self, path: str):
         self._check_closed()
 
+        logger.debug("Drop topic request: path=%s", path)
+
         req = _ydb_topic_public_types.DropTopicRequestParams(path=path)
         self._driver(
             req.to_proto(),
@@ -484,7 +546,7 @@ class TopicClient:
     def reader(
         self,
         topic: Union[str, TopicReaderSelector, List[Union[str, TopicReaderSelector]]],
-        consumer: str,
+        consumer: Optional[str],
         buffer_size_bytes: int = 50 * 1024 * 1024,
         # decoders: map[codec_code] func(encoded_bytes)->decoded_bytes
         # the func will be called from multiply threads in parallel
@@ -493,13 +555,31 @@ class TopicClient:
         # if max_worker in the executor is 1 - then decoders will be called from the thread without parallel
         decoder_executor: Optional[concurrent.futures.Executor] = None,  # default shared client executor pool
         auto_partitioning_support: Optional[bool] = True,  # Auto partitioning feature flag. Default - True.
+        event_handler: Optional[TopicReaderEvents.EventHandler] = None,
     ) -> TopicReader:
+        logger.debug("Create reader for topic=%s consumer=%s", topic, consumer)
         if not decoder_executor:
             decoder_executor = self._executor
 
         args = locals().copy()
         del args["self"]
-        self._check_closed()
+
+        if consumer == "":
+            raise issues.Error(
+                "Consumer name could not be empty! To use reader without consumer specify consumer as None."
+            )
+
+        if consumer is None:
+            if not isinstance(topic, TopicReaderSelector) or topic.partitions is None:
+                raise issues.Error(
+                    "To use reader without consumer it is required to specify partition_ids in topic selector."
+                )
+
+            if event_handler is None:
+                raise issues.Error(
+                    "To use reader without consumer it is required to specify event_handler with "
+                    "on_partition_get_start_offset method."
+                )
 
         settings = TopicReaderSettings(**args)
 
@@ -522,6 +602,7 @@ class TopicClient:
         # If max_worker in the executor is 1 - then encoders will be called from the thread without parallel.
         encoder_executor: Optional[concurrent.futures.Executor] = None,  # default shared client executor pool
     ) -> TopicWriter:
+        logger.debug("Create writer for topic=%s producer_id=%s", topic, producer_id)
         args = locals().copy()
         del args["self"]
         self._check_closed()
@@ -551,6 +632,7 @@ class TopicClient:
         # If max_worker in the executor is 1 - then encoders will be called from the thread without parallel.
         encoder_executor: Optional[concurrent.futures.Executor] = None,  # default shared client executor pool
     ) -> TopicWriter:
+        logger.debug("Create tx writer for topic=%s tx=%s", topic, tx)
         args = locals().copy()
         del args["self"]
         del args["tx"]
@@ -563,12 +645,39 @@ class TopicClient:
 
         return TopicTxWriter(tx, self._driver, settings, _parent=self)
 
+    def commit_offset(
+        self, path: str, consumer: str, partition_id: int, offset: int, read_session_id: Optional[str] = None
+    ) -> None:
+        logger.debug(
+            "Commit offset: path=%s partition_id=%s offset=%s consumer=%s",
+            path,
+            partition_id,
+            offset,
+            consumer,
+        )
+        req = _ydb_topic.CommitOffsetRequest(
+            path=path,
+            consumer=consumer,
+            partition_id=partition_id,
+            offset=offset,
+            read_session_id=read_session_id,
+        )
+
+        self._driver(
+            req.to_proto(),
+            _apis.TopicService.Stub,
+            _apis.TopicService.CommitOffset,
+            _wrap_operation,
+        )
+
     def close(self):
         if self._closed:
             return
 
+        logger.debug("Close topic client")
         self._closed = True
         self._executor.shutdown(wait=False)
+        logger.debug("Topic client was closed")
 
     def _check_closed(self):
         if not self._closed:

@@ -54,7 +54,6 @@ class DataService(DataServiceServicer):
         response_query.query_name = "query"
 
         timeseries = response_query.timeseries_vector.values.add()
-        timeseries.name = "name"
         for key, value in labels.items():
             timeseries.labels[key] = str(value)
         timeseries.type = MetricType.RATE
@@ -94,7 +93,7 @@ def start(argv):
 
 
 def _update_environment(port: int):
-    endpoint = "localhost"
+    endpoint = f"localhost:{port}"
     url = "localhost"
     set_env("SOLOMON_HOST", "localhost")
     set_env("SOLOMON_PORT", str(port))

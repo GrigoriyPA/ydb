@@ -99,8 +99,15 @@ public:
             Self->Become(&TNodeBroker::StateWork);
             Self->SubscribeForConfigUpdates(ctx);
             Self->ScheduleEpochUpdate(ctx);
+            Self->ScheduleProcessSubscribersQueue(ctx);
             Self->PrepareEpochCache();
-            Self->SignalTabletActive(ctx);
+            Self->PrepareUpdateNodesLog();
+
+            NKikimrNodeBroker::TVersionInfo versionInfo;
+            versionInfo.SetSupportDeltaProtocol(true);
+            Self->SignalTabletActive(ctx, versionInfo.SerializeAsString());
+
+            Self->UpdateCommittedStateCounters();
         } else {
             Self->Execute(Self->CreateTxMigrateState(std::move(DbChanges)));
         }

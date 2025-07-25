@@ -55,8 +55,9 @@ class TController::TTxInit: public TTxBase {
             const auto issue = rowset.GetValue<Schema::Replications::Issue>();
             const auto nextTid = rowset.GetValue<Schema::Replications::NextTargetId>();
             const auto desiredState = rowset.GetValue<Schema::Replications::DesiredState>();
+            const auto database = rowset.GetValue<Schema::Replications::Database>();
 
-            auto replication = Self->Add(rid, pathId, config);
+            auto replication = Self->Add(rid, pathId, config, database);
             replication->SetState(state, issue);
             replication->SetNextTargetId(nextTid);
             replication->SetDesiredState(desiredState);
@@ -88,6 +89,7 @@ class TController::TTxInit: public TTxBase {
                 rowset.GetValue<Schema::Targets::DstPathLocalId>()
             );
             const auto transformLambda = rowset.GetValue<Schema::Targets::TransformLambda>();
+            const auto runAsUser = rowset.GetValue<Schema::Targets::RunAsUser>();
 
             auto replication = Self->Find(rid);
             Y_VERIFY_S(replication, "Unknown replication: " << rid);
@@ -103,7 +105,7 @@ class TController::TTxInit: public TTxBase {
                     break;
 
                 case TReplication::ETargetKind::Transfer:
-                    config = std::make_shared<TTargetTransfer::TTransferConfig>(srcPath, dstPath, transformLambda);
+                    config = std::make_shared<TTargetTransfer::TTransferConfig>(srcPath, dstPath, transformLambda, runAsUser);
                     break;
             }
 

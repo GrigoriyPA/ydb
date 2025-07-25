@@ -87,7 +87,11 @@ public:
             Self->Committed.ExtendLease(node);
             Self->Committed.UpdateEpochVersion();
             Self->AddNodeToEpochCache(node);
+            Self->AddNodeToUpdateNodesLog(node);
+            Self->ScheduleProcessSubscribersQueue(ctx);
         }
+
+        Self->UpdateCommittedStateCounters();
     }
 
 private:

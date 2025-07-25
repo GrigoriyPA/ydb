@@ -369,6 +369,15 @@ SELECT RemoveTimezone(TzDatetime("2018-02-01T12:00:00,Europe/Moscow"));
 SELECT Version();
 ```
 
+## CurrentLanguageVersion {#current-language-version}
+
+`CurrentLanguageVersion()` returns a string describing the current version of the language selected for the current request if it is defined, or an empty string.
+
+#### Examples
+
+```yql
+SELECT CurrentLanguageVersion();
+```
 
 
 ## MAX_OF, MIN_OF, GREATEST, and LEAST {#max-min}
@@ -742,7 +751,7 @@ Getting the path to the root of a directory with several "attached" files with t
 
 The argument is a string with a prefix among aliases.
 
-See also [PRAGMA File](../syntax/pragma.md#file) and [PRAGMA Folder](../syntax/pragma.md#folder).
+See also [PRAGMA File](../syntax/pragma/file.md#file) and [PRAGMA Folder](../syntax/pragma/file.md#folder).
 
 #### Examples
 
@@ -833,7 +842,7 @@ Evaluate an expression before the start of the main calculation and input its re
 
 EvaluateExpr can be used where the grammar already expects an expression. For example, you can use it to:
 
-* Round the current time to days, weeks, or months and insert it into the query to ensure correct [query caching](../syntax/pragma.md#yt.querycachemode), although usually when [functions are used to get the current time](#current-utc), query caching is completely disabled.
+* Round the current time to days, weeks, or months and insert it into the query to ensure correct query caching, although usually when [functions are used to get the current time](#current-utc), query caching is completely disabled.
 * Run a heavy calculation with a small result once per query instead of once per job.
 
 EvaluateAtom lets you dynamically create an [atom](../types/special.md), but since atoms are mainly controlled from a lower [s-expressions](/docs/s_expressions/functions) level, it's generally not recommended to use this function directly.
@@ -950,16 +959,22 @@ SELECT
 
 Arguments:
 
-1. An unsigned number that's subject to the operation. TestBit is also implemented for strings.
+1. An unsigned number that's subject to the operation. `TestBit` is also implemented for strings (see the description below).
 2. Number of the bit.
 
-TestBit returns `true/false`. The other functions return a copy of their first argument with the corresponding conversion.
+`TestBit` returns `true/false`. The other functions return a copy of their first argument with the corresponding conversion.
+
+`TestBit` works the following way for the string argument:
+
+1. For the second argument (the number of the bit) the corresponding byte **from the beginning of the string** is chosen.
+2. Next, for the given byte the corresponding LSB is chosen.
 
 #### Examples
 
 ```yql
 SELECT
     TestBit(1u, 0), -- true
+    TestBit('ax', 12) -- true (second byte, fourth bit)
     SetBit(8u, 0); -- 9
 ```
 

@@ -92,7 +92,7 @@ public:
 
     static TWritePortionInfoWithBlobsConstructor BuildByBlobs(std::vector<TSplittedBlob>&& chunks,
         const THashMap<ui32, std::shared_ptr<IPortionDataChunk>>& inplaceChunks, const TInternalPathId granule, const ui64 schemaVersion,
-        const TSnapshot& snapshot, const std::shared_ptr<IStoragesManager>& operators);
+        const TSnapshot& snapshot, const std::shared_ptr<IStoragesManager>& operators, const EPortionType type);
 
     static TWritePortionInfoWithBlobsConstructor BuildByBlobs(std::vector<TSplittedBlob>&& chunks,
         const THashMap<ui32, std::shared_ptr<IPortionDataChunk>>& inplaceChunks, TPortionAccessorConstructor&& constructor,
@@ -147,7 +147,7 @@ public:
 
 private:
     std::optional<TPortionAccessorConstructor> PortionConstructor;
-    std::optional<TPortionDataAccessor> PortionResult;
+    std::optional<std::shared_ptr<TPortionDataAccessor>> PortionResult;
     YDB_READONLY_DEF(std::vector<TBlobInfo>, Blobs);
 
     TString GetBlobByAddressVerified(const ui32 entityId, const ui32 chunkIdx) const {
@@ -214,6 +214,14 @@ public:
     const TPortionDataAccessor& GetPortionResult() const {
         AFL_VERIFY(!PortionConstructor);
         AFL_VERIFY(!!PortionResult);
+        AFL_VERIFY(!!*PortionResult);
+        return **PortionResult;
+    }
+
+    const std::shared_ptr<TPortionDataAccessor>& GetPortionResultPtr() const {
+        AFL_VERIFY(!PortionConstructor);
+        AFL_VERIFY(!!PortionResult);
+        AFL_VERIFY(!!*PortionResult);
         return *PortionResult;
     }
 
