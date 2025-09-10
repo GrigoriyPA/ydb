@@ -348,7 +348,7 @@ private:
 public:
     TTopicFormatHandler(const TFormatHandlerConfig& config, const TSettings& settings, const TCountersDesc& counters)
         : TBase(&TTopicFormatHandler::StateFunc)
-        , TTypeParser(__LOCATION__, counters.CopyWithNewMkqlCountersName("row_dispatcher"))
+        , TTypeParser(__LOCATION__, config.FunctionRegistry, counters.CopyWithNewMkqlCountersName("row_dispatcher"))
         , Config(config)
         , Settings(settings)
         , LogPrefix(TStringBuilder() << "TTopicFormatHandler [" << Settings.ParsingFormat << "]: ")
@@ -580,7 +580,7 @@ private:
     TValueStatus<ITopicParser::TPtr> CreateParserForFormat() const {
         const auto& counters = Counters.Desc.CopyWithNewMkqlCountersName("row_dispatcher_parser");
         if (Settings.ParsingFormat == "raw") {
-            return CreateRawParser(ParserHandler, counters);
+            return CreateRawParser(ParserHandler, Config.FunctionRegistry, counters);
         }
         if (Settings.ParsingFormat == "json_each_row") {
             return CreateJsonParser(ParserHandler, Config.JsonParserConfig, counters);
@@ -666,9 +666,10 @@ ITopicFormatHandler::TPtr CreateTopicFormatHandler(const NActors::TActorContext&
     return ITopicFormatHandler::TPtr(handler);
 }
 
-TFormatHandlerConfig CreateFormatHandlerConfig(const NKikimrConfig::TSharedReadingConfig& rowDispatcherConfig, NActors::TActorId compileServiceId) {
+TFormatHandlerConfig CreateFormatHandlerConfig(const NKikimrConfig::TSharedReadingConfig& rowDispatcherConfig, const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry, NActors::TActorId compileServiceId) {
     return {
-        .JsonParserConfig = CreateJsonParserConfig(rowDispatcherConfig.GetJsonParser()),
+        .FunctionRegistry = functionRegistry,
+        .JsonParserConfig = CreateJsonParserConfig(rowDispatcherConfig.GetJsonParser(), functionRegistry),
         .FiltersConfig = {
             .CompileServiceId = compileServiceId
         }

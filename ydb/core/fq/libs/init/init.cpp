@@ -292,6 +292,7 @@ void Init(
             config,
             NKikimr::CreateYdbCredentialsProviderFactory,
             credentialsFactory,
+            appData->FunctionRegistry,
             tenant,
             yqCounters->GetSubgroup("subsystem", "row_dispatcher"),
             pqGatewayFactory ? pqGatewayFactory->CreatePqGateway() : CreatePqNativeGateway(pqServices),

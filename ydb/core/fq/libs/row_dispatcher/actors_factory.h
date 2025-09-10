@@ -5,6 +5,8 @@
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/driver/driver.h>
 #include <ydb/library/yql/providers/pq/provider/yql_pq_gateway.h>
 
+#include <yql/essentials/minikql/mkql_function_registry.h>
+
 namespace NKikimrConfig {
 class TSharedReadingConfig;
 } // namespace NKikimrConfig
@@ -20,6 +22,7 @@ struct IActorFactory : public TThrRefBase {
         const TString& endpoint,
         const TString& database,
         const NKikimrConfig::TSharedReadingConfig& config,
+        const NKikimr::NMiniKQL::IFunctionRegistry* functionRegistry,
         NActors::TActorId rowDispatcherActorId,
         NActors::TActorId compileServiceActorId,
         ui32 partitionId,
