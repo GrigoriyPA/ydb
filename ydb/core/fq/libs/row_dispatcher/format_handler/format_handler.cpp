@@ -551,27 +551,35 @@ private:
 
         if (Parser) {
             Parser->Refresh(true);
-            Parser.Reset();
         }
 
         LOG_ROW_DISPATCHER_DEBUG("UpdateParser to new schema with size " << parerSchema.size());
         ParserHandler = MakeIntrusive<TParserHandler>(*this, std::move(parerSchema));
 
         if (const ui64 schemaSize = ParserHandler->GetColumns().size()) {
-            auto newParser = CreateParserForFormat();
-            if (newParser.IsFail()) {
-                return newParser;
+            if (!Parser) {
+                auto newParser = CreateParserForFormat();
+                if (newParser.IsFail()) {
+                    return newParser;
+                }
+
+                Parser = newParser.DetachResult();
+                LOG_ROW_DISPATCHER_DEBUG("Parser was created on schema with " << schemaSize << " columns");
+            } else {
+                if (auto status = Parser->ChangeConsumer(ParserHandler); status.IsFail()) {
+                    return status;
+                }
+
+                LOG_ROW_DISPATCHER_DEBUG("Parser was updated on new schema with " << schemaSize << " columns");
             }
 
-            LOG_ROW_DISPATCHER_DEBUG("Parser was updated on new schema with " << schemaSize << " columns");
-
-            Parser = newParser.DetachResult();
             ParserSchemaIndex.resize(MaxColumnId, std::numeric_limits<ui64>::max());
             for (ui64 i = 0; const auto& [_, columnDesc] : ColumnsDesc) {
                 ParserSchemaIndex[columnDesc.ColumnId] = i++;
             }
         } else {
             LOG_ROW_DISPATCHER_INFO("No columns to parse, reset parser");
+            Parser.Reset();
         }
 
         return TStatus::Success();
