@@ -7,6 +7,14 @@ PEERDIR(
     ydb/library/yql/dq/expr_nodes
     ydb/library/yql/dq/proto
     yql/essentials/providers/common/provider
+
+
+
+
+
+
+
+    ydb/library/yql/providers/dq/expr_nodes
 )
 
 SRCS(

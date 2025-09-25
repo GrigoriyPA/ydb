@@ -13730,14 +13730,18 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
             auto& extFunctions = TSyncFunctionsMap::Instance().ExtFunctions;
             auto& columnOrderFunctions = TSyncFunctionsMap::Instance().ColumnOrderFunctions;
             auto name = input->Content();
+            if (name == "DqSourceWrap") Cerr << "--------------------- TExtCallableTypeAnnotationTransformer::ProcessCore, annotate TDqSourceWrap start\n";
             IGraphTransformer::TStatus status = IGraphTransformer::TStatus::Ok;
             if (auto func = functions.FindPtr(name)) {
                 TContext funcCtx(ctx);
                 status = (*func)(input, output, funcCtx);
+                if (name == "DqSourceWrap") Cerr << "--------------------- TExtCallableTypeAnnotationTransformer::ProcessCore, TDqSourceWrap found in Functions\n";
             } else if (auto func = extFunctions.FindPtr(name)) {
                 TExtContext funcCtx(ctx, Types_);
                 status = (*func)(input, output, funcCtx);
+                if (name == "DqSourceWrap") Cerr << "--------------------- TExtCallableTypeAnnotationTransformer::ProcessCore, TDqSourceWrap found in ExtFunctions\n";
             } else {
+                if (name == "DqSourceWrap") Cerr << "--------------------- TExtCallableTypeAnnotationTransformer::ProcessCore, TDqSourceWrap not found!\n";
                 return Nothing();
             }
 

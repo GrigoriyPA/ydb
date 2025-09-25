@@ -11,6 +11,8 @@
 
 #include <library/cpp/containers/absl_flat_hash/flat_hash_set.h>
 
+#include "ydb/library/yql/providers/dq/expr_nodes/dqs_expr_nodes.h"
+
 namespace NKikimr::NKqp::NOpt {
 
 using namespace NYql;
@@ -2359,6 +2361,8 @@ TAutoPtr<IGraphTransformer> CreateKqpTypeAnnotationTransformer(const TString& cl
         {
             output = input;
 
+            if (TDqSourceWrap::Match(input.Get())) Cerr << "--------------------- CreateKqpTypeAnnotationTransformer, annotate TDqSourceWrap start\n";
+
             TIssueScopeGuard issueScope(ctx.IssueManager, [&input, &ctx] {
                 return MakeIntrusive<TIssue>(ctx.GetPosition(input->Pos()),
                         TStringBuilder() << "At function: " << input->Content());
@@ -2560,6 +2564,7 @@ TAutoPtr<IGraphTransformer> CreateKqpTypeAnnotationTransformer(const TString& cl
                 return AnnotateOpRoot(input, ctx);
             }
 
+            if (TDqSourceWrap::Match(input.Get())) Cerr << "--------------------- CreateKqpTypeAnnotationTransformer, annotate TDqSourceWrap delegate to DQ\n";
             return dqTransformer->Transform(input, output, ctx);
         });
 }

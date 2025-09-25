@@ -9,6 +9,8 @@
 
 #include <yql/essentials/providers/common/provider/yql_provider.h>
 
+#include "ydb/library/yql/providers/dq/expr_nodes/dqs_expr_nodes.h"
+
 namespace NYql::NDq {
 
 using namespace NYql::NNodes;
@@ -1373,6 +1375,7 @@ THolder<IGraphTransformer> CreateDqTypeAnnotationTransformer(TTypeAnnotationCont
 
     return CreateFunctorTransformer(
         [coreTransformer](const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) {
+            if (TDqSourceWrap::Match(input.Get())) Cerr << "--------------------- CreateDqTypeAnnotationTransformer, annotate TDqSourceWrap start\n";
             output = input;
             TIssueScopeGuard issueScope(ctx.IssueManager, [&input, &ctx] {
                 return MakeIntrusive<TIssue>(ctx.GetPosition(input->Pos()),
@@ -1491,6 +1494,9 @@ THolder<IGraphTransformer> CreateDqTypeAnnotationTransformer(TTypeAnnotationCont
                 return AnnotateDqHashCombine(input, ctx);
             }
 
+            // if (TDq)
+
+            if (TDqSourceWrap::Match(input.Get())) Cerr << "--------------------- CreateDqTypeAnnotationTransformer, annotate TDqSourceWrap delegate to CORE\n";
             return coreTransformer->Transform(input, output, ctx);
         });
 }
