@@ -175,13 +175,12 @@ struct TEvScriptLeaseUpdateResponse : public TEventLocal<TEvScriptLeaseUpdateRes
         , CurrentDeadline(currentDeadline)
         , Status(status)
         , Issues(std::move(issues))
-    {
-    }
+    {}
 
-    bool ExecutionEntryExists;
-    TInstant CurrentDeadline;
-    Ydb::StatusIds::StatusCode Status;
-    NYql::TIssues Issues;
+    const bool ExecutionEntryExists = false;
+    const TInstant CurrentDeadline;
+    const Ydb::StatusIds::StatusCode Status;
+    const NYql::TIssues Issues;
 };
 
 struct TEvCheckAliveRequest : public TEventPB<TEvCheckAliveRequest, NKikimrKqp::TEvCheckAliveRequest, TKqpScriptExecutionEvents::EvCheckAliveRequest> {
@@ -342,8 +341,22 @@ struct TEvSaveScriptPhysicalGraphResponse : public TEventLocal<TEvSaveScriptPhys
     NYql::TIssues Issues;
 };
 
+struct TEvGetScriptExecutionPhysicalGraph : public TEventWithDatabaseId<TEvGetScriptExecutionPhysicalGraph, TKqpScriptExecutionEvents::EvGetScriptExecutionPhysicalGraph> {
+    TEvGetScriptExecutionPhysicalGraph(const TString& database, const TString& executionId)
+        : TEventWithDatabaseId(database)
+        , ExecutionId(executionId)
+    {}
+
+    const TString ExecutionId;
+};
+
 struct TEvGetScriptPhysicalGraphResponse : public TEventLocal<TEvGetScriptPhysicalGraphResponse, TKqpScriptExecutionEvents::EvGetScriptPhysicalGraphResponse> {
-    TEvGetScriptPhysicalGraphResponse(Ydb::StatusIds::StatusCode status, NKikimrKqp::TQueryPhysicalGraph&& physicalGraph, i64 generation, NYql::TIssues issues)
+    TEvGetScriptPhysicalGraphResponse(Ydb::StatusIds::StatusCode status, NYql::TIssues issues)
+        : Status(status)
+        , Issues(std::move(issues))
+    {}
+
+    TEvGetScriptPhysicalGraphResponse(Ydb::StatusIds::StatusCode status, std::optional<NKikimrKqp::TQueryPhysicalGraph>&& physicalGraph, i64 generation, NYql::TIssues issues)
         : Status(status)
         , PhysicalGraph(std::move(physicalGraph))
         , Generation(generation)
@@ -351,7 +364,7 @@ struct TEvGetScriptPhysicalGraphResponse : public TEventLocal<TEvGetScriptPhysic
     {}
 
     Ydb::StatusIds::StatusCode Status;
-    NKikimrKqp::TQueryPhysicalGraph PhysicalGraph;
+    std::optional<NKikimrKqp::TQueryPhysicalGraph> PhysicalGraph;
     i64 Generation = 0;
     NYql::TIssues Issues;
 };
@@ -360,7 +373,7 @@ struct TEvScriptFinalizeRequest : public TEventLocal<TEvScriptFinalizeRequest, T
     struct TDescription {
         TDescription(EFinalizationStatus finalizationStatus, const TString& executionId, const TString& database,
         Ydb::StatusIds::StatusCode operationStatus, Ydb::Query::ExecStatus execStatus, NYql::TIssues issues, std::optional<NKqpProto::TKqpStatsQuery> queryStats,
-        std::optional<TString> queryPlan, std::optional<TString> queryAst, i64 leaseGeneration)
+        std::optional<TString> queryPlan, std::optional<TString> queryAst, i64 leaseGeneration, bool cancelledByUser = false)
             : FinalizationStatus(finalizationStatus)
             , ExecutionId(executionId)
             , Database(database)
@@ -371,6 +384,7 @@ struct TEvScriptFinalizeRequest : public TEventLocal<TEvScriptFinalizeRequest, T
             , QueryPlan(std::move(queryPlan))
             , QueryAst(std::move(queryAst))
             , LeaseGeneration(leaseGeneration)
+            , CancelledByUser(cancelledByUser)
         {}
 
         EFinalizationStatus FinalizationStatus;
@@ -383,14 +397,15 @@ struct TEvScriptFinalizeRequest : public TEventLocal<TEvScriptFinalizeRequest, T
         std::optional<TString> QueryPlan;
         std::optional<TString> QueryAst;
         i64 LeaseGeneration;
+        bool CancelledByUser = false; // User cancel API; false when status is CANCELLED from execution (e.g. streaming retry).
         std::optional<TString> QueryPlanCompressionMethod;
         std::optional<TString> QueryAstCompressionMethod;
     };
 
     TEvScriptFinalizeRequest(EFinalizationStatus finalizationStatus, const TString& executionId, const TString& database,
         Ydb::StatusIds::StatusCode operationStatus, Ydb::Query::ExecStatus execStatus, NYql::TIssues issues, std::optional<NKqpProto::TKqpStatsQuery> queryStats,
-        std::optional<TString> queryPlan, std::optional<TString> queryAst, i64 leaseGeneration)
-        : Description(finalizationStatus, executionId, database, operationStatus, execStatus, issues, queryStats, queryPlan, queryAst, leaseGeneration)
+        std::optional<TString> queryPlan, std::optional<TString> queryAst, i64 leaseGeneration, bool cancelledByUser = false)
+        : Description(finalizationStatus, executionId, database, operationStatus, execStatus, issues, queryStats, queryPlan, queryAst, leaseGeneration, cancelledByUser)
     {}
 
     TDescription Description;
@@ -434,6 +449,30 @@ struct TEvDescribeSecretsResponse : public TEventLocal<TEvDescribeSecretsRespons
     };
 
     TEvDescribeSecretsResponse(const TDescription& description)
+        : Description(description)
+    {}
+
+    TDescription Description;
+};
+
+struct TEvDescribeResourceIdResponse : public TEventLocal<TEvDescribeResourceIdResponse, TKqpScriptExecutionEvents::EvDescribeResourceIdResponse> {
+    struct TDescription {
+        TDescription(Ydb::StatusIds::StatusCode status, NYql::TIssues issues)
+            : Status(status)
+            , Issues(std::move(issues))
+        {}
+
+        TDescription(const TString& resourceId)
+            : ResourceId(resourceId)
+            , Status(Ydb::StatusIds::SUCCESS)
+        {}
+
+        TString ResourceId;
+        Ydb::StatusIds::StatusCode Status;
+        NYql::TIssues Issues;
+    };
+
+    TEvDescribeResourceIdResponse(const TDescription& description)
         : Description(description)
     {}
 

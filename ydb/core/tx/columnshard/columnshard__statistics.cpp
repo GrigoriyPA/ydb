@@ -12,13 +12,13 @@
 
 namespace NKikimr::NColumnShard {
 
-void TColumnShard::Handle(NStat::TEvStatistics::TEvAnalyzeTable::TPtr& ev, const TActorContext&) {
+void TColumnShard::Handle(NStat::TEvStatistics::TEvAnalyzeShard::TPtr& ev, const TActorContext&) {
     auto& requestRecord = ev->Get()->Record;
     // TODO Start a potentially long analysis process.
     // ...
 
     // Return the response when the analysis is completed
-    auto response = std::make_unique<NStat::TEvStatistics::TEvAnalyzeTableResponse>();
+    auto response = std::make_unique<NStat::TEvStatistics::TEvAnalyzeShardResponse>();
     auto& responseRecord = response->Record;
     responseRecord.SetOperationId(requestRecord.GetOperationId());
     responseRecord.MutablePathId()->CopyFrom(requestRecord.GetTable().GetPathId());
@@ -52,7 +52,7 @@ private:
             auto* column = respRecord.AddColumns();
             column->SetTag(columnTag);
             auto* statistic = column->AddStatistics();
-            statistic->SetType(NStat::COUNT_MIN_SKETCH);
+            statistic->SetType(static_cast<ui32>(NStat::EStatType::COUNT_MIN_SKETCH));
             statistic->SetData(TString(sketch->AsStringBuf()));
         }
 
@@ -189,6 +189,14 @@ public:
             THashMap<ui32, std::unique_ptr<TCountMinSketch>> sketchesByColumns;
             for (auto id : ColumnTagsRequested) {
                 sketchesByColumns.emplace(id, TCountMinSketch::Create());
+            }
+            
+            if (result.HasErrors()) {
+                AFL_ERROR(NKikimrServices::TX_COLUMNSHARD)("error", "Data accessor result with errors " + result.GetErrorMessage());
+            }
+            
+            if (result.HasRemovedData()) {
+                AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD)("error", TStringBuilder{} << "Data accessor result with removed data, " << result.GetRemovedData().size());
             }
 
             THashMap<ui32, THashMap<TString, THashSet<NOlap::TBlobRange>>> rangesByColumn;

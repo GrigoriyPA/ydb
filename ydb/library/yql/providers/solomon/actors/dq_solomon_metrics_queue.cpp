@@ -13,6 +13,7 @@
 #include <yql/essentials/public/issue/yql_issue.h>
 #include <yql/essentials/utils/yql_panic.h>
 
+#include <util/generic/size_literals.h>
 #include <util/string/join.h>
 
 #define LOG_E(name, stream) \
@@ -77,14 +78,18 @@ public:
     TDqSolomonMetricsQueueActor(
         ui64 consumersCount,
         TDqSolomonReadParams&& readParams,
+        bool enableSolomonClientPostApi,
         ui64 batchCountLimit,
+        ui64 prefetchSize,
         TDuration truePointsFindRange,
         ui64 maxListingPageSize,
         ui64 maxApiInflight,
         std::shared_ptr<NYdb::ICredentialsProvider> credentialsProvider)
         : ConsumersCount(consumersCount)
         , ReadParams(std::move(readParams))
+        , EnableSolomonClientPostApi(enableSolomonClientPostApi)
         , BatchCountLimit(batchCountLimit)
+        , PrefetchSize(prefetchSize)
         , TrueRangeFrom(TInstant::Seconds(ReadParams.Source.GetFrom()) - truePointsFindRange)
         , TrueRangeTo(TInstant::Seconds(ReadParams.Source.GetTo()) + truePointsFindRange)
         , MaxListingPageSize(maxListingPageSize)
@@ -218,8 +223,18 @@ private:
                 return;
             }
 
-            ui64 metricsPerLabelValue = std::max<ui64>(1, listLabelsResult.TotalCount / label.Values.size());
+            double metricsPerLabelValue = std::max<double>(1, listLabelsResult.TotalCount * 1.0 / label.Values.size());
             ui64 batchSize = std::max<ui64>(1, MaxListingPageSize * 0.75 / metricsPerLabelValue);
+
+            if (!EnableSolomonClientPostApi) {
+                ui64 sumLength = 0;
+                for (const auto& value: label.Values) {
+                    sumLength += value.size();
+                }
+
+                double avgLength = std::max<double>(1.0, sumLength * 1.0 / label.Values.size());
+                batchSize = std::min<ui64>(batchSize, MaxHttpGetRequestSize * 0.5 / avgLength);
+            }
 
             for (ui64 i = 0; i * batchSize < label.Values.size(); i++) {
                 auto batchFromIt = label.Values.begin() + i * batchSize;
@@ -306,7 +321,7 @@ private:
 
     bool TryFetch() {
         if (CurrentInflight >= MaxApiInflight) {
-            LOG_D("TDqSolomonMetricsQueueActor", "TryFetch can't start fetching, have " << CurrentInflight << " inflight requests, current max: " << MaxApiInflight);
+            LOG_D("TDqSolomonMetricsQueueActor", "TryFetch can't start fetching, have " << CurrentInflight << " inflight requests, current limit: " << MaxApiInflight);
             return false;
         }
 
@@ -317,6 +332,11 @@ private:
                 Become(&TDqSolomonMetricsQueueActor::NoMoreMetricsState);
                 AnswerPendingRequests();
             }
+            return false;
+        }
+
+        if (Metrics.size() >= PrefetchSize) {
+            LOG_D("TDqSolomonMetricsQueueActor", "TryFetch can't start fetching, have " << Metrics.size() << " metrics stored, current limit: " << PrefetchSize);
             return false;
         }
 
@@ -430,6 +450,7 @@ private:
             result.push_back(Metrics.back());
             Metrics.pop_back();
             ProcessedMetrics++;
+            TryFetch();
         }
 
         LOG_D("TDqSolomonMetricsQueueActor", "SendMetrics Sending " << result.size() << " metrics to consumer with id " << consumer);
@@ -478,7 +499,7 @@ private:
     THashSet<NActors::TActorId> FinishedConsumers;
     THashMap<NActors::TActorId, ui64> FinishingConsumerToLastSeqNo;
 
-    bool HasPendingRequests;
+    bool HasPendingRequests = false;
     THashMap<NActors::TActorId, TDeque<NDqProto::TMessageTransportMeta>> PendingRequests;
     std::vector<NSo::TSelectors> PendingLabelRequests;
     std::vector<NSo::TSelectors> PendingListingRequests;
@@ -487,11 +508,14 @@ private:
     TMaybe<TString> MaybeIssues;
     
     const TDqSolomonReadParams ReadParams;
+    const bool EnableSolomonClientPostApi;
     const ui64 BatchCountLimit;
+    const ui64 PrefetchSize;
     const TInstant TrueRangeFrom;
     const TInstant TrueRangeTo;
     const ui64 MaxListingPageSize;
     const ui64 MaxApiInflight;
+    const ui64 MaxHttpGetRequestSize = 4_KB;
     const std::shared_ptr<NYdb::ICredentialsProvider> CredentialsProvider;
     const NSo::ISolomonAccessorClient::TPtr SolomonClient;
 
@@ -509,9 +533,19 @@ NActors::IActor* CreateSolomonMetricsQueueActor(
 {
     const auto& settings = readParams.Source.settings();
 
+    bool enableSolomonClientPostApi = false;
+    if (auto it = settings.find("enableSolomonClientPostApi"); it != settings.end()) {
+        enableSolomonClientPostApi = FromString<bool>(it->second);
+    }
+
     ui64 batchCountLimit = 0;
     if (auto it = settings.find("metricsQueueBatchCountLimit"); it != settings.end()) {
         batchCountLimit = FromString<ui64>(it->second);
+    }
+    
+    ui64 prefetchSize = 1000;
+    if (auto it = settings.find("metricsQueuePrefetchSize"); it != settings.end()) {
+        prefetchSize = FromString<ui64>(it->second);
     }
 
     ui64 truePointsFindRange = 301;
@@ -524,12 +558,12 @@ NActors::IActor* CreateSolomonMetricsQueueActor(
         maxListingPageSize = FromString<ui64>(it->second);
     }
 
-    ui64 maxInflight = 40;
+    ui64 maxApiInflight = 40;
     if (auto it = settings.find("maxApiInflight"); it != settings.end()) {
-        maxInflight = FromString<ui64>(it->second);
+        maxApiInflight = FromString<ui64>(it->second);
     }
 
-    return new TDqSolomonMetricsQueueActor(consumersCount, std::move(readParams), batchCountLimit, TDuration::Seconds(truePointsFindRange), maxListingPageSize, maxInflight, credentialsProvider);
+    return new TDqSolomonMetricsQueueActor(consumersCount, std::move(readParams), enableSolomonClientPostApi, batchCountLimit, prefetchSize, TDuration::Seconds(truePointsFindRange), maxListingPageSize, maxApiInflight, credentialsProvider);
 }
 
 } // namespace NYql::NDq

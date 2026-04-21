@@ -190,7 +190,7 @@ struct TPrimitiveDataType<NYql::NDecimal::TInt128> {
 
     class TScalarResult: public arrow::FixedSizeBinaryScalar {
     public:
-        TScalarResult(std::shared_ptr<arrow::Buffer> value)
+        explicit TScalarResult(std::shared_ptr<arrow::Buffer> value)
             : arrow::FixedSizeBinaryScalar(std::move(value), arrow::fixed_size_binary(16))
         {
         }
@@ -214,13 +214,15 @@ inline arrow::Datum MakeDefaultScalarDatum() {
 
 template <typename T>
 inline std::shared_ptr<arrow::DataType> GetPrimitiveDataType() {
-    static std::shared_ptr<arrow::DataType> result = std::make_shared<typename TPrimitiveDataType<T>::TResult>();
-    return result;
+    static std::shared_ptr<arrow::DataType> Result = std::make_shared<typename TPrimitiveDataType<T>::TResult>();
+    return Result;
 }
 
 using NYql::NUdf::TTypedBufferBuilder;
 
 std::shared_ptr<arrow::Buffer> MakeEmptyBuffer();
+
+void UntrackDatum(const arrow::Datum& datum);
 
 } // namespace NKikimr::NMiniKQL
 

@@ -22,17 +22,18 @@ using namespace NActors;
 static const size_t MEM_REG_SZ = 4096;
 
 class TRdmaLow : public TSkipFixture {};
+class TCqMode : public TSkipFixtureWithParams<NInterconnect::NRdma::ECqMode> {};
 
 static NInterconnect::NRdma::TMemRegionPtr AllocSourceRegion(std::shared_ptr<IMemPool> memPool) {
     auto reg = memPool->Alloc(MEM_REG_SZ, IMemPool::EMPTY);
     memset(reg->GetAddr(), 0, MEM_REG_SZ);
-    const char* testString = "-_RMDA_YDB_INTERCONNRCT_-";
+    const char* testString = "-_RDMA_YDB_INTERCONNECT_-";
     strncpy((char*)reg->GetAddr(), testString, MEM_REG_SZ);
     return reg;
 }
 
-void DoReadInOneProcess(TString bindTo) {
-    auto rdma = InitLocalRdmaStuff(bindTo);
+void DoReadInOneProcess(TString bindTo, NInterconnect::NRdma::ECqMode mode) {
+    auto rdma = InitLocalRdmaStuff(bindTo, mode);
 
     auto reg1 = AllocSourceRegion(rdma->MemPool);
     auto reg2 = rdma->MemPool->Alloc(MEM_REG_SZ, 0);
@@ -42,31 +43,31 @@ void DoReadInOneProcess(TString bindTo) {
     ASSERT_TRUE(strncmp((char*)reg1->GetAddr(), (char*)reg2->GetAddr(), MEM_REG_SZ) == 0);
 }
 
-TEST_F(TRdmaLow, ReadInOneProcessIpV4) {
-    DoReadInOneProcess("127.0.0.1");
+TEST_P(TCqMode, ReadInOneProcessIpV4) {
+    DoReadInOneProcess("127.0.0.1", GetParam());
 }
 
-TEST_F(TRdmaLow, ReadInOneProcessIpV6) {
-    DoReadInOneProcess("::1");
+TEST_P(TCqMode, ReadInOneProcessIpV6) {
+    DoReadInOneProcess("::1", GetParam());
 }
 
 /*
- * This test cover the sutuation when sender going to reuse memory but has no
+ * This test covers the situation when sender is going to reuse memory but has no
  * information about remote reading in progress.
- * In this case we change QP on the sender to the 'Reset' state and expect reader will fail with read error
+ * In this case we change QP on the sender to the 'Reset' state and expect reader will fail with read error.
  */
-TEST_F(TRdmaLow, ReadInOneProcessWithQpInterruption) {
+TEST_P(TCqMode, ReadInOneProcessWithQpInterruption) {
     TString addr = "127.0.0.1";
 
-    auto rdma = InitLocalRdmaStuff(addr);
+    auto rdma = InitLocalRdmaStuff(addr, GetParam());
 
     THolder<IThreadPool> pool = CreateThreadPool(2, 2);
-    const int intialAttempts = 50000;
+    const int initialAttempts = 50000;
 
-    // Use attempt as timeout to delay to run mem corrupter 
-    int attempt = intialAttempts;
+    // Use attempt as timeout to delay the memory corruptor.
+    int attempt = initialAttempts;
 
-    // bin search works unstable here due to small ammount of time to trigger race
+    // Binary search is unstable here due to the small amount of time to trigger the race.
     while (attempt--) {
         auto reg1 = AllocSourceRegion(rdma->MemPool);
         auto reg2 = rdma->MemPool->Alloc(reg1->GetSize(), 0);
@@ -76,9 +77,9 @@ TEST_F(TRdmaLow, ReadInOneProcessWithQpInterruption) {
         NThreading::TPromise<void> promise = NThreading::NewPromise<void>();
         NThreading::TFuture<void> done = promise.GetFuture();
 
-        class TMemCorrupter : public IObjectInQueue {
+        class TMemCorruptor : public IObjectInQueue {
         public:
-            TMemCorrupter(char* mem, size_t sz, TQueuePair* qp, int attempt, NThreading::TPromise<void> promise)
+            TMemCorruptor(char* mem, size_t sz, TQueuePair* qp, int attempt, NThreading::TPromise<void> promise)
                 : Mem(mem)
                 , Sz(sz)
                 , Qp(qp)
@@ -86,7 +87,7 @@ TEST_F(TRdmaLow, ReadInOneProcessWithQpInterruption) {
                 , Promise(std::move(promise))
             {}
             virtual void Process(void*) override {
-                // Delay to get a chanse to triger memset just during the RDMA read.
+                // Delay to get a chance to trigger memset just during the RDMA read.
                 Sleep(TDuration::MicroSeconds(Attempt / 128));
                 Qp->ToErrorState();
                 memset(Mem, 'Q', Sz);
@@ -103,28 +104,36 @@ TEST_F(TRdmaLow, ReadInOneProcessWithQpInterruption) {
 
         std::function<void()> srcInterruptHook = [&]() noexcept {
             bool added = pool->Add(
-                new TMemCorrupter((char*)reg1->GetAddr(), reg1->GetSize(), rdma->Qp1.get(), attempt, std::move(promise))
+                new TMemCorruptor((char*)reg1->GetAddr(), reg1->GetSize(), rdma->Qp1.get(), attempt, std::move(promise))
             );
             Y_ABORT_UNLESS(added);
         };
 
         auto readResult = ReadOneMemRegion(rdma, rdma->Qp2, reg1->GetAddr(), reg1->GetRKey(rdma->Ctx->GetDeviceIndex()), MEM_REG_SZ, reg2, std::move(srcInterruptHook));
 
-        // Whait until corrupter finished
+        // Wait until corruptor finished.
         done.Wait();
 
         switch (readResult) {
-            case EReadResult::OK: // corrupter fired too late, just check data is ok
+            case EReadResult::OK: // corruptor fired too late, just check data is ok
                 {
                     ASSERT_TRUE(strncmp(expected.data(), (char*)reg2->GetAddr(), MEM_REG_SZ) == 0);
-                    // Additional check cq is empty after all this stuff
+                    // Additional check CQ has no leaked WR after async completion callback returns.
+                    // In CQ processing we call wr->Reply(...) first and ReturnWr(wr) second. ReadOneMemRegion()
+                    // unblocks on the callback from Reply(), so immediately after it returns we may observe
+                    // a transient "allocated WR still not returned" state (Ready < Total), especially in EVENT mode.
+                    // Bounded waiting (<=100ms) keeps this check strict for real leaks while tolerating that ordering race.
                     ICq::TWrStats stats = rdma->CqPtr->GetWrStats();
+                    for (ui32 i = 0; i < 2000 && stats.Ready != stats.Total; ++i) {
+                        Sleep(TDuration::MicroSeconds(50));
+                        stats = rdma->CqPtr->GetWrStats();
+                    }
                     EXPECT_TRUE(stats.Total > 0);
-                    EXPECT_TRUE(stats.Ready == stats.Total);
+                    EXPECT_EQ(stats.Ready, stats.Total);
                 }
                 break;
-            case EReadResult::WRPOST_ERR: // currupter fired too early, increase timeout
-                attempt = std::min(intialAttempts, attempt *= 2);
+            case EReadResult::WRPOST_ERR: // corruptor fired too early, increase timeout
+                attempt = std::min(initialAttempts, attempt *= 2);
                 break;
             case EReadResult::READ_ERR:
                 Cerr << "passed at " << attempt << Endl;
@@ -132,7 +141,7 @@ TEST_F(TRdmaLow, ReadInOneProcessWithQpInterruption) {
         }
         if (attempt == 0) {
             Cerr << "race was not triggered, restart..." << Endl;
-            attempt = intialAttempts;
+            attempt = initialAttempts;
         }
 
         {
@@ -142,14 +151,41 @@ TEST_F(TRdmaLow, ReadInOneProcessWithQpInterruption) {
             auto qp1num = rdma->Qp1->GetQpNum();
 
             {
-                int err = rdma->Qp2->ToRtsState(qp1num, rdma->Ctx->GetGid(), rdma->Ctx->GetPortAttr().active_mtu);
+                int err = rdma->Qp2->ToRtsState(NInterconnect::NRdma::THandshakeData {
+                    .QpNum = qp1num,
+                    .SubnetPrefix = rdma->Ctx->GetGid().global.subnet_prefix,
+                    .InterfaceId = rdma->Ctx->GetGid().global.interface_id,
+                    .MtuIndex = rdma->Ctx->GetPortAttr().active_mtu
+                 });
                 EXPECT_TRUE(err == 0);
             }
 
             {
-                int err = rdma->Qp1->ToRtsState(rdma->Qp2->GetQpNum(), rdma->Ctx->GetGid(), rdma->Ctx->GetPortAttr().active_mtu);
+                int err = rdma->Qp1->ToRtsState(NInterconnect::NRdma::THandshakeData {
+                    .QpNum = rdma->Qp2->GetQpNum(),
+                    .SubnetPrefix = rdma->Ctx->GetGid().global.subnet_prefix,
+                    .InterfaceId = rdma->Ctx->GetGid().global.interface_id,
+                    .MtuIndex = rdma->Ctx->GetPortAttr().active_mtu
+                });
                 EXPECT_TRUE(err == 0);
             }
         }
     }
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    TRdmaLow,
+    TCqMode,
+    ::testing::Values(
+        NInterconnect::NRdma::ECqMode::POLLING,
+        NInterconnect::NRdma::ECqMode::EVENT
+    ),
+    [](const testing::TestParamInfo<NInterconnect::NRdma::ECqMode>& info) {
+        switch (info.param) {
+            case NInterconnect::NRdma::ECqMode::POLLING:
+                return "POLLING";
+            case NInterconnect::NRdma::ECqMode::EVENT:
+                return "EVENT";
+        }
+    }
+);

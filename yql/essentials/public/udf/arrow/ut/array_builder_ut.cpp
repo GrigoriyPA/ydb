@@ -294,10 +294,10 @@ Y_UNIT_TEST(TestSingularTypeValueBuilderReader) {
         TInputBuffer inputBuffer("Just arbitrary string");
         arrayBuilder->Add(inputBuffer);
         UNIT_ASSERT_VALUES_EQUAL_C(inputBuffer.PopChar(), 'J', "The input buffer must not be consumed.");
-        arrayBuilder->AddMany(*arrayData, /*popCount=*/3u, /*sparseBitmat=*/nullptr, /*bitmapSize=*/arrayData->length);
+        arrayBuilder->AddMany(*arrayData, /*popCount=*/3u, /*sparseBitmap=*/nullptr, /*bitmapSize=*/arrayData->length);
         arrayBuilder->AddMany(&arrayDataItem, /*arrayCount=*/1, /*beginIndex=*/1, /*count=*/3u);
         std::vector<ui64> indexes = {1, 5, 7, 10};
-        arrayBuilder->AddMany(&arrayDataItem, /*arrayCount=*/1, /*beginIndex=*/indexes.data(), /*count=*/4u);
+        arrayBuilder->AddMany(&arrayDataItem, /*arrayCount=*/1, /*indexes=*/indexes.data(), /*count=*/4u);
         UNIT_ASSERT_VALUES_EQUAL(arrayBuilder->Build(true).array()->length, 1 + 1 + 4 + 1 + 3 + 3 + 4);
     }
 
@@ -338,16 +338,16 @@ Y_UNIT_TEST(TestBuilderAllocatedSize) {
     const TString bString(bigStringSize, 'a');
     TBlockItem strItem1(bString);
     TBlockItem intItem1(1);
-    TBlockItem sItems1[] = {strItem1, intItem1};
-    TBlockItem sItem1(sItems1);
+    std::array<TBlockItem, 2> sItems1 = {strItem1, intItem1};
+    TBlockItem sItem1(sItems1.data());
 
     const TBlockItem bigItem = sItem1.MakeOptional();
 
     const TString hString(hugeStringSize, 'b');
     TBlockItem strItem2(hString);
     TBlockItem intItem2(2);
-    TBlockItem sItems2[] = {strItem2, intItem2};
-    TBlockItem sItem2(sItems2);
+    std::array<TBlockItem, 2> sItems2 = {strItem2, intItem2};
+    TBlockItem sItem2(sItems2.data());
 
     const TBlockItem hugeItem = sItem2.MakeOptional();
 

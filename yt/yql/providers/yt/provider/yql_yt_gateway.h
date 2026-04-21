@@ -6,6 +6,9 @@
 #include <yt/yql/providers/yt/common/yql_yt_settings.h>
 #include <yt/yql/providers/yt/lib/full_capture/yql_yt_full_capture.h>
 #include <yt/yql/providers/yt/lib/row_spec/yql_row_spec.h>
+#include <yt/yql/providers/yt/lib/temp_files/temp_files.h>
+#include <yt/yql/providers/yt/lib/yt_token_resolver/yt_token_resolver.h>
+
 #include <yql/providers/stat/uploader/yql_stat_uploader.h>
 
 #include <yql/essentials/providers/common/gateway/yql_provider_gateway.h>
@@ -111,6 +114,7 @@ public:
         OPTION_FIELD_DEFAULT(bool, CreateOperationTracker, true)
         OPTION_FIELD_DEFAULT(TQContext, QContext, {})
         OPTION_FIELD_DEFAULT(IYtFullCapture::TPtr, FullCapture, nullptr)
+        OPTION_FIELD(TSecureTmpStatePtr, UseSecureTmp)
     };
 
     //////////////////////////////////////////////////////////////
@@ -253,6 +257,7 @@ public:
         OPTION_FIELD(TYtSettings::TConstPtr, Config)
         OPTION_FIELD(TString, OptLLVM)
         OPTION_FIELD(TString, OperationHash)
+        OPTION_FIELD(TMaybe<TString>, OutputHash)
         OPTION_FIELD(TPosition, Pos)
         OPTION_FIELD(TSecureParams, SecureParams)
         OPTION_FIELD_DEFAULT(NUdf::ELogLevel, RuntimeLogLevel, NUdf::ELogLevel::Info)
@@ -364,6 +369,7 @@ public:
         OPTION_FIELD(TString, UsedCluster)
         OPTION_FIELD(TString, OptLLVM)
         OPTION_FIELD(TString, OperationHash)
+        OPTION_FIELD(TMaybe<TString>, OutputHash)
         OPTION_FIELD(TSecureParams, SecureParams)
         OPTION_FIELD_DEFAULT(NUdf::ELogLevel, RuntimeLogLevel, NUdf::ELogLevel::Info)
         OPTION_FIELD_DEFAULT(TLangVersion, LangVer, UnknownLangVersion)
@@ -392,6 +398,7 @@ public:
         OPTION_FIELD(TYtSettings::TConstPtr, Config)
         OPTION_FIELD(TString, OptLLVM)
         OPTION_FIELD(TString, OperationHash)
+        OPTION_FIELD(TMaybe<TString>, OutputHash)
         OPTION_FIELD(TSecureParams, SecureParams)
         OPTION_FIELD_DEFAULT(NUdf::ELogLevel, RuntimeLogLevel, NUdf::ELogLevel::Info)
         OPTION_FIELD_DEFAULT(TLangVersion, LangVer, UnknownLangVersion)
@@ -418,6 +425,7 @@ public:
         OPTION_FIELD(TMaybe<ui32>, PublicId)
         OPTION_FIELD(TYtSettings::TConstPtr, Config)
         OPTION_FIELD(TString, OperationHash)
+        OPTION_FIELD(TMaybe<TString>, OutputHash)
         OPTION_FIELD_DEFAULT(TSet<TString>, SecurityTags, {})
     };
 
@@ -440,6 +448,7 @@ public:
         OPTION_FIELD(TYtSettings::TConstPtr, Config)
         OPTION_FIELD(TString, OptLLVM)
         OPTION_FIELD(TString, OperationHash)
+        OPTION_FIELD(TMaybe<TString>, OutputHash)
         OPTION_FIELD(TSecureParams, SecureParams)
         OPTION_FIELD_DEFAULT(NUdf::ELogLevel, RuntimeLogLevel, NUdf::ELogLevel::Info)
         OPTION_FIELD_DEFAULT(TLangVersion, LangVer, UnknownLangVersion)
@@ -464,6 +473,7 @@ public:
         OPTION_FIELD(TYtSettings::TConstPtr, Config)
         OPTION_FIELD(TString, OptLLVM)
         OPTION_FIELD(TString, OperationHash)
+        OPTION_FIELD(TMaybe<TString>, OutputHash)
     };
 
     struct TPublishResult : public NCommon::TOperationResult {
@@ -693,9 +703,55 @@ public:
         }
 
         OPTION_FIELD(TEntriesPerCluster, Entries);
+        OPTION_FIELD(TYtSettings::TConstPtr, Config)
     };
 
     struct TDumpResult : public NCommon::TOperationResult {
+    };
+
+    struct TDownloadTableOptions : public TCommonOptions {
+        using TSelf = TDownloadTableOptions;
+
+        TDownloadTableOptions(const TString& sessionId)
+            : TCommonOptions(sessionId)
+        {
+        }
+
+        struct TSamplingConfig {
+            double SamplingPercent;
+            ui64 SamplingSeed;
+            bool IsSystemSampling;
+        };
+
+        struct TYtTableOptions {
+            bool IsTemporary;
+            bool IsAnonymous;
+            ui32 Epoch;
+        };
+
+        struct TRemoteYtTable {
+            NYT::TRichYPath RichPath;
+            TYtTableOptions TableOptions;
+            NYT::TNode Format;
+        };
+
+        using TStructColumns = THashMap<TString, ui32>;
+
+        OPTION_FIELD(TString, Cluster)
+        OPTION_FIELD(TYtSettings::TConstPtr, Config)
+        OPTION_FIELD(TVector<TRemoteYtTable>, Tables)
+        OPTION_FIELD(TStructColumns, StructColumns)
+        OPTION_FIELD(TMaybe<TSamplingConfig>, SamplingConfig)
+        OPTION_FIELD(bool, ForceLocalTableContent)
+        OPTION_FIELD(TMaybe<ui32>, PublicId)
+        OPTION_FIELD(TString, UniqueId)
+        OPTION_FIELD(TTempFiles::TPtr, TmpFiles)
+        OPTION_FIELD(ETableContentDeliveryMode, DeliveryMode);
+    };
+
+    struct TDownloadTableResult: public NCommon::TOperationResult {
+        TVector<NYT::TRichYPath> RemoteFiles;
+        TVector<TString> LocalFiles;
     };
 
 public:
@@ -766,6 +822,10 @@ public:
     virtual TMaybe<TString> GetTableFilePath(const TGetTableFilePathOptions&& options) = 0;
 
     virtual NThreading::TFuture<TDumpResult> Dump(TDumpOptions&& options) = 0;
+
+    virtual NThreading::TFuture<TDownloadTableResult> DownloadTable(TDownloadTableOptions&& options) = 0;
+
+    virtual IYtTokenResolver::TPtr GetYtTokenResolver() const = 0;
 };
 
 }

@@ -2,54 +2,16 @@
 
 #include "persqueue_utils.h"
 
-#include <ydb/core/client/server/ic_nodes_cache_service.h>
 #include <ydb/core/persqueue/public/utils.h>
 #include <ydb/core/ydb_convert/topic_description.h>
 #include <ydb/core/ydb_convert/ydb_convert.h>
 #include <ydb/public/sdk/cpp/src/library/persqueue/obfuscate/obfuscate.h>
 
+#include <library/cpp/json/json_writer.h>
+
 namespace NKikimr::NGRpcProxy::V1 {
 
 constexpr TStringBuf GRPCS_ENDPOINT_PREFIX = "grpcs://";
-
-TDropTopicActor::TDropTopicActor(NKikimr::NGRpcService::TEvDropTopicRequest* request)
-    : TBase(request, request->GetProtoRequest()->path())
-{
-}
-TDropTopicActor::TDropTopicActor(NKikimr::NGRpcService::IRequestOpCtx* request)
-    : TBase(request)
-{
-}
-
-void TDropTopicActor::Bootstrap(const NActors::TActorContext& ctx)
-{
-    TBase::Bootstrap(ctx);
-    SendProposeRequest(ctx);
-    Become(&TDropTopicActor::StateWork);
-}
-
-TPQDropTopicActor::TPQDropTopicActor(NKikimr::NGRpcService::TEvPQDropTopicRequest* request)
-    : TBase(request, request->GetProtoRequest()->path())
-{
-}
-
-void TPQDropTopicActor::Bootstrap(const NActors::TActorContext& ctx)
-{
-    TBase::Bootstrap(ctx);
-    SendProposeRequest(ctx);
-    Become(&TPQDropTopicActor::StateWork);
-}
-
-
-void TDropPropose::FillProposeRequest(TEvTxUserProxy::TEvProposeTransaction& proposal, const TActorContext& ctx,
-                                         const TString& workingDir, const TString& name)
-{
-    Y_UNUSED(ctx);
-    NKikimrSchemeOp::TModifyScheme& modifyScheme(*proposal.Record.MutableTransaction()->MutableModifyScheme());
-    modifyScheme.SetWorkingDir(workingDir);
-    modifyScheme.SetOperationType(NKikimrSchemeOp::ESchemeOpDropPersQueueGroup);
-    modifyScheme.MutableDrop()->SetName(name);
-}
 
 TPQDescribeTopicActor::TPQDescribeTopicActor(NKikimr::NGRpcService::TEvPQDescribeTopicRequest* request)
     : TBase(request, request->GetProtoRequest()->path())
@@ -64,7 +26,7 @@ void TPQDescribeTopicActor::StateWork(TAutoPtr<IEventHandle>& ev) {
 
 
 void TPQDescribeTopicActor::HandleCacheNavigateResponse(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev) {
-    Y_ABORT_UNLESS(ev->Get()->Request.Get()->ResultSet.size() == 1); // describe for only one topic
+    AFL_ENSURE(ev->Get()->Request.Get()->ResultSet.size() == 1); // describe for only one topic
     if (ReplyIfNotTopic(ev)) {
         return;
     }
@@ -112,6 +74,9 @@ void TPQDescribeTopicActor::HandleCacheNavigateResponse(TEvTxProxySchemeCache::T
         if (config.GetEnableCompactification()) {
             (*settings->mutable_attributes())["_cleanup_policy"] = "compact";
         }
+        if (config.HasMetricsLevel()) {
+            settings->set_metrics_level(config.GetMetricsLevel());
+        }
         bool local = config.GetLocalDC();
         settings->set_client_write_disabled(!local);
         const auto &partConfig = config.GetPartitionConfig();
@@ -139,6 +104,7 @@ void TPQDescribeTopicActor::HandleCacheNavigateResponse(TEvTxProxySchemeCache::T
 
         const auto& pqConfig = AppData(ActorContext())->PQConfig;
 
+        NJson::TJsonValue consumersAdvancedMonitoringSettings;
         for (const auto& consumer : config.GetConsumers()) {
             auto rr = settings->add_read_rules();
             auto consumerName = NPersQueue::ConvertOldConsumerName(consumer.GetName(), ActorContext());
@@ -151,6 +117,11 @@ void TPQDescribeTopicActor::HandleCacheNavigateResponse(TEvTxProxySchemeCache::T
                 rr->add_supported_codecs((Ydb::PersQueue::V1::Codec) (codec + 1));
             }
             rr->set_important(consumer.GetImportant());
+            if (consumer.HasAvailabilityPeriodMs()) {
+                TDuration availabilityPeriod = TDuration::MilliSeconds(consumer.GetAvailabilityPeriodMs());
+                rr->mutable_availability_period()->set_seconds(availabilityPeriod.Seconds());
+                rr->mutable_availability_period()->set_nanos(availabilityPeriod.NanoSecondsOfSecond());
+            }
 
             if (consumer.HasServiceType()) {
                 rr->set_service_type(consumer.GetServiceType());
@@ -165,6 +136,19 @@ void TPQDescribeTopicActor::HandleCacheNavigateResponse(TEvTxProxySchemeCache::T
                 }
                 rr->set_service_type(pqConfig.GetDefaultClientServiceType().GetName());
             }
+            NJson::TJsonValue customMonitoringSettings;
+            if (consumer.HasMetricsLevel()) {
+                customMonitoringSettings["metrics_level"] = consumer.GetMetricsLevel();
+            }
+            if (const auto& monitoringProjectId = consumer.GetMonitoringProjectId(); !monitoringProjectId.empty()) {
+                customMonitoringSettings["monitoring_project_id"] = monitoringProjectId;
+            }
+            if (customMonitoringSettings.IsDefined()) { // at least one attribute is set
+                consumersAdvancedMonitoringSettings[consumerName] = std::move(customMonitoringSettings);
+            }
+        }
+        if (consumersAdvancedMonitoringSettings.IsDefined()) { // at least one consumer has custom monitoring settings
+             (*settings->mutable_attributes())["_advanced_monitoring"] = WriteJson(consumersAdvancedMonitoringSettings, false, true);
         }
         if (NPQ::MirroringEnabled(config)) {
             auto rmr = settings->mutable_remote_mirror_rule();
@@ -243,9 +227,9 @@ void TAddReadRuleActor::ModifyPersqueueConfig(
     auto serviceTypes = GetSupportedClientServiceTypes(pqConfig);
 
     TString error;
-    auto messageAndCode = AddReadRuleToConfig(tabletConfig, rule, serviceTypes, pqConfig);
+    auto messageAndCode = AddReadRuleToConfig(tabletConfig, rule, serviceTypes, pqConfig, nullptr);
     auto status = messageAndCode.PQCode == Ydb::PersQueue::ErrorCode::OK ?
-                                CheckConfig(*tabletConfig, serviceTypes, messageAndCode.Message, pqConfig, Ydb::StatusIds::ALREADY_EXISTS)
+                                CheckConfig(*tabletConfig, serviceTypes, messageAndCode.Message, pqConfig, EOperation::Alter)
                                 : Ydb::StatusIds::BAD_REQUEST;
     if (status != Ydb::StatusIds::SUCCESS) {
         return ReplyWithError(status,
@@ -414,41 +398,6 @@ void TPQAlterTopicActor::FillProposeRequest(TEvTxUserProxy::TEvProposeTransactio
 }
 
 
-TAlterTopicActor::TAlterTopicActor(NKikimr::NGRpcService::TEvAlterTopicRequest* request)
-    : TBase(request, request->GetProtoRequest()->path())
-{
-}
-
-TAlterTopicActor::TAlterTopicActor(NKikimr::NGRpcService::IRequestOpCtx* request)
-    : TBase(request)
-{
-}
-
-void TAlterTopicActor::Bootstrap(const NActors::TActorContext& ctx) {
-    TBase::Bootstrap(ctx);
-    SendDescribeProposeRequest(ctx);
-    Become(&TBase::StateWork);
-}
-
-void TAlterTopicActor::ModifyPersqueueConfig(
-    TAppData* appData,
-    NKikimrSchemeOp::TPersQueueGroupDescription& groupConfig,
-    const NKikimrSchemeOp::TPersQueueGroupDescription& pqGroupDescription,
-    const NKikimrSchemeOp::TDirEntry& selfInfo
-) {
-    Y_UNUSED(pqGroupDescription);
-    Y_UNUSED(selfInfo);
-    TString error;
-    Y_UNUSED(selfInfo);
-
-    auto status = FillProposeRequestImpl(*GetProtoRequest(), groupConfig, appData, error, GetCdcStreamName().Defined());
-    if (!error.empty()) {
-        Request_->RaiseIssue(FillIssue(error, Ydb::PersQueue::ErrorCode::BAD_REQUEST));
-        return RespondWithCode(status);
-    }
-}
-
-
 TDescribeTopicActor::TDescribeTopicActor(NKikimr::NGRpcService::TEvDescribeTopicRequest* request)
     : TBase(request, request->GetProtoRequest()->path())
     , TDescribeTopicActorImpl(TDescribeTopicActorSettings::DescribeTopic(
@@ -505,6 +454,12 @@ bool TDescribeTopicActorImpl::StateWork(TAutoPtr<IEventHandle>& ev, const TActor
     return true;
 }
 
+void TDescribeTopicActorImpl::PassAway(const TActorContext& ctx) {
+    for (auto& [_, tablet] : Tablets) {
+        NTabletPipe::CloseClient(ctx, tablet.Pipe);
+    }
+}
+
 void TDescribeTopicActor::StateWork(TAutoPtr<IEventHandle>& ev) {
     if (!TDescribeTopicActorImpl::StateWork(ev, this->ActorContext())) {
         TBase::StateWork(ev);
@@ -551,11 +506,8 @@ void TDescribeTopicActorImpl::RestartTablet(ui64 tabletId, const TActorContext& 
     if (pipe && pipe != tabletInfo.Pipe) return;
     if (tabletInfo.ResultRecived) return;
 
-    if (tabletId == BalancerTabletId) {
-        if (GotLocation && GotReadSessions) {
-            return;
-        }
-        BalancerPipe = nullptr;
+    if (tabletId == BalancerTabletId && GotLocation && GotReadSessions) {
+        return;
     }
 
     NTabletPipe::CloseClient(ctx, tabletInfo.Pipe);
@@ -578,17 +530,17 @@ void TDescribeTopicActorImpl::Handle(TEvPQProxy::TEvRequestTablet::TPtr& ev, con
             return;
         }
         if (!GotLocation) {
-            Y_ABORT_UNLESS(RequestsInfly > 0);
+            AFL_ENSURE(RequestsInfly > 0);
             --RequestsInfly;
         }
         if (!GotReadSessions) {
-            Y_ABORT_UNLESS(RequestsInfly > 0);
+            AFL_ENSURE(RequestsInfly > 0);
             --RequestsInfly;
         }
     } else if (tabletInfo.ResultRecived) {
         return;
     } else {
-        Y_ABORT_UNLESS(RequestsInfly > 0);
+        AFL_ENSURE(RequestsInfly > 0);
         --RequestsInfly;
     }
 
@@ -613,7 +565,6 @@ void TDescribeTopicActorImpl::RequestTablet(TTabletInfo& tablet, const TActorCon
         tablet.Pipe = CreatePipe(tablet.TabletId, ctx);
 
     if (tablet.TabletId == BalancerTabletId) {
-        BalancerPipe = &tablet.Pipe;
         RequestBalancer(ctx);
     } else {
         RequestPartitionStatus(tablet, ctx);
@@ -621,7 +572,7 @@ void TDescribeTopicActorImpl::RequestTablet(TTabletInfo& tablet, const TActorCon
 }
 
 void TDescribeTopicActorImpl::RequestBalancer(const TActorContext& ctx) {
-    Y_ABORT_UNLESS(BalancerTabletId);
+    AFL_ENSURE(BalancerTabletId);
     if (Settings.RequireLocation) {
         if (!GotLocation) {
             RequestPartitionsLocation(ctx);
@@ -674,16 +625,16 @@ void TDescribeTopicActorImpl::RequestPartitionsLocation(const TActorContext& ctx
         }
     }
     NTabletPipe::SendData(
-        ctx, *BalancerPipe,
+        ctx, Tablets[BalancerTabletId].Pipe,
         new TEvPersQueue::TEvGetPartitionsLocation(partsVector)
     );
     ++RequestsInfly;
 }
 
 void TDescribeTopicActorImpl::RequestReadSessionsInfo(const TActorContext& ctx) {
-    Y_ABORT_UNLESS(Settings.Mode == TDescribeTopicActorSettings::EMode::DescribeConsumer);
+    AFL_ENSURE(Settings.Mode == TDescribeTopicActorSettings::EMode::DescribeConsumer);
     NTabletPipe::SendData(
-            ctx, *BalancerPipe,
+            ctx, Tablets[BalancerTabletId].Pipe,
                     new TEvPersQueue::TEvGetReadSessionsInfo(NPersQueue::ConvertNewConsumerName(Settings.Consumer, ctx))
             );
     LOG_DEBUG_S(ctx, NKikimrServices::PQ_READ_PROXY, "DescribeTopicImpl " << ctx.SelfID.ToString() << ": Request sessions");
@@ -714,7 +665,7 @@ void TDescribeTopicActorImpl::Handle(NKikimr::TEvPersQueue::TEvStatusResponse::T
     }
 
     tabletInfo.ResultRecived = true;
-    Y_ABORT_UNLESS(RequestsInfly > 0);
+    AFL_ENSURE(RequestsInfly > 0);
     --RequestsInfly;
 
     NTabletPipe::CloseClient(ctx, tabletInfo.Pipe);
@@ -735,10 +686,10 @@ void TDescribeTopicActorImpl::Handle(NKikimr::TEvPersQueue::TEvReadSessionsInfoR
         return;
 
     auto it = Tablets.find(BalancerTabletId);
-    Y_ABORT_UNLESS(it != Tablets.end());
+    AFL_ENSURE(it != Tablets.end());
 
     GotReadSessions = true;
-    Y_ABORT_UNLESS(RequestsInfly > 0);
+    AFL_ENSURE(RequestsInfly > 0);
     --RequestsInfly;
 
     CheckCloseBalancerPipe(ctx);
@@ -756,14 +707,14 @@ void TDescribeTopicActorImpl::Handle(TEvPersQueue::TEvGetPartitionsLocationRespo
         return;
 
     auto it = Tablets.find(BalancerTabletId);
-    Y_ABORT_UNLESS(it != Tablets.end());
+    AFL_ENSURE(it != Tablets.end());
 
     const auto& record = ev->Get()->Record;
     if (record.GetStatus()) {
         auto res = ApplyResponse(ev, ctx);
         if (res) {
             GotLocation = true;
-            Y_ABORT_UNLESS(RequestsInfly > 0);
+            AFL_ENSURE(RequestsInfly > 0);
             --RequestsInfly;
 
             CheckCloseBalancerPipe(ctx);
@@ -781,10 +732,14 @@ void TDescribeTopicActorImpl::Handle(TEvPersQueue::TEvGetPartitionsLocationRespo
 }
 
 void TDescribeTopicActorImpl::CheckCloseBalancerPipe(const TActorContext& ctx) {
-    if (!GotLocation || !GotReadSessions)
+    if (!GotLocation || !GotReadSessions) {
         return;
-    NTabletPipe::CloseClient(ctx, *BalancerPipe);
-    *BalancerPipe = TActorId{};
+    }
+    auto& balancerPipe = Tablets[BalancerTabletId].Pipe;
+    if (balancerPipe) {
+        NTabletPipe::CloseClient(ctx, balancerPipe);
+        balancerPipe = {};
+    }
     BalancerTabletId = 0;
 }
 
@@ -903,7 +858,7 @@ bool TDescribeTopicActor::ApplyResponse(
         TEvPersQueue::TEvGetPartitionsLocationResponse::TPtr& ev, const TActorContext&
 ) {
     const auto& record = ev->Get()->Record;
-    Y_ABORT_UNLESS(Settings.RequireLocation);
+    AFL_ENSURE(Settings.RequireLocation);
 
     for (auto i = 0u; i < std::min<ui64>(record.LocationsSize(), TotalPartitions); ++i) {
         const auto& location = record.GetLocations(i);
@@ -913,6 +868,10 @@ bool TDescribeTopicActor::ApplyResponse(
     return true;
 }
 
+void TDescribeTopicActor::PassAway() {
+    TDescribeTopicActorImpl::PassAway(ActorContext());
+    TBase::PassAway();
+}
 
 
 void TDescribeTopicActor::Reply(const TActorContext& ctx) {
@@ -1018,7 +977,7 @@ bool TDescribeConsumerActor::ApplyResponse(
         TEvPersQueue::TEvGetPartitionsLocationResponse::TPtr& ev, const TActorContext&
 ) {
     const auto& record = ev->Get()->Record;
-    Y_ABORT_UNLESS(Settings.RequireLocation);
+    AFL_ENSURE(Settings.RequireLocation);
     for (auto i = 0u; i < std::min<ui64>(record.LocationsSize(), TotalPartitions); ++i) {
         const auto& location = record.GetLocations(i);
         auto* locationResult = Result.mutable_partitions(i)->mutable_partition_location();
@@ -1027,9 +986,13 @@ bool TDescribeConsumerActor::ApplyResponse(
     return true;
 }
 
+void TDescribeConsumerActor::PassAway() {
+    TDescribeTopicActorImpl::PassAway(ActorContext());
+    TBase::PassAway();
+}
 
 void TDescribeTopicActor::HandleCacheNavigateResponse(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev) {
-    Y_ABORT_UNLESS(ev->Get()->Request.Get()->ResultSet.size() == 1); // describe for only one topic
+    AFL_ENSURE(ev->Get()->Request.Get()->ResultSet.size() == 1); // describe for only one topic
     if (ReplyIfNotTopic(ev)) {
         return;
     }
@@ -1079,7 +1042,7 @@ void TDescribeTopicActor::HandleCacheNavigateResponse(TEvTxProxySchemeCache::TEv
 }
 
 void TDescribeConsumerActor::HandleCacheNavigateResponse(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev) {
-    Y_ABORT_UNLESS(ev->Get()->Request.Get()->ResultSet.size() == 1); // describe for only one topic
+    AFL_ENSURE(ev->Get()->Request.Get()->ResultSet.size() == 1); // describe for only one topic
     if (ReplyIfNotTopic(ev)) {
         return;
     }
@@ -1253,7 +1216,7 @@ bool TDescribePartitionActor::NeedToRequestWithDescribeSchema(TAutoPtr<IEventHan
 
     auto evNav = *reinterpret_cast<typename TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr*>(&ev);
     auto const& entries = evNav->Get()->Request.Get()->ResultSet;
-    Y_ABORT_UNLESS(entries.size() == 1);
+    AFL_ENSURE(entries.size() == 1);
 
     if (entries.front().Status != NSchemeCache::TSchemeCacheNavigate::EStatus::AccessDenied) {
         // We do have access to the requested entity or there was an error.
@@ -1267,7 +1230,7 @@ bool TDescribePartitionActor::NeedToRequestWithDescribeSchema(TAutoPtr<IEventHan
 
 void TDescribePartitionActor::HandleCacheNavigateResponse(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev) {
     auto const& entries = ev->Get()->Request.Get()->ResultSet;
-    Y_ABORT_UNLESS(entries.size() == 1); // describe for only one topic
+    AFL_ENSURE(entries.size() == 1); // describe for only one topic
     if (ReplyIfNotTopic(ev)) {
         return;
     }
@@ -1289,7 +1252,7 @@ void TDescribePartitionActor::ApplyResponse(TTabletInfo& tabletInfo, NKikimr::TE
     for (auto partData : record.GetPartResult()) {
         if ((ui32)partData.GetPartition() != Settings.Partitions[0])
             continue;
-        Y_ABORT_UNLESS((ui32)(partData.GetPartition()) == Settings.Partitions[0]);
+        AFL_ENSURE((ui32)(partData.GetPartition()) == Settings.Partitions[0]);
         partResult->set_partition_id(partData.GetPartition());
         partResult->set_active(true);
         FillPartitionStats(partData, partResult->mutable_partition_stats(), tabletInfo.NodeId);
@@ -1301,7 +1264,7 @@ bool TDescribePartitionActor::ApplyResponse(
 ) {
     const auto& record = ev->Get()->Record;
     if (Settings.Partitions) {
-        Y_ABORT_UNLESS(record.LocationsSize() == 1);
+        AFL_ENSURE(record.LocationsSize() == 1);
     }
 
     const auto& location = record.GetLocations(0);
@@ -1311,6 +1274,11 @@ bool TDescribePartitionActor::ApplyResponse(
     auto* locationResult = pResult->mutable_partition_location();
     SetPartitionLocation(location, locationResult);
     return true;
+}
+
+void TDescribePartitionActor::PassAway() {
+    TDescribeTopicActorImpl::PassAway(ActorContext());
+    TBase::PassAway();
 }
 
 void TDescribePartitionActor::RaiseError(
@@ -1328,7 +1296,7 @@ void TDescribePartitionActor::Reply(const TActorContext& ctx) {
         return;
     }
     if (Settings.RequireLocation) {
-        Y_ABORT_UNLESS(Result.partition().has_partition_location());
+        AFL_ENSURE(Result.partition().has_partition_location());
     }
     return ReplyWithResult(Ydb::StatusIds::SUCCESS, Result, ctx);
 }
@@ -1374,6 +1342,11 @@ bool TPartitionsLocationActor::ApplyResponse(
         TEvPersQueue::TEvGetPartitionsLocationResponse::TPtr& ev, const TActorContext&
 ) {
     const auto& record = ev->Get()->Record;
+    if (!record.GetStatus()) {
+        this->RaiseError("Partition locations are not available", Ydb::PersQueue::ErrorCode::TABLET_PIPE_DISCONNECTED,
+            Ydb::StatusIds::UNAVAILABLE, ActorContext());
+        return false;
+    }
     for (auto i = 0u; i < record.LocationsSize(); i++) {
         const auto& part = record.GetLocations(i);
         TEvPQProxy::TPartitionLocationInfo partLocation;
@@ -1382,17 +1355,28 @@ bool TPartitionsLocationActor::ApplyResponse(
         partLocation.PartitionId = part.GetPartitionId();
         partLocation.Generation = part.GetGeneration();
         partLocation.NodeId = nodeId;
-        Response->Partitions.emplace_back(std::move(partLocation));
+        if (TopicPartitionsIds.contains(partLocation.PartitionId)) {
+            Response->Partitions.emplace_back(std::move(partLocation));
+        }
     }
     Finalize();
     return true;
 }
 
+void TPartitionsLocationActor::PassAway() {
+    TDescribeTopicActorImpl::PassAway(ActorContext());
+    TBase::PassAway();
+}
+
 void TPartitionsLocationActor::Finalize() {
     if (Settings.Partitions) {
-        Y_ABORT_UNLESS(Response->Partitions.size() == Settings.Partitions.size());
+        AFL_ENSURE(Response->Partitions.size() == Settings.Partitions.size())
+            ("l", Response->Partitions.size())
+            ("r", Settings.Partitions.size());
     } else {
-        Y_ABORT_UNLESS(Response->Partitions.size() == PQGroupInfo->Description.PartitionsSize());
+        AFL_ENSURE(Response->Partitions.size() >= PQGroupInfo->Description.PartitionsSize())
+            ("l", Response->Partitions.size())
+            ("r", PQGroupInfo->Description.PartitionsSize());
     }
     TBase::RespondWithCode(Ydb::StatusIds::SUCCESS);
 }
@@ -1402,70 +1386,13 @@ void TPartitionsLocationActor::RaiseError(const TString& error, const Ydb::PersQ
     this->RespondWithCode(status);
 }
 
-TAlterTopicActorInternal::TAlterTopicActorInternal(
-        TAlterTopicActorInternal::TRequest&& request,
-        NThreading::TPromise<TAlterTopicResponse>&& promise,
-        bool missingOk
-)
-    : TActorBase(std::move(request), TActorId{})
-    , Promise(std::move(promise))
-    , MissingOk(missingOk)
-{}
+bool TPartitionsLocationActor::OnUnhandledException(const std::exception& exc) {
+    ALOG_ERROR(NKikimrServices::PQ_READ_PROXY, "unhandled exception "
+        << TypeName(exc) << ": " << exc.what() << Endl
+        << TBackTrace::FromCurrentException().PrintToString());
 
-void TAlterTopicActorInternal::Bootstrap(const NActors::TActorContext&) {
-    SendDescribeProposeRequest();
-    Become(&TAlterTopicActorInternal::StateWork);
-}
+    this->RaiseError("Unhandled exception", Ydb::PersQueue::ErrorCode::ERROR, Ydb::StatusIds::UNAVAILABLE, ActorContext());
 
-void TAlterTopicActorInternal::HandleCacheNavigateResponse(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev) {
-    if (!TActorBase::HandleCacheNavigateResponseBase(ev)) {
-        this->Die(ActorContext());
-        return;
-    }
-    TUpdateSchemeBase::HandleCacheNavigateResponse(ev);
-    auto& schemeTx = Response->Response.ModifyScheme;
-    std::pair <TString, TString> pathPair;
-    try {
-        pathPair = NKikimr::NGRpcService::SplitPath(GetTopicPath());
-    } catch (const std::exception &ex) {
-        Response->Response.Issues.AddIssue(NYql::ExceptionToIssue(ex));
-        RespondWithCode(Ydb::StatusIds::BAD_REQUEST);
-        return;
-    }
-
-    const auto& workingDir = pathPair.first;
-    const auto& name = pathPair.second;
-    FillModifyScheme(schemeTx, ActorContext(), workingDir, name);
-}
-
-void TAlterTopicActorInternal::ModifyPersqueueConfig(
-    TAppData* appData,
-    NKikimrSchemeOp::TPersQueueGroupDescription& groupConfig,
-    const NKikimrSchemeOp::TPersQueueGroupDescription& pqGroupDescription,
-    const NKikimrSchemeOp::TDirEntry& selfInfo
-) {
-    Y_UNUSED(pqGroupDescription);
-    Y_UNUSED(selfInfo);
-    TString error;
-    Y_UNUSED(selfInfo);
-
-    auto status = FillProposeRequestImpl(GetRequest().Request, groupConfig, appData, error, GetCdcStreamName().Defined());
-    if (!error.empty()) {
-        Response->Response.Issues.AddIssue(error);
-    }
-    RespondWithCode(status);
-}
-
-bool TAlterTopicActorInternal::RespondOverride(Ydb::StatusIds::StatusCode status, bool notFound) {
-    if (MissingOk && notFound) {
-        Response->Response.Status = Ydb::StatusIds::SUCCESS;
-        Response->Response.ModifyScheme.Clear();
-
-    } else {
-        Response->Response.Status = status;
-        Response->Response.Issues.AddIssues(std::move(Response->Issues));
-    }
-    Promise.SetValue(std::move(Response->Response));
     return true;
 }
 

@@ -81,18 +81,9 @@ Y_DECLARE_OUT_SPEC(, NYdb::NTable::TKMeansTreeSettings, stream, value) {
         "{ settings: " << value.Settings << 
         ", clusters: " << value.Clusters << 
         ", levels: " << value.Levels << 
+        ", overlap_clusters: " << value.OverlapClusters << 
+        ", overlap_ratio: " << value.OverlapRatio << 
         " }";
-}
-
-Y_DECLARE_OUT_SPEC(, NYdb::NTable::TFulltextIndexSettings::ELayout, stream, value) {
-    switch (value) {
-        case NYdb::NTable::TFulltextIndexSettings::ELayout::Flat:
-            stream << "flat";
-            break;
-        case NYdb::NTable::TFulltextIndexSettings::ELayout::Unspecified:
-            stream << "unspecified";
-            break;
-    }
 }
 
 Y_DECLARE_OUT_SPEC(, NYdb::NTable::TFulltextIndexSettings::ETokenizer, stream, value) {
@@ -159,9 +150,9 @@ Y_DECLARE_OUT_SPEC(, NYdb::NTable::TFulltextIndexSettings::TColumnAnalyzers, str
 }
 
 Y_DECLARE_OUT_SPEC(, NYdb::NTable::TFulltextIndexSettings, stream, value) {
-    stream << "{ layout: " << value.Layout.value_or(NYdb::NTable::TFulltextIndexSettings::ELayout::Unspecified);
+    stream << "{";
     if (!value.Columns.empty()) {
-        stream << ", columns: [";
+        stream << " columns: [";
         for (size_t i = 0; i < value.Columns.size(); ++i) {
             if (i > 0) stream << ", ";
             stream << value.Columns[i];

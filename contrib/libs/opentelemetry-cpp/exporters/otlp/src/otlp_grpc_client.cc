@@ -22,6 +22,9 @@
 
 // clang-format off
 #include "opentelemetry/exporters/otlp/protobuf_include_prefix.h" // IWYU pragma: keep
+#ifdef ENABLE_ASYNC_EXPORT
+#  include "google/protobuf/arena.h"
+#endif /* ENABLE_ASYNC_EXPORT */
 #include "opentelemetry/proto/collector/logs/v1/logs_service.pb.h"
 #include "opentelemetry/proto/collector/metrics/v1/metrics_service.pb.h"
 #include "opentelemetry/proto/collector/trace/v1/trace_service.pb.h"
@@ -29,7 +32,6 @@
 // clang-format on
 
 #ifdef ENABLE_ASYNC_EXPORT
-#  include <google/protobuf/arena.h>
 #  include <algorithm>
 #  include <condition_variable>
 #  include <cstdio>
@@ -160,13 +162,13 @@ template <class StubType, class RequestType, class ResponseType>
 static sdk::common::ExportResult InternalDelegateAsyncExport(
     const std::shared_ptr<OtlpGrpcClientAsyncData> &async_data,
     StubType *stub,
-    std::unique_ptr<grpc::ClientContext> &&context,
-    std::unique_ptr<google::protobuf::Arena> &&arena,
-    RequestType &&request,
+    std::unique_ptr<grpc::ClientContext> context,
+    std::unique_ptr<google::protobuf::Arena> arena,
+    RequestType request,
     std::function<bool(opentelemetry::sdk::common::ExportResult,
                        std::unique_ptr<google::protobuf::Arena> &&,
                        const RequestType &,
-                       ResponseType *)> &&result_callback,
+                       ResponseType *)> result_callback,
     int32_t export_data_count,
     const char *export_data_name) noexcept
 {
@@ -186,11 +188,14 @@ static sdk::common::ExportResult InternalDelegateAsyncExport(
 
   std::shared_ptr<OtlpGrpcAsyncCallData<RequestType, ResponseType>> call_data =
       std::make_shared<OtlpGrpcAsyncCallData<RequestType, ResponseType>>();
-  call_data->arena.swap(arena);
-  call_data->result_callback.swap(result_callback);
+  call_data->arena           = std::move(arena);
+  call_data->result_callback = std::move(result_callback);
 
-  call_data->request = google::protobuf::Arena::Create<RequestType>(
-      call_data->arena.get(), std::forward<RequestType>(request));
+  call_data->request = google::protobuf::Arena::Create<RequestType>(call_data->arena.get());
+  if (call_data->request != nullptr)
+  {
+    call_data->request->Swap(&request);
+  }
   call_data->response = google::protobuf::Arena::Create<ResponseType>(call_data->arena.get());
 
   if (call_data->request == nullptr || call_data->response == nullptr)
@@ -208,7 +213,7 @@ static sdk::common::ExportResult InternalDelegateAsyncExport(
 
     return opentelemetry::sdk::common::ExportResult::kFailure;
   }
-  call_data->grpc_context.swap(context);
+  call_data->grpc_context = std::move(context);
 
   call_data->grpc_async_callback = [](OtlpGrpcAsyncCallDataBase *base_call_data) {
     OtlpGrpcAsyncCallData<RequestType, ResponseType> *real_call_data =
@@ -764,7 +769,7 @@ bool OtlpGrpcClient::Shutdown(OtlpGrpcClientReferenceGuard &guard,
   }
 
   bool last_reference_removed = RemoveReference(guard);
-  bool force_flush_result;
+  bool force_flush_result{};
   if (last_reference_removed && false == is_shutdown_.exchange(true, std::memory_order_acq_rel))
   {
     OTEL_INTERNAL_LOG_DEBUG("[OTLP GRPC Client] DEBUG: OtlpGrpcClient start to shutdown");

@@ -6,9 +6,12 @@ namespace NYql {
 struct TTypeAnnotationContext;
 struct TExprContext;
 
-TString CalculateLineage(const TExprNode& root, const TTypeAnnotationContext& ctx, TExprContext& exprCtx, bool standalone);
+TString CalculateLineage(const TExprNode& root, TTypeAnnotationContext& ctx, TExprContext& exprCtx, bool standalone);
 
-// Replace input and output table's IDs with pathes for checking lineage equality
-TString NormalizeLineage(const TString& lineageStr);
+// Check that lineage section is not empty
+void ValidateLineage(const TString& lineageStr);
+
+// Compare that two lineages are equvalent otherwise throw exception
+void CheckEquvalentLineages(const TString& lineageFirst, const TString& lineageSecond);
 
 } // namespace NYql

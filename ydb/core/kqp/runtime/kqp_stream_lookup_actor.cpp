@@ -40,14 +40,21 @@ public:
         , AllowInconsistentReads(settings.GetAllowInconsistentReads())
         , UseFollowers(settings.GetAllowUseFollowers())
         , IsTableImmutable(settings.GetIsTableImmutable())
+        , HasVectorTopK(settings.HasVectorTopK())
         , PipeCacheId(UseFollowers ? FollowersPipeCacheId : MainPipeCacheId)
         , LockTxId(settings.HasLockTxId() ? settings.GetLockTxId() : TMaybe<ui64>())
         , NodeLockId(settings.HasLockNodeId() ? settings.GetLockNodeId() : TMaybe<ui32>())
         , LockMode(settings.HasLockMode() ? settings.GetLockMode() : TMaybe<NKikimrDataEvents::ELockMode>())
+        , QuerySpanId(settings.HasQuerySpanId() ? settings.GetQuerySpanId() : 0)
         , SchemeCacheRequestTimeout(SCHEME_CACHE_REQUEST_TIMEOUT)
         , LookupStrategy(settings.GetLookupStrategy())
         , StreamLookupWorker(CreateStreamLookupWorker(std::move(settings), args.TaskId, args.TypeEnv, args.HolderFactory, args.InputDesc))
         , IsolationLevel(settings.GetIsolationLevel())
+        , Database(settings.GetDatabase())
+        , MaxTotalBytesQuota(MaxTotalBytesQuotaStreamLookup())
+        , MaxRowsProcessing(MaxRowsProcessingStreamLookup())
+        , MaxInFlightReads(MaxInFlightReadsStreamLookup())
+        , MaxBytesPerFetch(MaxBytesPerFetchStreamLookup())
         , Counters(counters)
         , LookupActorSpan(TWilsonKqp::LookupActor, std::move(args.TraceId), "LookupActor")
     {
@@ -91,10 +98,11 @@ public:
             ui64 rowsReadEstimate = ReadRowsCount;
             ui64 bytesReadEstimate = ReadBytesCount;
 
-            if (mstats) {
+            if (mstats && !HasVectorTopK) {
                 switch(LookupStrategy) {
-                    case NKqpProto::EStreamLookupStrategy::LOOKUP: {
-                        // in lookup case we return as result actual data, that we read from the datashard.
+                    case NKqpProto::EStreamLookupStrategy::LOOKUP:
+                    case NKqpProto::EStreamLookupStrategy::UNIQUE: {
+                        // in lookup case without top-K pushdown we return as result actual data, that we read from the datashard.
                         rowsReadEstimate = mstats->Inputs[InputIndex]->RowsConsumed;
                         bytesReadEstimate = mstats->Inputs[InputIndex]->BytesConsumed;
                         break;
@@ -117,6 +125,17 @@ public:
             }
 
             tableStats->MutableExtra()->PackFrom(tableExtraStats);
+
+            // Add lock stats for broken locks from stream lookup operations
+            if (!BrokenLocks.empty()) {
+                NKqpProto::TKqpTaskExtraStats extraStats;
+                if (stats->HasExtra()) {
+                    stats->GetExtra().UnpackTo(&extraStats);
+                }
+                extraStats.MutableLockStats()->SetBrokenAsVictim(
+                    extraStats.GetLockStats().GetBrokenAsVictim() + BrokenLocks.size());
+                stats->MutableExtra()->PackFrom(extraStats);
+            }
         }
     }
 
@@ -296,6 +315,7 @@ private:
 
     i64 GetAsyncInputData(NKikimr::NMiniKQL::TUnboxedValueBatch& batch, TMaybe<TInstant>&, bool& finished, i64 freeSpace) final {
         YQL_ENSURE(!batch.IsWide(), "Wide stream is not supported");
+        SentResultsAvailable = false;
 
         if (ResolveShardsInProgress) {
             finished = false;
@@ -306,12 +326,9 @@ private:
         ReadRowsCount += replyResultStats.ReadRowsCount;
         ReadBytesCount += replyResultStats.ReadBytesCount;
 
-        auto overloaded = StreamLookupWorker->IsOverloaded();
-        if (!overloaded.has_value()) {
+        // Fetch input rows if we have less than max in flight reads in the scheduled queue.
+        if (StreamLookupWorker->ScheduledRequestsCount() < MaxInFlightReads) {
             FetchInputRows();
-        } else {
-            CA_LOG_N("Pausing stream lookup because it's overloaded by reason: "
-                << overloaded.value_or("empty"));
         }
 
         if (Partitioning) {
@@ -323,9 +340,16 @@ private:
         const bool allRowsProcessed = StreamLookupWorker->AllRowsProcessed();
         const bool hasPendingResults = StreamLookupWorker->HasPendingResults();
 
-        if (hasPendingResults) {
+        // If we have no new reads and no pending results, we can fetch input rows again.
+        bool noNewReads = (
+            Partitioning && Reads.InFlightReads() + StreamLookupWorker->ScheduledRequestsCount() == 0
+            && LastFetchStatus == NUdf::EFetchStatus::Ok);
+        if (hasPendingResults || noNewReads) {
             // has more results
-            Send(ComputeActorId, new TEvNewAsyncInputDataArrived(InputIndex));
+            if (!SentResultsAvailable) {
+                Send(ComputeActorId, new TEvNewAsyncInputDataArrived(InputIndex));
+                SentResultsAvailable = true;
+            }
         }
 
         finished = inputRowsFinished && allReadsFinished && allRowsProcessed;
@@ -345,6 +369,10 @@ private:
 
         for (auto& lock : BrokenLocks) {
             resultInfo.AddLocks()->CopyFrom(lock);
+        }
+
+        if (DeferredVictimQuerySpanId) {
+            resultInfo.SetDeferredVictimQuerySpanId(DeferredVictimQuerySpanId);
         }
 
         result.PackFrom(resultInfo);
@@ -385,8 +413,15 @@ private:
             return RuntimeError(errorMsg, NYql::NDqProto::StatusIds::SCHEME_ERROR);
         }
 
-        if (IsolationLevel == NKikimrKqp::EIsolationLevel::ISOLATION_LEVEL_SNAPSHOT_RO) {
+        if (IsolationLevel == NKqpProto::EIsolationLevel::ISOLATION_LEVEL_SNAPSHOT_RO) {
             YQL_ENSURE(!LockTxId, "SnapshotReadOnly should not take locks");
+        }
+        if (LockTxId && IsolationLevel == NKqpProto::EIsolationLevel::ISOLATION_LEVEL_SNAPSHOT_RW && LookupStrategy == NKqpProto::EStreamLookupStrategy::UNIQUE) {
+            YQL_ENSURE(LockMode == NKikimrDataEvents::OPTIMISTIC);
+        } else if (LockTxId && IsolationLevel == NKqpProto::EIsolationLevel::ISOLATION_LEVEL_SNAPSHOT_RW) {
+            YQL_ENSURE(LockMode == NKikimrDataEvents::OPTIMISTIC_SNAPSHOT_ISOLATION);
+        } else if (LockTxId && IsolationLevel == NKqpProto::EIsolationLevel::ISOLATION_LEVEL_SERIALIZABLE) {
+            YQL_ENSURE(LockMode == NKikimrDataEvents::OPTIMISTIC);
         }
         LookupActorStateSpan.EndOk();
 
@@ -396,7 +431,10 @@ private:
 
         ProcessInputRows();
 
-        Send(ComputeActorId, new TEvNewAsyncInputDataArrived(InputIndex));
+        if (!SentResultsAvailable) {
+            Send(ComputeActorId, new TEvNewAsyncInputDataArrived(InputIndex));
+            SentResultsAvailable = true;
+        }
     }
 
     void Handle(TEvDataShard::TEvReadResult::TPtr& ev) {
@@ -441,6 +479,10 @@ private:
             Locks.push_back(lock);
         }
 
+        if (record.HasDeferredVictimQuerySpanId() && DeferredVictimQuerySpanId == 0) {
+            DeferredVictimQuerySpanId = record.GetDeferredVictimQuerySpanId();
+        }
+
         if (UseFollowers) {
             YQL_ENSURE(Locks.empty());
             if (!record.GetFinished() && !IsTableImmutable) {
@@ -448,6 +490,9 @@ private:
                 return;
             }
         }
+
+        TotalBytesQuota -= MaxBytesDefaultQuota;
+        Counters->StreamLookupIteratorTotalQuotaBytesInFlight->Sub(MaxBytesDefaultQuota);
 
         if (!Snapshot.IsValid()) {
             Snapshot = IKqpGateway::TKqpSnapshot(record.GetSnapshot().GetStep(), record.GetSnapshot().GetTxId());
@@ -506,6 +551,7 @@ private:
             }
         }
 
+
         YQL_ENSURE(read.LastSeqNo < record.GetSeqNo());
         read.LastSeqNo = record.GetSeqNo();
 
@@ -518,8 +564,14 @@ private:
             request->Record.SetSeqNo(record.GetSeqNo());
 
             auto defaultSettings = GetDefaultReadAckSettings()->Record;
-            request->Record.SetMaxRows(defaultSettings.GetMaxRows());
-            request->Record.SetMaxBytes(defaultSettings.GetMaxBytes());
+            request->Record.SetMaxRows(MaxRowsDefaultQuota);
+            request->Record.SetMaxBytes(MaxBytesDefaultQuota);
+
+            TotalBytesQuota += MaxBytesDefaultQuota;
+            Counters->StreamLookupIteratorTotalQuotaBytesInFlight->Add(MaxBytesDefaultQuota);
+            if (TotalBytesQuota > MaxTotalBytesQuota) {
+                Counters->StreamLookupIteratorTotalQuotaBytesExceeded->Inc();
+            }
 
             const bool needToCreatePipe = Reads.NeedToCreatePipe(read.ShardId);
 
@@ -543,10 +595,14 @@ private:
         }
 
         auto guard = BindAllocator();
-        StreamLookupWorker->AddResult(TKqpStreamLookupWorker::TShardReadResult{
-            shardId, THolder<TEventHandle<TEvDataShard::TEvReadResult>>(ev.Release())
-        });
-        Send(ComputeActorId, new TEvNewAsyncInputDataArrived(InputIndex));
+        StreamLookupWorker->AddResult(TStreamLookupShardReadResult(
+            shardId, THolder<TEventHandle<TEvDataShard::TEvReadResult>>(ev.Release()),
+            &guard.GetMutex()->Ref()
+        ));
+        if (!SentResultsAvailable) {
+            Send(ComputeActorId, new TEvNewAsyncInputDataArrived(InputIndex));
+            SentResultsAvailable = true;
+        }
     }
 
     void Handle(TEvPipeCache::TEvDeliveryProblem::TPtr& ev) {
@@ -595,11 +651,9 @@ private:
         if ((read.State == EReadState::Running && read.LastSeqNo <= ev->Get()->LastSeqNo) || read.State == EReadState::Blocked) {
             if (ev->Get()->InstantStart) {
                 auto guard = BindAllocator();
-                auto requests = StreamLookupWorker->RebuildRequest(read.Id, ReadId);
-                for (auto& request : requests) {
-                    StartTableRead(read.ShardId, std::move(request));
-                }
+                StreamLookupWorker->RebuildRequest(read.ShardId, read.Id, ReadId);
                 Reads.erase(read);
+                ScheduleNextReads();
             } else {
                 RetryTableRead(read);
             }
@@ -610,6 +664,7 @@ private:
         auto guard = BindAllocator();
 
         NUdf::TUnboxedValue row;
+        auto allocState = &guard.GetMutex()->Ref();
 
         YQL_ENSURE(!Input.IsInvalid());
         if (Input.IsFinish() || !Input.HasValue()) {
@@ -617,8 +672,17 @@ private:
             return;
         }
 
+        size_t fetchCount = 0;
+        i64 bytesBefore = allocState->GetAllocated();
         while ((LastFetchStatus = Input.Fetch(row)) == NUdf::EFetchStatus::Ok) {
             StreamLookupWorker->AddInputRow(std::move(row));
+            ++fetchCount;
+            // Avoid fetching too many rows at once: limit both the number of rows and
+            // the allocator growth since the start of this fetch loop. GetAllocated()
+            // is only a heuristic for memory pressure here, not a precise retained-memory metric.
+            if (fetchCount >= MaxRowsProcessing || static_cast<i64>(allocState->GetAllocated()) - bytesBefore > static_cast<i64>(MaxBytesPerFetch)) {
+                break;
+            }
         }
     }
 
@@ -627,8 +691,17 @@ private:
 
         auto guard = BindAllocator();
 
-        auto requests = StreamLookupWorker->BuildRequests(Partitioning, ReadId);
-        for (auto& [shardId, request] : requests) {
+        StreamLookupWorker->BuildRequests(Partitioning, ReadId);
+        ScheduleNextReads();
+    }
+
+    void ScheduleNextReads() {
+        while(Reads.InFlightReads() < MaxInFlightReads) {
+            auto [shardId, request] = StreamLookupWorker->PopNextRequest();
+            if (!request) {
+                break;
+            }
+
             StartTableRead(shardId, std::move(request));
         }
     }
@@ -660,10 +733,26 @@ private:
             record.SetLockNodeId(*NodeLockId);
         }
 
+        if (QuerySpanId) {
+            record.SetQuerySpanId(QuerySpanId);
+        }
+
         auto defaultSettings = GetDefaultReadSettings()->Record;
-        record.SetMaxRows(defaultSettings.GetMaxRows());
-        record.SetMaxBytes(defaultSettings.GetMaxBytes());
+        if (!MaxRowsDefaultQuota || !MaxBytesDefaultQuota) {
+            MaxRowsDefaultQuota = defaultSettings.GetMaxRows();
+            MaxBytesDefaultQuota = defaultSettings.GetMaxBytes();
+        }
+
+        record.SetMaxRows(MaxRowsDefaultQuota);
+        record.SetMaxBytes(MaxBytesDefaultQuota);
         record.SetResultFormat(NKikimrDataEvents::FORMAT_CELLVEC);
+
+        TotalBytesQuota += MaxBytesDefaultQuota;
+        Counters->StreamLookupIteratorTotalQuotaBytesInFlight->Add(MaxBytesDefaultQuota);
+
+        if (TotalBytesQuota > MaxTotalBytesQuota) {
+            Counters->StreamLookupIteratorTotalQuotaBytesExceeded->Inc();
+        }
 
         CA_LOG_D(TStringBuilder() << "Send EvRead (stream lookup) to shardId=" << shardId
             << ", readId = " << record.GetReadId()
@@ -725,11 +814,9 @@ private:
         auto delay = Reads.CalcDelayForShard(failedRead, allowInstantRetry);
         if (delay == TDuration::Zero()) {
             auto guard = BindAllocator();
-            auto requests = StreamLookupWorker->RebuildRequest(failedRead.Id, ReadId);
-            for (auto& request : requests) {
-                StartTableRead(failedRead.ShardId, std::move(request));
-            }
+            StreamLookupWorker->RebuildRequest(failedRead.ShardId, failedRead.Id, ReadId);
             Reads.erase(failedRead);
+            ScheduleNextReads();
         } else {
             CA_LOG_D("Schedule retry atempt for readId: " << failedRead.Id << " after " << delay);
             TlsActivationContext->Schedule(
@@ -754,6 +841,7 @@ private:
         Partitioning.reset();
 
         auto request = MakeHolder<NSchemeCache::TSchemeCacheRequest>();
+        request->DatabaseName = Database;
 
         auto keyColumnTypes = StreamLookupWorker->GetKeyColumnTypes();
 
@@ -810,28 +898,41 @@ private:
     const bool AllowInconsistentReads;
     const bool UseFollowers;
     const bool IsTableImmutable;
+    const bool HasVectorTopK;
     const TActorId PipeCacheId;
     const TMaybe<ui64> LockTxId;
     const TMaybe<ui32> NodeLockId;
     const TMaybe<NKikimrDataEvents::ELockMode> LockMode;
+    const ui64 QuerySpanId;
     TReads Reads;
+    bool SentResultsAvailable = false;
     NUdf::EFetchStatus LastFetchStatus = NUdf::EFetchStatus::Yield;
-    std::shared_ptr<const TVector<TKeyDesc::TPartitionInfo>> Partitioning;
+    TPartitioning::TCPtr Partitioning;
     const TDuration SchemeCacheRequestTimeout;
     NActors::TActorId SchemeCacheRequestTimeoutTimer;
     TVector<NKikimrDataEvents::TLock> Locks;
     TVector<NKikimrDataEvents::TLock> BrokenLocks;
+    ui64 DeferredVictimQuerySpanId = 0;
     NKqpProto::EStreamLookupStrategy LookupStrategy;
     std::unique_ptr<TKqpStreamLookupWorker> StreamLookupWorker;
     ui64 ReadId = 0;
     size_t TotalRetryAttempts = 0;
     size_t TotalResolveShardsAttempts = 0;
     bool ResolveShardsInProgress = false;
-    NKikimrKqp::EIsolationLevel IsolationLevel;
+    NKqpProto::EIsolationLevel IsolationLevel;
+    const TString Database;
 
     // stats
     ui64 ReadRowsCount = 0;
     ui64 ReadBytesCount = 0;
+
+    size_t TotalBytesQuota = 0;
+    ui64 MaxTotalBytesQuota = 0;
+    size_t MaxRowsProcessing = 0;
+    ui64 MaxInFlightReads = 50;
+    ui64 MaxBytesPerFetch = 256_MB;
+    size_t MaxBytesDefaultQuota = 0;
+    size_t MaxRowsDefaultQuota = 0;
 
     TIntrusivePtr<TKqpCounters> Counters;
     NWilson::TSpan LookupActorSpan;

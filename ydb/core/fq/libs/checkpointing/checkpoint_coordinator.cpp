@@ -9,6 +9,7 @@
 #include <ydb/library/yql/dq/state/dq_state_load_plan.h>
 
 #include <util/string/builder.h>
+#include <util/system/env.h>
 
 #include <utility>
 
@@ -24,6 +25,16 @@
 namespace NFq {
 
 using namespace NActors;
+
+TCheckpointCoordinatorSettings::TCheckpointCoordinatorSettings() {
+    ui64 ms = 0;
+    if (!TryFromString<ui64>(GetEnv("YDB_TEST_DEFAULT_CHECKPOINTING_PERIOD_MS"), ms)) {
+        return;
+    }
+    if (ms) {
+        CheckpointingPeriod = TDuration::MilliSeconds(ms);
+    }
+}
 
 TCheckpointCoordinatorSettings::TCheckpointCoordinatorSettings(const NFq::NConfig::TCheckpointCoordinatorConfig& config)
     : CheckpointingPeriod(TDuration::MilliSeconds(config.GetCheckpointingPeriodMillis() ? config.GetCheckpointingPeriodMillis() : 30'000))
@@ -54,7 +65,9 @@ TCheckpointCoordinator::TCheckpointCoordinator(TCoordinatorId coordinatorId,
 }
 
 void TCheckpointCoordinator::Handle(NFq::TEvCheckpointCoordinator::TEvReadyState::TPtr& ev) {
-    CC_LOG_D("TEvReadyState, streaming disposition " << StreamingDisposition << ", state load mode " << FederatedQuery::StateLoadMode_Name(StateLoadMode));
+    CC_LOG_D("TEvReadyState, streaming disposition " << StreamingDisposition 
+        << ", state load mode " << FederatedQuery::StateLoadMode_Name(StateLoadMode)
+        << ", checkpointing period " << Settings.GetCheckpointingPeriod());
     ControlId = ev->Sender;
 
     for (const auto& task : ev->Get()->Tasks) {
@@ -363,10 +376,12 @@ void TCheckpointCoordinator::Handle(const TEvCheckpointCoordinator::TEvScheduleC
     if (checkpointsInFly >= Settings.GetMaxInflight() || (InitingZeroCheckpoint && !FailedZeroCheckpoint)) {
         CC_LOG_W("Skip schedule checkpoint event since inflight checkpoint limit exceeded: current: " << checkpointsInFly << ", limit: " << Settings.GetMaxInflight());
         Metrics.SkippedDueToInFlightLimit->Inc();
+        ++SkippedDueToInFlightLimitCounter;
         return;
     }
     FailedZeroCheckpoint = false;
-    Metrics.SkippedDueToInFlightLimit->Set(0);
+    Metrics.SkippedDueToInFlightLimit->Sub(SkippedDueToInFlightLimitCounter);
+    SkippedDueToInFlightLimitCounter = 0;
     InitCheckpoint();
 }
 
@@ -645,6 +660,7 @@ void TCheckpointCoordinator::PassAway() {
     for (const auto& [actorId, transport] : AllActors) {
         transport->EventsQueue.Unsubscribe();
     }
+    Metrics.SkippedDueToInFlightLimit->Sub(SkippedDueToInFlightLimitCounter);
     NActors::TActor<TCheckpointCoordinator>::PassAway();
 }
 

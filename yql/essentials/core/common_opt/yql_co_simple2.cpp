@@ -1,5 +1,5 @@
 #include "yql_co.h"
-#include "yql_co_pgselect.h"
+#include "yql_co_sqlselect.h"
 
 #include <yql/essentials/core/yql_opt_utils.h>
 #include <yql/essentials/core/yql_expr_csee.h>
@@ -541,9 +541,8 @@ TExprNode::TPtr OptimizeExistsAndUnwrap(const TExprNode::TPtr& node, TExprContex
 
 bool IsExtractCommonPredicatesFromLogicalOpsEnabled(const TOptimizeContext& optCtx) {
     YQL_ENSURE(optCtx.Types);
-    static const TString enable = to_lower(TString("ExtractCommonPredicatesFromLogicalOps"));
-    static const TString disable = to_lower(TString("DisableExtractCommonPredicatesFromLogicalOps"));
-    return optCtx.Types->OptimizerFlags.contains(enable) && !optCtx.Types->OptimizerFlags.contains(disable);
+    static const char OptName[] = "ExtractCommonPredicatesFromLogicalOps";
+    return !IsOptimizerDisabled<OptName>(*optCtx.Types);
 }
 
 size_t GetNodeId(const TExprNode* node, const TNodeMap<size_t>& node2id) {
@@ -671,8 +670,8 @@ TExprNode::TPtr ApplyAndAbsorption(const TExprNode::TPtr& node, TExprContext& ct
 
 bool IsOptimizeXNotXEnabled(const TOptimizeContext& optCtx) {
     YQL_ENSURE(optCtx.Types);
-    static const char flag[] = "OptimizeXNotX";
-    return IsOptimizerEnabled<flag>(*optCtx.Types) && !IsOptimizerDisabled<flag>(*optCtx.Types);
+    static const char Flag[] = "OptimizeXNotX";
+    return !IsOptimizerDisabled<Flag>(*optCtx.Types);
 }
 
 const TExprNode* UnwrapUnessential(const TExprNode* node) {
@@ -951,7 +950,8 @@ TExprNode::TPtr CheckIfWithSame(const TExprNode::TPtr& node, TExprContext& ctx, 
     }
 
     if (const auto width = node->ChildrenSize() >> 1U; width > 1U) {
-        TNodeSet predicates(width), branches(width);
+        TNodeSet predicates(width);
+        TNodeSet branches(width);
         for (auto i =0U; i < node->ChildrenSize() - 1U; ++i) {
             predicates.emplace(node->Child(i));
             branches.emplace(node->Child(++i));
@@ -1080,7 +1080,8 @@ void RegisterCoSimpleCallables2(TCallableOptimizerMap& map) {
         return node;
     };
 
-    map["PgGrouping"] = ExpandPgGrouping;
+    map["PgGrouping"] = ExpandSqlGrouping;
+    map["YqlGrouping"] = ExpandSqlGrouping;
 
     map["PruneKeys"] = map["PruneAdjacentKeys"] = [](const TExprNode::TPtr& node, TExprContext& /*ctx*/, TOptimizeContext&) {
         TCoPruneKeysBase pruneKeys(node);

@@ -232,8 +232,12 @@ public:
         str << "\n</table>";
     }
 
-    ui32 ColorFlagLimit(TOwner id, NKikimrBlobStorage::TPDiskSpaceColor::E color) {
+    ui32 ColorFlagLimit(TOwner id, NKikimrBlobStorage::TPDiskSpaceColor::E color) const {
         return QuotaForOwner[id].ColorFlagLimit(color);
+    }
+
+    double GetOccupancyForColor(NKikimrBlobStorage::TPDiskSpaceColor::E color) const {
+        return ColorLimits.GetOccupancyForColor(color, Total);
     }
 };
 
@@ -364,7 +368,7 @@ public:
         }
 
         ColorBorder = params.SpaceColorBorder;
-        ColorBorderOccupancy = chunkLimits.GetOccupancyForColor(ColorBorder, GlobalQuota->GetHardLimit(OwnerBeginUser));
+        ColorBorderOccupancy = OwnerQuota->GetOccupancyForColor(ColorBorder);
         return true;
     }
 
@@ -434,6 +438,17 @@ public:
 
     i64 GetTotalHardLimit() const {
         return SharedQuota->GetHardLimit();
+    }
+
+    TColor::E GetPDiskCapacityAlert() const {
+        double occupancy;
+        TColor::E sharedColor = SharedQuota->EstimateSpaceColor(0, &occupancy);
+        if (Params.SeparateCommonLog) {
+            TColor::E commonLogColor = GlobalQuota->EstimateSpaceColor(OwnerSystem, 0, &occupancy);
+            return Max(sharedColor, commonLogColor);
+        } else {
+            return sharedColor;
+        }
     }
     /////////////////////////////////////////////////////
 
@@ -586,7 +601,7 @@ public:
         OwnerQuota->PrintHTML(str, SharedQuota.Get(), &ColorBorder, &ColorBorderOccupancy);
     }
 
-    ui32 ColorFlagLimit(TOwner owner, NKikimrBlobStorage::TPDiskSpaceColor::E color) {
+    ui32 ColorFlagLimit(TOwner owner, NKikimrBlobStorage::TPDiskSpaceColor::E color) const {
         if (IsOwnerUser(owner)) {
             return OwnerQuota->ColorFlagLimit(owner, color);
         } else {
@@ -612,7 +627,7 @@ public:
 
     void SetColorBorder(NKikimrBlobStorage::TPDiskSpaceColor::E colorBorder) {
         ColorBorder = colorBorder;
-        ColorBorderOccupancy = ColorLimits.GetOccupancyForColor(ColorBorder, GlobalQuota->GetHardLimit(OwnerBeginUser));
+        ColorBorderOccupancy = OwnerQuota->GetOccupancyForColor(ColorBorder);
     }
 };
 

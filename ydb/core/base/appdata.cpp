@@ -22,16 +22,19 @@
 #include <ydb/core/protos/cms.pb.h>
 #include <ydb/core/protos/config.pb.h>
 #include <ydb/core/protos/data_integrity_trails.pb.h>
+#include <ydb/core/protos/schemeshard_config.pb.h>
 #include <ydb/core/protos/datashard_config.pb.h>
 #include <ydb/core/protos/feature_flags.pb.h>
 #include <ydb/core/protos/key.pb.h>
 #include <ydb/core/protos/memory_controller_config.pb.h>
 #include <ydb/core/protos/netclassifier.pb.h>
 #include <ydb/core/protos/pqconfig.pb.h>
+#include <ydb/core/protos/recoveryshard_config.pb.h>
 #include <ydb/core/protos/replication.pb.h>
 #include <ydb/core/protos/shared_cache.pb.h>
 #include <ydb/core/protos/stream.pb.h>
 #include <ydb/core/protos/workload_manager_config.pb.h>
+#include <ydb/core/protos/long_tx_service_config.pb.h>
 #include <ydb/library/pdisk_io/aio.h>
 
 #include <ydb/library/actors/interconnect/poller/poller_tcp.h>
@@ -40,6 +43,7 @@
 #include <library/cpp/random_provider/random_provider.h>
 #include <library/cpp/time_provider/time_provider.h>
 #include <library/cpp/monlib/dynamic_counters/counters.h>
+#include <ydb/core/tx/long_tx_service/public/snapshot_registry.h>
 
 namespace NKikimr {
 
@@ -82,6 +86,9 @@ struct TAppData::TImpl {
     NKikimrConfig::TStatisticsConfig StatisticsConfig;
     TMetricsConfig MetricsConfig;
     NKikimrConfig::TSystemTabletBackupConfig SystemTabletBackupConfig;
+    NKikimrConfig::TRecoveryShardConfig RecoveryShardConfig;
+    NKikimrConfig::TClusterDiagnosticsConfig ClusterDiagnosticsConfig;
+    NKikimrConfig::TLongTxServiceConfig LongTxServiceConfig;
 };
 
 TAppData::TAppData(
@@ -149,6 +156,9 @@ TAppData::TAppData(
     , StatisticsConfig(Impl->StatisticsConfig)
     , MetricsConfig(Impl->MetricsConfig)
     , SystemTabletBackupConfig(Impl->SystemTabletBackupConfig)
+    , RecoveryShardConfig(Impl->RecoveryShardConfig)
+    , ClusterDiagnosticsConfig(Impl->ClusterDiagnosticsConfig)
+    , LongTxServiceConfig(Impl->LongTxServiceConfig)
     , KikimrShouldContinue(kikimrShouldContinue)
     , TracingConfigurator(MakeIntrusive<NJaegerTracing::TSamplingThrottlingConfigurator>(TimeProvider, RandomProvider))
 {}

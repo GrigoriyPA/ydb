@@ -6,8 +6,7 @@
 #include <yql/essentials/minikql/mkql_node.h>
 #include <yql/essentials/minikql/mkql_program_builder.h>
 
-namespace NYql {
-namespace NCommon {
+namespace NYql::NCommon {
 
 class IMkqlCallableCompiler;
 
@@ -56,12 +55,12 @@ struct TMkqlBuildContext {
 
 class IMkqlCallableCompiler: public TThrRefBase {
 public:
-    typedef std::function<NKikimr::NMiniKQL::TRuntimeNode(const TExprNode&, TMkqlBuildContext&)> TCompiler;
+    using TCompiler = std::function<NKikimr::NMiniKQL::TRuntimeNode(const TExprNode&, TMkqlBuildContext&)>;
     virtual bool HasCallable(const std::string_view& name) const = 0;
     virtual TCompiler FindCallable(const std::string_view& name) const = 0;
     virtual TCompiler GetCallable(const std::string_view& name) const = 0;
 
-    virtual ~IMkqlCallableCompiler() {
+    ~IMkqlCallableCompiler() override {
     }
 };
 
@@ -108,10 +107,11 @@ private:
     }
 };
 
+NKikimr::NMiniKQL::EJoinKind GetJoinKind(const TExprNode& owner, const std::string_view& content);
+
 NKikimr::NMiniKQL::TRuntimeNode CombineByKeyImpl(const TExprNode& node, TMkqlBuildContext& ctx);
 NKikimr::NMiniKQL::TRuntimeNode MkqlBuildExpr(const TExprNode& node, TMkqlBuildContext& ctx);
 NKikimr::NMiniKQL::TRuntimeNode MkqlBuildLambda(const TExprNode& lambda, TMkqlBuildContext& ctx, const NKikimr::NMiniKQL::TRuntimeNode::TList& args);
 NKikimr::NMiniKQL::TRuntimeNode::TList MkqlBuildWideLambda(const TExprNode& lambda, TMkqlBuildContext& ctx, const NKikimr::NMiniKQL::TRuntimeNode::TList& args);
 
-} // namespace NCommon
-} // namespace NYql
+} // namespace NYql::NCommon

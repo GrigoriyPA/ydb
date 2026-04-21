@@ -4,7 +4,7 @@
 
 #include "datetime.h"
 
-namespace NYql::DateTime {
+namespace NYql::NDateTime {
 
 struct TTM64Storage {
     i32 Year : 19;
@@ -56,7 +56,12 @@ struct TTM64Storage {
 
     void FromDate32(const NUdf::IDateBuilder& builder, i32 value, ui16 tzId = 0) {
         i32 year;
-        ui32 month, day, dayOfYear, weekOfYear, weekOfYearIso8601, dayOfWeek;
+        ui32 month;
+        ui32 day;
+        ui32 dayOfYear;
+        ui32 weekOfYear;
+        ui32 weekOfYearIso8601;
+        ui32 dayOfWeek;
 
         if (!builder.SplitTzDate32(value, year, month, day, dayOfYear, weekOfYear, weekOfYearIso8601, dayOfWeek, tzId)) {
             ythrow yexception() << "Error in SplitTzDate32 tzId " << tzId << " value " << value;
@@ -74,8 +79,15 @@ struct TTM64Storage {
 
     void FromDatetime64(const NUdf::IDateBuilder& builder, i64 value, ui16 tzId = 0) {
         i32 year;
-        ui32 month, day, dayOfYear, weekOfYear, weekOfYearIso8601, dayOfWeek;
-        ui32 hour, minute, second;
+        ui32 month;
+        ui32 day;
+        ui32 dayOfYear;
+        ui32 weekOfYear;
+        ui32 weekOfYearIso8601;
+        ui32 dayOfWeek;
+        ui32 hour;
+        ui32 minute;
+        ui32 second;
 
         if (!builder.SplitTzDatetime64(
                 value, year, month, day, hour, minute, second,
@@ -141,18 +153,46 @@ struct TTM64Storage {
         return ToDatetime64(builder) * 1000000ll + Microsecond;
     }
 
-    inline bool Validate(const NUdf::IDateBuilder& builder) {
+    inline bool Validate(const NUdf::IDateBuilder& builder, TMaybe<i16> timezoneOffset = Nothing()) {
         i64 datetime;
-        if (!builder.MakeTzDatetime64(Year, Month, Day, Hour, Minute, Second, datetime, TimezoneId)) {
-            return false;
+        if (timezoneOffset.Defined()) {
+            Y_ENSURE(TimezoneId == 0);
+            if (!builder.MakeTzDatetime64(Year, Month, Day, Hour, Minute, Second, datetime)) {
+                return false;
+            }
+            const auto tzOffset = *timezoneOffset.Get() * 60;
+            if (datetime < tzOffset + NUdf::MIN_DATETIME64 ||
+                datetime > tzOffset + NUdf::MAX_DATETIME64)
+            {
+                return false;
+            }
+            datetime -= tzOffset;
+        } else {
+            if (!builder.MakeTzDatetime64(Year, Month, Day, Hour, Minute, Second, datetime, TimezoneId)) {
+                return false;
+            }
         }
 
         i32 year;
-        ui32 month, day, hour, minute, second, dayOfYear, weekOfYear, weekOfYearIso8601, dayOfWeek;
+        ui32 month;
+        ui32 day;
+        ui32 hour;
+        ui32 minute;
+        ui32 second;
+        ui32 dayOfYear;
+        ui32 weekOfYear;
+        ui32 weekOfYearIso8601;
+        ui32 dayOfWeek;
         if (!builder.SplitTzDatetime64(datetime, year, month, day, hour, minute, second, dayOfYear, weekOfYear, weekOfYearIso8601, dayOfWeek, TimezoneId)) {
             ythrow yexception() << "Error in SplitTzDatetime64";
         }
 
+        Year = year;
+        Month = month;
+        Day = day;
+        Hour = hour;
+        Minute = minute;
+        Second = second;
         DayOfYear = dayOfYear;
         WeekOfYear = weekOfYear;
         WeekOfYearIso8601 = weekOfYearIso8601;
@@ -174,7 +214,7 @@ struct TTM64Storage {
         return ((Hour * 60ull + Minute) * 60ull + Second) * 1000000ull + Microsecond;
     }
 
-    const TString ToString() const {
+    TString ToString() const {
         const auto& tzName = NTi::GetTimezones()[TimezoneId];
         return Sprintf("%8d-%02d-%02dT%02d:%02d:%02d.%06d,%.*s",
                        Year, Month, Day, Hour, Minute, Second, Microsecond,
@@ -182,4 +222,9 @@ struct TTM64Storage {
     }
 };
 
+} // namespace NYql::NDateTime
+
+// TODO(YQL-20086): Migrate YDB to NYql::NDateTime
+namespace NYql::DateTime { // NOLINT(readability-identifier-naming)
+using namespace NYql::NDateTime;
 } // namespace NYql::DateTime

@@ -25,7 +25,7 @@ private:
     virtual TString DoDebugString() const = 0;
     bool InitCursorFlag = false;
     virtual void DoFillReadStats(TReadStats& /*stats*/) const {
-    
+
     }
 
 public:
@@ -122,11 +122,6 @@ private:
 public:
     using TConstPtr = std::shared_ptr<const TReadMetadata>;
 
-    void SetSelectInfo(std::unique_ptr<ISourcesConstructor>&& value) {
-        AFL_VERIFY(!SourcesConstructor);
-        SourcesConstructor = std::move(value);
-    }
-
     std::unique_ptr<ISourcesConstructor> ExtractSelectInfo() const {
         AFL_VERIFY(!!SourcesConstructor);
         return std::move(SourcesConstructor);
@@ -191,6 +186,10 @@ public:
 
     TReadMetadata(const TReadMetadata&) = delete;
     TReadMetadata& operator=(const TReadMetadata&) = delete;
+
+    bool OrderByLimitAllowed() const {
+        return TableMetadataAccessor->OrderByLimitAllowed() && !GetFakeSort();
+    }
 
     virtual std::vector<TNameTypeInfo> GetKeyYqlSchema() const override {
         return GetResultSchema()->GetIndexInfo().GetPrimaryKeyColumns();

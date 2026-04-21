@@ -7,10 +7,20 @@ namespace NSQLTranslationV1 {
 
 using namespace NSQLv1Generated;
 
+template <typename TRule>
+    requires std::same_as<TRule, TRule_union_op> ||
+             std::same_as<TRule, TRule_intersect_op>
+bool IsAllQualifiedOp(const TRule& node);
+
 class TSqlSelect: public TSqlTranslation {
 public:
     TSqlSelect(TContext& ctx, NSQLTranslation::ESqlMode mode)
         : TSqlTranslation(ctx, mode)
+    {
+    }
+
+    explicit TSqlSelect(const TSqlTranslation& that)
+        : TSqlTranslation(that)
     {
     }
 
@@ -20,6 +30,7 @@ public:
     TSourcePtr BuildSubSelect(const TRule_select_subexpr& node);
 
 private:
+    TSourcePtr CheckSubSelectOnDiscard(TSourcePtr source);
     bool SelectTerm(TVector<TNodePtr>& terms, const TRule_result_column& node);
     bool ValidateSelectColumns(const TVector<TNodePtr>& terms);
     bool ColumnName(TVector<TNodePtr>& keys, const TRule_column_name& node);
@@ -69,11 +80,6 @@ private:
         TPosition FirstPos;
         TSelectKindResult Last;
     };
-
-    template <typename TRule>
-        requires std::same_as<TRule, TRule_union_op> ||
-                 std::same_as<TRule, TRule_intersect_op>
-    bool IsAllQualifiedOp(const TRule& node);
 
     template <typename TRule>
         requires std::same_as<TRule, TRule_select_stmt> ||

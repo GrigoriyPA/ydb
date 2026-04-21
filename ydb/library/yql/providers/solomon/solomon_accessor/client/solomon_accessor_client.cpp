@@ -12,6 +12,7 @@
 #include <ydb/library/yql/providers/solomon/solomon_accessor/grpc/data_service.pb.h>
 #include <ydb/library/yql/providers/solomon/solomon_accessor/grpc/data_service.grpc.pb.h>
 
+#include <util/generic/size_literals.h>
 #include <util/string/join.h>
 
 namespace NYql::NSo {
@@ -223,7 +224,12 @@ TGetPointsCountResponse ProcessGetPointsCountResponse(NYql::IHTTPGateway::TResul
     TGetPointsCountResult result;
 
     if (response.CurlResponseCode != CURLE_OK) {
-        TString issues = response.Issues.ToOneLineString();
+        return TGetPointsCountResponse(TStringBuilder() << "Monitoring api points count response: " << response.Issues.ToOneLineString() <<
+            ", internal code: " << static_cast<int>(response.CurlResponseCode));
+    }
+
+    if (response.Content.HttpResponseCode < 200 || response.Content.HttpResponseCode >= 300) {
+        TString issues = response.Content.data();
 
         for (const auto& whitelistIssue : whitelistIssues) {
             if (issues.find(whitelistIssue) != issues.npos) {
@@ -232,11 +238,6 @@ TGetPointsCountResponse ProcessGetPointsCountResponse(NYql::IHTTPGateway::TResul
             }
         }
 
-        return TGetPointsCountResponse(TStringBuilder() << "Monitoring api points count response: " << issues <<
-            ", internal code: " << static_cast<int>(response.CurlResponseCode));
-    }
-
-    if (response.Content.HttpResponseCode < 200 || response.Content.HttpResponseCode >= 300) {
         return TGetPointsCountResponse(TStringBuilder{} << "Monitoring api points count response: " << response.Content.data() <<
             ", internal code: " << response.Content.HttpResponseCode);
     }
@@ -561,13 +562,11 @@ private:
 
         if (EnableSolomonClientPostApi) {
             w.BeginObject()
-                .UnsafeWriteKey("projectId").WriteString(GetProjectId())
                 .UnsafeWriteKey("selectors").WriteString(BuildSelectorsProgram(selectors))
                 .UnsafeWriteKey("from").WriteString(from.ToString())
                 .UnsafeWriteKey("to").WriteString(to.ToString())
             .EndObject();
         } else {
-            builder.AddUrlParam("projectId", GetProjectId());
             builder.AddUrlParam("selectors", BuildSelectorsProgram(selectors));
             builder.AddUrlParam("from", from.ToString());
             builder.AddUrlParam("to", to.ToString());
@@ -585,22 +584,20 @@ private:
         builder.AddPathComponent(Settings.GetProject());
         builder.AddPathComponent("sensors");
 
+        builder.AddUrlParam("pageSize", ToString(MaxListingPageSize));
+
         NJsonWriter::TBuf w;
 
         if (EnableSolomonClientPostApi) {
             w.BeginObject()
-                .UnsafeWriteKey("projectId").WriteString(GetProjectId())
                 .UnsafeWriteKey("selectors").WriteString(BuildSelectorsProgram(selectors))
                 .UnsafeWriteKey("from").WriteString(from.ToString())
                 .UnsafeWriteKey("to").WriteString(to.ToString())
-                .UnsafeWriteKey("pageSize").WriteLongLong(MaxListingPageSize)
             .EndObject();
         } else {
-            builder.AddUrlParam("projectId", GetProjectId());
             builder.AddUrlParam("selectors", BuildSelectorsProgram(selectors));
             builder.AddUrlParam("from", from.ToString());
             builder.AddUrlParam("to", to.ToString());
-            builder.AddUrlParam("pageSize", ToString(MaxListingPageSize));
         }
 
         return { builder.Build(), w.Str() };
@@ -620,14 +617,12 @@ private:
 
         if (EnableSolomonClientPostApi) {
             w.BeginObject()
-                .UnsafeWriteKey("projectId").WriteString(GetProjectId())
                 .UnsafeWriteKey("selectors").WriteString(BuildSelectorsProgram(selectors))
                 .UnsafeWriteKey("from").WriteString(from.ToString())
                 .UnsafeWriteKey("to").WriteString(to.ToString())
                 .UnsafeWriteKey("limit").WriteLongLong(100000)
             .EndObject();
         } else {
-            builder.AddUrlParam("projectId", GetProjectId());
             builder.AddUrlParam("selectors", BuildSelectorsProgram(selectors));
             builder.AddUrlParam("from", from.ToString());
             builder.AddUrlParam("to", to.ToString());
@@ -646,8 +641,6 @@ private:
         builder.AddPathComponent(Settings.GetProject());
         builder.AddPathComponent("sensors");
         builder.AddPathComponent("data");
-
-        builder.AddUrlParam("projectId", GetProjectId());
 
         const auto& ds = Settings.GetDownsampling();
         NJsonWriter::TBuf w;
@@ -730,7 +723,7 @@ private:
 private:
     const bool EnableSolomonClientPostApi;
     const ui64 MaxListingPageSize;
-    const ui64 ListSizeLimit = 100 * 1024 * 1024 * 8;
+    const ui64 ListSizeLimit = 100_MB * 8;
     const NYql::NSo::NProto::TDqSolomonSource Settings;
     const std::shared_ptr<NYdb::ICredentialsProvider> CredentialsProvider;
 

@@ -20,6 +20,8 @@ SRCS(
     yql_expr_optimize.h
     yql_expr_type_annotation.cpp
     yql_expr_type_annotation.h
+    yql_expr_type_annotation_pg.cpp
+    yql_expr_type_annotation_pg.h
     yql_func_stack.cpp
     yql_func_stack.h
     yql_gc_transformer.cpp
@@ -30,6 +32,7 @@ SRCS(
     yql_holding_file_storage.h
     yql_join.cpp
     yql_join.h
+    yql_module_helpers.cpp
     yql_library_compiler.cpp
     yql_linear_checker.cpp
     yql_layers_helpers.cpp
@@ -48,6 +51,8 @@ SRCS(
     yql_opt_utils.h
     yql_opt_window.cpp
     yql_opt_window.h
+    yql_opt_window_stream_transformers.cpp
+    yql_opt_window_stream_transformers.h
     yql_statistics.cpp
     yql_type_annotation.cpp
     yql_type_annotation.h
@@ -63,6 +68,15 @@ SRCS(
     yql_user_data.h
     yql_user_data_storage.cpp
     yql_user_data_storage.h
+    yql_window_features.cpp
+    yql_window_features.h
+    yql_window_frame_setting_bound.h
+    yql_window_frame_settings.cpp
+    yql_window_frame_settings.h
+    yql_window_frames_collector_params_serializer.cpp
+    yql_window_frames_collector_params_serializer.h
+    yql_window_frame_settings_pg.cpp
+    yql_window_frame_settings_pg.h
 )
 
 PEERDIR(
@@ -121,6 +135,7 @@ RECURSE(
     minsketch
     pg_ext
     pg_settings
+    poly_args
     sql_types
     url_lister
     url_preprocessing

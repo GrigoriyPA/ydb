@@ -3,9 +3,7 @@
 #include <yql/essentials/core/yql_type_annotation.h>
 #include <yql/essentials/core/yql_execution.h>
 
-namespace Nkikimr::NMiniKQL {
-class IFunctionRegistry;
-} // namespace Nkikimr::NMiniKQL
+#include <utility>
 
 namespace NYql {
 
@@ -29,7 +27,7 @@ struct TResultProviderConfig: TThrRefBase {
                           IDataProvider::EResultFormat format, const TString& formatDetails, TResultWriterFactory writerFactory)
         : Types(types)
         , FunctionRegistry(functionRegistry)
-        , WriterFactory(writerFactory)
+        , WriterFactory(std::move(writerFactory))
     {
         FillSettings.Format = format;
         FillSettings.FormatDetails = formatDetails;

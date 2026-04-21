@@ -44,6 +44,8 @@
 #include <google/protobuf/text_format.h>
 #include <library/cpp/testing/unittest/registar.h>
 
+#include "ut_common.h"
+
 #ifdef NDEBUG
 #define Ctest Cnull
 #else
@@ -51,11 +53,6 @@
 #endif
 
 const bool STRAND_PDISK = true;
-#ifndef NDEBUG
-static constexpr bool ENABLE_DETAILED_HIVE_LOG = true;
-#else
-static constexpr bool ENABLE_DETAILED_HIVE_LOG = false;
-#endif
 const char *DOMAIN_NAME = "dc-1";
 
 namespace NKikimr {
@@ -212,6 +209,9 @@ namespace {
                 nodeWardenConfig->SectorMaps[pDiskPath] = sectorMap;
             }
             ui64 pDiskGuid = i + 1;
+            TFormatOptions options;
+            options.SectorMap = sectorMap;
+            options.EnableSmallDiskOptimization = false;
             FormatPDisk(
                         pDiskPath,
                         pDiskSize,
@@ -223,10 +223,7 @@ namespace {
                         0x7890123456 + iteration,
                         NPDisk::YdbDefaultPDiskSequence,
                         TString(""),
-                        false,
-                        false,
-                        sectorMap,
-                        false);
+                        options);
         }
     }
 
@@ -467,9 +464,11 @@ void FormatPDiskForTest(TString path, ui64 diskSize, ui32 chunkSize, ui64 guid,
     SafeEntropyPoolRead(&logKey, sizeof(NKikimr::NPDisk::TKey));
     SafeEntropyPoolRead(&sysLogKey, sizeof(NKikimr::NPDisk::TKey));
 
+    TFormatOptions options;
+    options.SectorMap = sectorMap;
+    options.EnableSmallDiskOptimization = false;
     NKikimr::FormatPDisk(path, diskSize, 4 << 10, chunkSize, guid,
-        chunkKey, logKey, sysLogKey, NPDisk::YdbDefaultPDiskSequence, "", false, false, sectorMap,
-        false);
+        chunkKey, logKey, sysLogKey, NPDisk::YdbDefaultPDiskSequence, "", options);
 }
 
 void InitSchemeRoot(TTestBasicRuntime& runtime, const TActorId& sender) {
@@ -866,24 +865,6 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         runtime.DispatchEvents(options);
     }
 
-    NKikimrTabletBase::TEvGetCountersResponse GetCounters(TTestBasicRuntime& runtime, ui64 tabletId) {
-        const auto sender = runtime.AllocateEdgeActor();
-        runtime.SendToPipe(tabletId, sender, new TEvTablet::TEvGetCounters);
-        auto ev = runtime.GrabEdgeEvent<TEvTablet::TEvGetCountersResponse>(sender);
-
-        UNIT_ASSERT(ev);
-        return ev->Get()->Record;
-    }
-
-    ui64 GetSimpleCounter(TTestBasicRuntime& runtime, ui64 tabletId,
-                          NHive::ESimpleCounters counter) {
-      return GetCounters(runtime, tabletId)
-          .GetTabletCounters()
-          .GetAppCounters()
-          .GetSimpleCounters(counter)
-          .GetValue();
-    }
-
     void WaitForBootQueue(TTestBasicRuntime& runtime, ui64 hiveTabletId) {
         for (;;) {
             auto counters = GetCounters(runtime, hiveTabletId);
@@ -897,6 +878,14 @@ Y_UNIT_TEST_SUITE(THiveTest) {
             TDispatchOptions options;
             runtime.DispatchEvents(options, TDuration::MilliSeconds(500));
         }
+    }
+
+    void BalanceTablets(TTestBasicRuntime& runtime, ui64 hiveTabletId, const TActorId& sender) {
+        runtime.SendToPipe(hiveTabletId, sender, new NHive::TEvPrivate::TEvProcessTabletBalancer, 0, GetPipeConfigWithRetries());
+    }
+
+    void BalanceTablets(TTestBasicRuntime& runtime, ui64 hiveTabletId) {
+        BalanceTablets(runtime, hiveTabletId, runtime.AllocateEdgeActor());
     }
 
     Y_UNIT_TEST(TestCreateTablet) {
@@ -1176,9 +1165,8 @@ Y_UNIT_TEST_SUITE(THiveTest) {
             SendKillLocal(runtime, nodeIdx);
             {
                 TDispatchOptions options;
-                options.FinalEvents.emplace_back(NHive::TEvPrivate::EvDeleteNode);
-                runtime.DispatchEvents(options);
                 runtime.AdvanceCurrentTime(TDuration::Seconds(2));
+                options.FinalEvents.emplace_back(NHive::TEvPrivate::EvDeleteNode);
                 runtime.DispatchEvents(options);
             }
         }
@@ -1295,6 +1283,52 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         TAutoPtr<IEventHandle> handle;
         auto drainResponse = runtime.GrabEdgeEventRethrow<TEvHive::TEvDrainNodeResult>(handle, TDuration::Seconds(30));
         UNIT_ASSERT_VALUES_EQUAL(drainResponse->Record.GetStatus(), NKikimrProto::EReplyStatus::OK);
+    }
+
+    Y_UNIT_TEST(TestIdempotentDrain) {
+        TTestBasicRuntime runtime(2, false);
+        Setup(runtime, true, 2);
+        const int numNodes = runtime.GetNodeCount();
+        const int NUM_TABLETS = 25;
+        const ui64 hiveTablet = MakeDefaultHiveID();
+        const ui64 testerTablet = MakeTabletID(false, 1);
+        CreateTestBootstrapper(runtime, CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
+        {
+            TDispatchOptions options;
+            options.FinalEvents.emplace_back(TEvLocal::EvStatus, numNodes);
+            runtime.DispatchEvents(options);
+        }
+        TTabletTypes::EType tabletType = TTabletTypes::Dummy;
+        std::unordered_set<TTabletId> tablets;
+        TActorId senderA = runtime.AllocateEdgeActor(0);
+        for (int i = 0; i < NUM_TABLETS; ++i) {
+            THolder<TEvHive::TEvCreateTablet> ev(new TEvHive::TEvCreateTablet(testerTablet, 100500 + i, tabletType, BINDED_CHANNELS));
+            runtime.SendToPipe(hiveTablet, senderA, ev.Release(), 0, GetPipeConfigWithRetries());
+        }
+        for (int i = 0; i < NUM_TABLETS; ++i) {
+            TAutoPtr<IEventHandle> handle;
+            auto createTabletReply = runtime.GrabEdgeEventRethrow<TEvHive::TEvCreateTabletReply>(handle);
+            ui64 tabletId = createTabletReply->Record.GetTabletID();
+            tablets.emplace(tabletId);
+        }
+        NTabletPipe::TClientConfig pipeConfig;
+        pipeConfig.RetryPolicy = NTabletPipe::TClientRetryPolicy::WithRetries();
+        for (TTabletId tabletId : tablets) {
+            MakeSureTabletIsUp(runtime, tabletId, 0, &pipeConfig);
+        }
+
+        ui32 nodeId = runtime.GetNodeId(0);
+        {
+            const int numDrains = 5;
+            for (int i = 0; i < numDrains; ++i) {
+                runtime.SendToPipe(hiveTablet, senderA, new TEvHive::TEvDrainNode(nodeId));
+            }
+            for (int i = 0; i < numDrains; ++i) {
+                TAutoPtr<IEventHandle> handle;
+                auto drainResponse = runtime.GrabEdgeEventRethrow<TEvHive::TEvDrainNodeResult>(handle, TDuration::Seconds(30));
+                UNIT_ASSERT_VALUES_EQUAL(drainResponse->Record.GetStatus(), NKikimrProto::EReplyStatus::OK);
+            }
+        }
     }
 
     Y_UNIT_TEST(TestCreateSubHiveCreateTablet) {
@@ -3025,9 +3059,9 @@ Y_UNIT_TEST_SUITE(THiveTest) {
             vdiskMetrics->MutableVDiskId()->SetVDisk(0);
 
             if (tabletGroups.contains(groupId)) {
-                vdiskMetrics->SetOccupancy(1.0);
+                vdiskMetrics->SetNormalizedOccupancy(1.0);
             } else {
-                vdiskMetrics->SetOccupancy(0.8);
+                vdiskMetrics->SetNormalizedOccupancy(0.8);
             }
         }
 
@@ -3392,6 +3426,8 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         const ui64 testerTablet = MakeTabletID(false, 1);
         CreateTestBootstrapper(runtime, CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
 
+        auto syncReassign = runtime.AddObserver<TEvHive::TEvReassignTablet>([] (auto&& ev) { ev->Get()->Record.SetAsync(false); });
+
         TTabletTypes::EType tabletType = TTabletTypes::Dummy;
         TVector<ui64> tablets;
         for (ui64 i = 0; i < NUM_TABLETS; ++i) {
@@ -3462,6 +3498,51 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         }
 
         UNIT_ASSERT_VALUES_UNEQUAL(getGroup(tabletA), getGroup(tabletB));
+    }
+
+    Y_UNIT_TEST(TestStorageBalancerDeleteTablet) {
+        static constexpr ui64 NUM_TABLETS = 3;
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.HiveConfig.SetMinPeriodBetweenReassign(0);
+            app.HiveConfig.SetStorageInfoRefreshFrequency(200);
+        });
+        const ui64 hiveTablet = MakeDefaultHiveID();
+        const ui64 testerTablet = MakeTabletID(false, 1);
+        CreateTestBootstrapper(runtime, CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
+        TActorId sender = runtime.AllocateEdgeActor();
+
+        TTabletTypes::EType tabletType = TTabletTypes::Dummy;
+        TVector<ui64> tablets;
+        for (ui64 i = 0; i < NUM_TABLETS; ++i) {
+            THolder<TEvHive::TEvCreateTablet> ev(new TEvHive::TEvCreateTablet(testerTablet, 100500 + i, tabletType, BINDED_CHANNELS));
+            ev->Record.SetObjectId(i);
+            ui64 tabletId = SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(ev), 0, true);
+            tablets.emplace_back(tabletId);
+            MakeSureTabletIsUp(runtime, tabletId, 0);
+        }
+
+        TBlockEvents<NHive::TEvPrivate::TEvRestartComplete> block(runtime);
+
+        runtime.SendToPipe(hiveTablet, sender, new NHive::TEvPrivate::TEvStartStorageBalancer({.NumReassigns = NUM_TABLETS, .MaxInFlight = 1}), 0, GetPipeConfigWithRetries());
+
+        while (block.empty()) {
+            runtime.DispatchEvents({}, TDuration::MilliSeconds(100));
+        }
+
+
+        for (ui64 i = 0; i < NUM_TABLETS; ++i) {
+            SendDeleteTestTablet(runtime, hiveTablet, MakeHolder<TEvHive::TEvDeleteTablet>(testerTablet, 100500 + i, 0), 0, std::nullopt);
+        }
+
+        block.Stop().Unblock();
+
+        {
+            TDispatchOptions options;
+            options.FinalEvents.emplace_back(NHive::TEvPrivate::EvStorageBalancerOut);
+            runtime.DispatchEvents(options, TDuration::Minutes(1));
+        }
+
     }
 
 //    Y_UNIT_TEST(TestCreateTabletAndChangeProfiles) {
@@ -5857,6 +5938,8 @@ Y_UNIT_TEST_SUITE(THiveTest) {
             runtime.SendToPipe(hiveTablet, senderA, metrics.Release());
         }
 
+        runtime.DispatchEvents({}, TDuration::MilliSeconds(300));
+
         auto createTablet = MakeHolder<TEvHive::TEvCreateTablet>(testerTablet, 100500 + tablets.size(), tabletType, BINDED_CHANNELS);
         ui64 newTablet = SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(createTablet), 0, false);
 
@@ -7834,7 +7917,7 @@ Y_UNIT_TEST_SUITE(THiveTest) {
 
         {
             NActorsProto::TRemoteHttpInfo pb;
-            pb.SetMethod(HTTP_METHOD_GET);
+            pb.SetMethod(HTTP_METHOD_POST);
             pb.SetPath("/app");
             auto* p1 = pb.AddQueryParams();
             p1->SetKey("TabletID");
@@ -7862,7 +7945,7 @@ Y_UNIT_TEST_SUITE(THiveTest) {
 
         {
             NActorsProto::TRemoteHttpInfo pb;
-            pb.SetMethod(HTTP_METHOD_GET);
+            pb.SetMethod(HTTP_METHOD_POST);
             pb.SetPath("/app");
             auto* p1 = pb.AddQueryParams();
             p1->SetKey("TabletID");
@@ -7910,7 +7993,7 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         }
         {
             NActorsProto::TRemoteHttpInfo pb;
-            pb.SetMethod(HTTP_METHOD_GET);
+            pb.SetMethod(HTTP_METHOD_POST);
             pb.SetPath("/app");
             auto* p1 = pb.AddQueryParams();
             p1->SetKey("TabletID");
@@ -7939,7 +8022,7 @@ Y_UNIT_TEST_SUITE(THiveTest) {
 
         {
             NActorsProto::TRemoteHttpInfo pb;
-            pb.SetMethod(HTTP_METHOD_GET);
+            pb.SetMethod(HTTP_METHOD_POST);
             pb.SetPath("/app");
             auto* p1 = pb.AddQueryParams();
             p1->SetKey("TabletID");
@@ -8129,6 +8212,15 @@ Y_UNIT_TEST_SUITE(THiveTest) {
 
         MakeSureTabletIsUp(runtime, tablet, 0);
 
+        auto getJsonAnswer = [&] {
+            TAutoPtr<IEventHandle> handle;
+            auto resp = runtime.GrabEdgeEventRethrow<NMon::TEvRemoteBinaryInfoRes>(handle);
+            auto lines = SplitString(resp->Blob, "\r\n");
+            NJson::TJsonValue value;
+            ReadJsonTree(lines.back(), &value, false);
+            return value;
+        };
+
         {
             NActorsProto::TRemoteHttpInfo pb;
             pb.SetMethod(HTTP_METHOD_POST);
@@ -8156,11 +8248,7 @@ Y_UNIT_TEST_SUITE(THiveTest) {
             p7->SetValue(TStringBuilder() << wrongOldDomain.GetPathId());
             runtime.SendToPipe(hiveTablet, sender, new NMon::TEvRemoteHttpInfo(std::move(pb)), 0, GetPipeConfigWithRetries());
 
-            TAutoPtr<IEventHandle> handle;
-            auto resp = runtime.GrabEdgeEventRethrow<NMon::TEvRemoteJsonInfoRes>(handle);
-            Ctest << "Hive response: " << resp->Json << Endl;
-            NJson::TJsonValue value;
-            ReadJsonTree(resp->Json, &value, false);
+            auto value = getJsonAnswer();
             UNIT_ASSERT_VALUES_EQUAL(value["status"].GetStringSafe(), "ERROR");
         }
 
@@ -8220,13 +8308,72 @@ Y_UNIT_TEST_SUITE(THiveTest) {
             p5->SetValue(TStringBuilder() << newDomain.GetPathId());
             runtime.SendToPipe(hiveTablet, sender, new NMon::TEvRemoteHttpInfo(std::move(pb)), 0, GetPipeConfigWithRetries());
 
+            auto value = getJsonAnswer();
+            UNIT_ASSERT_VALUES_EQUAL(value["status"].GetStringSafe(), "ERROR");
+        }
+    }
+
+    Y_UNIT_TEST(TestReassignNonexistentTablet) {
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true);
+
+        const ui64 hiveTablet = MakeDefaultHiveID();
+        const ui64 testerTablet = MakeTabletID(false, 1);
+        const TActorId hiveActor = CreateTestBootstrapper(runtime, CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
+        runtime.EnableScheduleForActor(hiveActor);
+        MakeSureTabletIsUp(runtime, hiveTablet, 0);
+        TActorId sender = runtime.AllocateEdgeActor(0);
+
+        {
+            TDispatchOptions options;
+            options.FinalEvents.emplace_back(TEvLocal::EvSyncTablets);
+            runtime.DispatchEvents(options);
+        }
+
+        THolder<TEvHive::TEvCreateTablet> createTablet = MakeHolder<TEvHive::TEvCreateTablet>(testerTablet, 1, TTabletTypes::Dummy, BINDED_CHANNELS);
+        ui64 tablet = SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(createTablet), 0, true);
+
+        MakeSureTabletIsUp(runtime, tablet, 0);
+
+        {
+            NActorsProto::TRemoteHttpInfo pb;
+            pb.SetMethod(HTTP_METHOD_POST);
+            pb.SetPath("/app");
+            auto* p1 = pb.AddQueryParams();
+            p1->SetKey("TabletID");
+            p1->SetValue(TStringBuilder() << hiveTablet);
+            auto* p2 = pb.AddQueryParams();
+            p2->SetKey("page");
+            p2->SetValue("ReassignTablet");
+            auto* p3 = pb.AddQueryParams();
+            p3->SetKey("tablet");
+            p3->SetValue("52");
+            runtime.SendToPipe(hiveTablet, sender, new NMon::TEvRemoteHttpInfo(std::move(pb)), 0, GetPipeConfigWithRetries());
+
             TAutoPtr<IEventHandle> handle;
             auto resp = runtime.GrabEdgeEventRethrow<NMon::TEvRemoteJsonInfoRes>(handle);
             Ctest << "Hive response: " << resp->Json << Endl;
             NJson::TJsonValue value;
             ReadJsonTree(resp->Json, &value, false);
-            UNIT_ASSERT_VALUES_EQUAL(value["status"].GetStringSafe(), "ERROR");
+            UNIT_ASSERT_VALUES_EQUAL(value["total"].GetIntegerSafe(), 0);
         }
+
+        // this must not block balancer
+
+       {
+            THolder<TEvHive::TEvTabletMetrics> metrics = MakeHolder<TEvHive::TEvTabletMetrics>();
+            NKikimrHive::TTabletMetrics* metric = metrics->Record.AddTabletMetrics();
+            metric->SetTabletID(tablet);
+            metric->MutableResourceUsage()->SetNetwork(9000);
+
+            runtime.SendToPipe(hiveTablet, sender, metrics.Release());
+       }
+
+       {
+           TDispatchOptions options;
+           options.FinalEvents.push_back(NHive::TEvPrivate::EvBalancerOut);
+           runtime.DispatchEvents(options);
+       }
     }
 
     Y_UNIT_TEST(TestTabletsStartingCounter) {
@@ -8383,6 +8530,39 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         UNIT_ASSERT_VALUES_EQUAL(30, getTabletsCounter());
     }
 
+    Y_UNIT_TEST(TestDownCounterDeleteNode) {
+        const int NUM_NODES = 2;
+        TTestBasicRuntime runtime(NUM_NODES, false);
+        Setup(runtime, true, 2, [](TAppPrepare& app) {
+            app.HiveConfig.SetNodeDeletePeriod(1);
+        });
+        const ui64 hiveTablet = MakeDefaultHiveID();
+        const TActorId senderA = runtime.AllocateEdgeActor(0);
+        const TActorId hiveActor = CreateTestBootstrapper(runtime, CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
+        runtime.EnableScheduleForActor(hiveActor);
+        {
+            TDispatchOptions options;
+            options.FinalEvents.emplace_back(TEvLocal::EvStatus, NUM_NODES);
+            runtime.DispatchEvents(options);
+        }
+
+        ui32 nodeIdx = 0;
+        ui32 nodeId = runtime.GetNodeId(nodeIdx);
+        runtime.SendToPipe(hiveTablet, senderA, new TEvHive::TEvSetDown(nodeId));
+        TAutoPtr<IEventHandle> handle;
+        runtime.GrabEdgeEventRethrow<TEvHive::TEvSetDownReply>(handle);
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_NODES_DOWN), 1);
+
+        SendKillLocal(runtime, nodeIdx);
+        {
+            TDispatchOptions options;
+            runtime.AdvanceCurrentTime(TDuration::Seconds(2));
+            options.FinalEvents.emplace_back(NHive::TEvPrivate::EvDeleteNode);
+            runtime.DispatchEvents(options);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(GetSimpleCounter(runtime, hiveTablet, NHive::COUNTER_NODES_DOWN), 0);
+    }
+
     Y_UNIT_TEST(TestLockedTabletsMustNotRestart) {
         const ui64 hiveTablet = MakeDefaultHiveID();
         const ui64 testerTablet = MakeTabletID(false, 1);
@@ -8461,7 +8641,7 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         void Notify() {
             for (auto subscriber : Subscribers) {
                 auto pile = (subscriber.NodeId() - Runtime.GetNodeId(0)) % 2;
-                auto ev  = std::make_unique<TEvNodeWardenStorageConfig>(nullptr, nullptr, true, BridgeInfos[pile]);
+                auto ev  = std::make_unique<TEvNodeWardenStorageConfig>(nullptr, true, BridgeInfos[pile]);
                 Runtime.Send(new IEventHandle(subscriber, subscriber, ev.release()));
             }
         }
@@ -8921,6 +9101,94 @@ Y_UNIT_TEST_SUITE(THiveTest) {
 
         UNIT_ASSERT_VALUES_EQUAL(followers, 2); // followers in both piles
     }
+
+    Y_UNIT_TEST(SegmentsInSync) {
+        static constexpr int NodeCount = 1;
+        static constexpr auto NodeDeletePeriod = TDuration::Seconds(5);
+
+        TTestBasicRuntime runtime(NodeCount, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.HiveConfig.SetNodeDeletePeriod(NodeDeletePeriod.Seconds());
+        });
+
+        const ui64 hiveTablet = MakeDefaultHiveID();
+        const TActorId hiveActor = CreateTestBootstrapper(runtime, CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
+        runtime.EnableScheduleForActor(hiveActor);
+        {
+            TDispatchOptions options;
+            options.FinalEvents.emplace_back(TEvLocal::EvStatus, NodeCount);
+            runtime.DispatchEvents(options);
+        }
+
+        // recreate node
+        TBlockEvents<TEvTabletPipe::TEvServerDisconnected> blockDisconnected(runtime);
+        TBlockEvents<TEvLocal::TEvStatus> blockStatusDead(runtime, [](auto&& ev) {
+            return ev->Get()->Record.GetStatus() == TEvLocal::TEvStatus::StatusDead;
+        });
+        SendKillLocal(runtime, 0);
+
+        CreateLocal(runtime, 0);
+        {
+            TDispatchOptions options;
+            options.FinalEvents.emplace_back(TEvLocal::EvStatus);
+            runtime.DispatchEvents(options);
+        }
+
+        blockDisconnected.Unblock().Stop();
+        blockStatusDead.Unblock().Stop();
+
+        // delete node
+        SendKillLocal(runtime, 0);
+        {
+            TDispatchOptions options;
+            runtime.AdvanceCurrentTime(NodeDeletePeriod);
+            options.FinalEvents.emplace_back(NHive::TEvPrivate::EvDeleteNode);
+            runtime.DispatchEvents(options);
+        }
+
+        // some action
+        BalanceTablets(runtime, hiveTablet);
+        runtime.SimulateSleep(TDuration::Seconds(1));
+    }
+
+    Y_UNIT_TEST(LoadEverythingNoUpdateNodeSegmentsAfterDelete) {
+        static constexpr int NodeCount = 1;
+        static constexpr auto NodeDeletePeriod = TDuration::Seconds(5);
+
+        TTestBasicRuntime runtime(NodeCount, false);
+        Setup(runtime, true, 1, [](TAppPrepare& app) {
+            app.HiveConfig.SetNodeDeletePeriod(NodeDeletePeriod.Seconds());
+        });
+
+        const ui64 hiveTablet = MakeDefaultHiveID();
+        const TActorId hiveActor = CreateTestBootstrapper(runtime, CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
+        runtime.EnableScheduleForActor(hiveActor);
+        {
+            TDispatchOptions options;
+            options.FinalEvents.emplace_back(TEvLocal::EvStatus, NodeCount);
+            runtime.DispatchEvents(options);
+        }
+
+        // kill node
+        SendKillLocal(runtime, 0);
+        {
+            TDispatchOptions options;
+            options.FinalEvents.emplace_back(TEvTablet::TEvCommit::EventType);
+            runtime.DispatchEvents(options);
+        }
+
+        runtime.AdvanceCurrentTime(NodeDeletePeriod + TDuration::Seconds(1));
+        runtime.Register(CreateTabletKiller(hiveTablet));
+        {
+            TDispatchOptions options;
+            options.FinalEvents.emplace_back(NHive::TEvPrivate::EvBootTablets);
+            runtime.DispatchEvents(options);
+        }
+
+        // trigger balancer
+        BalanceTablets(runtime, hiveTablet);
+        runtime.SimulateSleep(TDuration::Seconds(1));
+    }
 }
 
 Y_UNIT_TEST_SUITE(THeavyPerfTest) {
@@ -9051,6 +9319,11 @@ Y_UNIT_TEST_SUITE(TStorageBalanceTest) {
                     case TEvLocal::EvBootTablet: {
                         const auto& info = ev->Get<TEvLocal::TEvBootTablet>()->Record.GetInfo();
                         OnBootTablet(info);
+                        return TTestActorRuntime::EEventAction::PROCESS;
+                    }
+                    case TEvHive::EvReassignTablet: {
+                        auto& record = ev->Get<TEvHive::TEvReassignTablet>()->Record;
+                        record.SetAsync(false);
                         return TTestActorRuntime::EEventAction::PROCESS;
                     }
                 }

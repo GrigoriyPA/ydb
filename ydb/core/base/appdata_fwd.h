@@ -26,6 +26,8 @@ namespace NKikimr {
     namespace NJaegerTracing {
         class TSamplingThrottlingConfigurator;
     }
+
+    class IImmutableSnapshotRegistryHolder;
 }
 
 namespace NKikimrCms {
@@ -82,6 +84,9 @@ namespace NKikimrConfig {
     class TBridgeConfig;
     class TStatisticsConfig;
     class TSystemTabletBackupConfig;
+    class TRecoveryShardConfig;
+    class TClusterDiagnosticsConfig;
+    class TLongTxServiceConfig;
 }
 
 namespace NKikimrReplication {
@@ -272,6 +277,9 @@ struct TAppData {
     NKikimrConfig::TStatisticsConfig& StatisticsConfig;
     TMetricsConfig& MetricsConfig;
     NKikimrConfig::TSystemTabletBackupConfig& SystemTabletBackupConfig;
+    NKikimrConfig::TRecoveryShardConfig& RecoveryShardConfig;
+    NKikimrConfig::TClusterDiagnosticsConfig& ClusterDiagnosticsConfig;
+    NKikimrConfig::TLongTxServiceConfig& LongTxServiceConfig;
     bool EnforceUserTokenRequirement = false;
     bool EnforceUserTokenCheckRequirement = false; // check token if it was specified
     bool AllowHugeKeyValueDeletes = true; // delete when all clients limit deletes per request
@@ -324,6 +332,9 @@ struct TAppData {
 
     // Tracing configurator (look for tracing config in ydb/core/jaeger_tracing/actors_tracing_control)
     TIntrusivePtr<NKikimr::NJaegerTracing::TSamplingThrottlingConfigurator> TracingConfigurator;
+
+    // Immutable snapshot registry for fast snapshot queries
+    TIntrusivePtr<IImmutableSnapshotRegistryHolder> SnapshotRegistryHolder;
 
     TAppData(
             ui32 sysPoolId, ui32 userPoolId, ui32 ioPoolId, ui32 batchPoolId,

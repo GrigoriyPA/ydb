@@ -1,8 +1,10 @@
 PY3TEST()
 
-INCLUDE(${ARCADIA_ROOT}/ydb/tests/ydbd_dep.inc)
+INCLUDE(${ARCADIA_ROOT}/ydb/tests/harness_dep.inc)
 TEST_SRCS(
+    test_security_token_not_in_logs.py
     test_pdisk_format_info.py
+    test_pdisk_slot_size_in_units.py
     test_replication.py
     test_self_heal.py
     test_tablet_channel_migration.py
@@ -11,11 +13,12 @@ TEST_SRCS(
 
 IF (SANITIZER_TYPE)
     REQUIREMENTS(ram:32 cpu:4)
+ELSE()
+    REQUIREMENTS(cpu:2)
 ENDIF()
-
 IF (SANITIZER_TYPE == "thread")
     SIZE(LARGE)
-    TAG(ya:fat)
+    INCLUDE(${ARCADIA_ROOT}/ydb/tests/large.inc)
 ELSE()
     SIZE(MEDIUM)
 ENDIF()

@@ -9,40 +9,6 @@ namespace NKikimr::NGRpcProxy::V1 {
 
 using namespace NKikimr::NGRpcService;
 
-class TDropPropose {
-public:
-    TDropPropose() {}
-    virtual ~TDropPropose() {}
-
-    void FillProposeRequest(TEvTxUserProxy::TEvProposeTransaction& proposal, const TActorContext& ctx,
-                         const TString& workingDir, const TString& name);
-};
-
-class TPQDropTopicActor : public TPQGrpcSchemaBase<TPQDropTopicActor, NKikimr::NGRpcService::TEvPQDropTopicRequest>, public TDropPropose {
-using TBase = TPQGrpcSchemaBase<TPQDropTopicActor, TEvPQDropTopicRequest>;
-
-public:
-     TPQDropTopicActor(NKikimr::NGRpcService::TEvPQDropTopicRequest* request);
-    ~TPQDropTopicActor() = default;
-
-    void Bootstrap(const NActors::TActorContext& ctx);
-
-    void HandleCacheNavigateResponse(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev){ Y_UNUSED(ev); }
-};
-
-class TDropTopicActor : public TPQGrpcSchemaBase<TDropTopicActor, NKikimr::NGRpcService::TEvDropTopicRequest>, public TDropPropose {
-using TBase = TPQGrpcSchemaBase<TDropTopicActor, TEvDropTopicRequest>;
-
-public:
-     TDropTopicActor(NKikimr::NGRpcService::TEvDropTopicRequest* request);
-     TDropTopicActor(NKikimr::NGRpcService::IRequestOpCtx* request);
-    ~TDropTopicActor() = default;
-
-    void Bootstrap(const NActors::TActorContext& ctx);
-
-    void HandleCacheNavigateResponse(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev){ Y_UNUSED(ev); }
-};
-
 class TPQDescribeTopicActor : public TPQGrpcSchemaBase<TPQDescribeTopicActor, NKikimr::NGRpcService::TEvPQDescribeTopicRequest>
                             , public TCdcStreamCompatible
 {
@@ -168,14 +134,14 @@ public:
 
     virtual void Reply(const TActorContext& ctx) = 0;
 
+    void PassAway(const TActorContext& ctx);
+
 private:
     std::map<ui64, TTabletInfo> Tablets;
     ui32 RequestsInfly = 0;
 
     bool GotLocation = false;
     bool GotReadSessions = false;
-
-    TActorId* BalancerPipe = nullptr;
 
 protected:
     ui64 BalancerTabletId = 0;
@@ -207,6 +173,8 @@ public:
     bool ApplyResponse(TEvPersQueue::TEvGetPartitionsLocationResponse::TPtr& ev, const TActorContext& ctx) override;
     virtual void Reply(const TActorContext& ctx) override;
 
+    void PassAway() override;
+
 private:
     Ydb::Topic::DescribeTopicResult Result;
 };
@@ -234,6 +202,8 @@ public:
     void ApplyResponse(TTabletInfo& tabletInfo, NKikimr::TEvPersQueue::TEvReadSessionsInfoResponse::TPtr& ev, const TActorContext& ctx) override;
     bool ApplyResponse(TEvPersQueue::TEvGetPartitionsLocationResponse::TPtr& ev, const TActorContext& ctx) override;
     virtual void Reply(const TActorContext& ctx) override;
+
+    void PassAway() override;
 
 private:
     Ydb::Topic::DescribeConsumerResult Result;
@@ -263,6 +233,8 @@ public:
     bool ApplyResponse(TEvPersQueue::TEvGetPartitionsLocationResponse::TPtr& ev, const TActorContext& ctx) override;
 
     virtual void Reply(const TActorContext& ctx) override;
+
+    void PassAway() override;
 
 private:
 
@@ -363,63 +335,12 @@ private:
     TString LocalCluster;
 };
 
-
-class TAlterTopicActor : public TUpdateSchemeActor<TAlterTopicActor, TEvAlterTopicRequest>
-                       , public TCdcStreamCompatible
-{
-    using TBase = TUpdateSchemeActor<TAlterTopicActor, TEvAlterTopicRequest>;
-
-public:
-    TAlterTopicActor(NKikimr::NGRpcService::TEvAlterTopicRequest *request);
-    TAlterTopicActor(NKikimr::NGRpcService::IRequestOpCtx* request);
-
-    void Bootstrap(const NActors::TActorContext& ctx);
-    void ModifyPersqueueConfig(TAppData* appData,
-                               NKikimrSchemeOp::TPersQueueGroupDescription& groupConfig,
-                               const NKikimrSchemeOp::TPersQueueGroupDescription& pqGroupDescription,
-                               const NKikimrSchemeOp::TDirEntry& selfInfo) override;
-};
-
-
-class TAlterTopicActorInternal : public TPQInternalSchemaActor<TAlterTopicActorInternal, NKikimr::NGRpcProxy::V1::TAlterTopicRequest,
-                                                               TEvPQProxy::TEvAlterTopicResponse>
-                               , public TUpdateSchemeActorBase<TAlterTopicActorInternal>
-                               , public TCdcStreamCompatible
-{
-    using TUpdateSchemeBase = TUpdateSchemeActorBase<TAlterTopicActorInternal>;
-    using TRequest = NKikimr::NGRpcProxy::V1::TAlterTopicRequest;
-    using TActorBase = TPQInternalSchemaActor<TAlterTopicActorInternal, TRequest, TEvPQProxy::TEvAlterTopicResponse>;
-
-public:
-    TAlterTopicActorInternal(NKikimr::NGRpcProxy::V1::TAlterTopicRequest&& request,
-                             NThreading::TPromise<TAlterTopicResponse>&& promise,
-                             bool notExistsOk);
-
-    void Bootstrap(const NActors::TActorContext& ctx) override;
-    void ModifyPersqueueConfig(TAppData* appData,
-                               NKikimrSchemeOp::TPersQueueGroupDescription& groupConfig,
-                               const NKikimrSchemeOp::TPersQueueGroupDescription& pqGroupDescription,
-                               const NKikimrSchemeOp::TDirEntry& selfInfo) override;
-
-    void HandleCacheNavigateResponse(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev) override;
-
-    void StateWork(TAutoPtr<IEventHandle>& ev) {
-        TActorBase::StateWork(ev);
-    }
-
-protected:
-    bool RespondOverride(Ydb::StatusIds::StatusCode status, bool notFound) override;
-
-private:
-    NThreading::TPromise<TAlterTopicResponse> Promise;
-    bool MissingOk;
-};
-
 class TPartitionsLocationActor : public TPQInternalSchemaActor<TPartitionsLocationActor,
                                                                TGetPartitionsLocationRequest,
                                                                TEvPQProxy::TEvPartitionLocationResponse>
                                , public TDescribeTopicActorImpl
-                               , public TCdcStreamCompatible {
+                               , public TCdcStreamCompatible
+                               , public NActors::IActorExceptionHandler {
 
 using TBase = TPQInternalSchemaActor<TPartitionsLocationActor, TGetPartitionsLocationRequest,
                                      TEvPQProxy::TEvPartitionLocationResponse>;
@@ -450,6 +371,10 @@ public:
     void Reply(const TActorContext&) override {};
 
     void RaiseError(const TString& error, const Ydb::PersQueue::ErrorCode::ErrorCode errorCode, const Ydb::StatusIds::StatusCode status, const TActorContext&) override;
+    bool OnUnhandledException(const std::exception& exc) override;
+
+    void PassAway() override;
+
 private:
     THashSet<ui64> PartitionIds;
 };

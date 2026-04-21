@@ -2,6 +2,7 @@
 
 #include <yql/essentials/core/pg_settings/guc_settings.h>
 #include <yql/essentials/public/langver/yql_langver.h>
+#include <yql/essentials/public/udf_meta/udf_meta.h>
 
 #include <util/generic/hash.h>
 #include <util/generic/hash_set.h>
@@ -9,7 +10,7 @@
 #include <util/generic/maybe.h>
 #include <util/generic/vector.h>
 
-namespace google::protobuf {
+namespace google::protobuf { // NOLINT(readability-identifier-naming)
 class Arena;
 } // namespace google::protobuf
 
@@ -40,6 +41,12 @@ enum class EBindingsMode {
     DROP
 };
 
+enum class EYqlSelect {
+    Disable,
+    Auto,
+    Force,
+};
+
 inline bool IsQueryMode(NSQLTranslation::ESqlMode mode) {
     return mode == NSQLTranslation::ESqlMode::QUERY || mode == NSQLTranslation::ESqlMode::DISCOVERY;
 }
@@ -55,7 +62,7 @@ enum class EV0Behavior: ui32 {
 
 class ISqlFeaturePolicy: public TThrRefBase {
 public:
-    virtual ~ISqlFeaturePolicy() = default;
+    ~ISqlFeaturePolicy() override = default;
     virtual bool Allow() const = 0;
 
     using TPtr = TIntrusivePtr<ISqlFeaturePolicy>;
@@ -85,6 +92,7 @@ struct TTranslationSettings {
     THashMap<TString, TString> ModuleMapping;
     THashSet<TString> Libraries;
     THashSet<TString> Flags;
+    EYqlSelect YqlSelect = EYqlSelect::Disable;
 
     EBindingsMode BindingsMode;
     THashMap<TString, TTableBindingSettings> Bindings;
@@ -104,20 +112,21 @@ struct TTranslationSettings {
     bool EnableGenericUdfs;
     ui16 SyntaxVersion;
     bool AnsiLexer;
-    bool Antlr4Parser;
+    bool Antlr4Parser; // TODO(YQL-19017): remove.
     bool PgParser;
     bool InferSyntaxVersion;
     EV0Behavior V0Behavior;
     bool V0ForceDisable;
     bool PGDisable;
     bool WarnOnV0;
-    bool TestAntlr4;
+    bool TestAntlr4; // TODO(YQL-19017): remove.
     ISqlFeaturePolicy::TPtr V0WarnAsError;
     ISqlFeaturePolicy::TPtr DqDefaultAuto;
     ISqlFeaturePolicy::TPtr BlockDefaultAuto;
     bool AssumeYdbOnClusterWithSlash;
     TString DynamicClusterProvider;
     TString FileAliasPrefix;
+    const NYql::IUdfMeta* UdfMeta = nullptr;
 
     TVector<ui32> PgParameterTypeOids;
     bool AutoParametrizeEnabled = false;
@@ -129,11 +138,22 @@ struct TTranslationSettings {
     TMaybe<TString> ApplicationName;
     bool PgSortNulls = false;
     NYql::IAutoParamBuilderFactory* AutoParamBuilderFactory = nullptr;
-    bool EmitReadsForExists = false;
+    bool EmitReadsForExists = true;
     bool AlwaysAllowExports = false;
     bool IsReplay = false;
 };
 
-bool ParseTranslationSettings(const TString& query, NSQLTranslation::TTranslationSettings& settings, NYql::TIssues& issues);
+struct TParsedSettings {
+    bool HasSyntaxV0 = false;
+    bool HasSyntaxV1 = false;
+    bool HasAnsiLexer = false;
+    bool HasPgParser = false;
+
+    bool ApplyTo(TTranslationSettings& settings, NYql::TIssues& issues) const;
+};
+
+bool ParseTranslationSettingsFromComments(const TString& query, TParsedSettings& parsed, NYql::TIssues& issues);
+
+bool ParseTranslationSettings(const TString& query, TTranslationSettings& settings, NYql::TIssues& issues);
 
 } // namespace NSQLTranslation

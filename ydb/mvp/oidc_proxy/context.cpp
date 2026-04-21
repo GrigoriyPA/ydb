@@ -1,5 +1,4 @@
 #include <util/generic/string.h>
-#include <util/random/random.h>
 #include <util/string/builder.h>
 #include <library/cpp/string_utils/base64/base64.h>
 #include <ydb/library/actors/http/http.h>
@@ -11,14 +10,14 @@ namespace NMVP::NOIDC {
 
 TContext::TContext(const TInitializer& initializer)
     : State(initializer.State)
-    , AjaxRequest(initializer.AjaxRequest)
+    , NavigationRequest(initializer.NavigationRequest)
     , RequestedAddress(initializer.RequestedAddress)
 {}
 
 TContext::TContext(const NHttp::THttpIncomingRequestPtr& request)
-    : State(GenerateState())
-    , AjaxRequest(DetectAjaxRequest(request))
-    , RequestedAddress(GetRequestedUrl(request, AjaxRequest))
+    : State(GenerateRandomBase64())
+    , NavigationRequest(IsPageNavigationRequest(request))
+    , RequestedAddress(GetRequestedUrl(request, NavigationRequest))
 {}
 
 TString TContext::GetState(const TString& key) const {
@@ -34,8 +33,8 @@ TString TContext::GetState(const TString& key) const {
     return Base64EncodeNoPadding(signedState);
 }
 
-bool TContext::IsAjaxRequest() const {
-    return AjaxRequest;
+bool TContext::IsNavigationRequest() const {
+    return NavigationRequest;
 }
 
 TString TContext::GetRequestedAddress() const {
@@ -61,33 +60,32 @@ TString TContext::GenerateCookie(const TString& key) const {
     return Base64Encode(signedRequestedAddress);
 }
 
-TString TContext::GenerateState() {
-    TStringBuilder sb;
-    static constexpr size_t CHAR_NUMBER = 15;
-    for (size_t i{0}; i < CHAR_NUMBER; i++) {
-        sb << RandomNumber<char>();
-    }
-    return Base64EncodeUrlNoPadding(sb);
-}
-
-bool TContext::DetectAjaxRequest(const NHttp::THttpIncomingRequestPtr& request) {
-    static const THashMap<TStringBuf, TStringBuf> expectedHeaders {
-        {"Accept", "application/json"}
-    };
+bool TContext::IsPageNavigationRequest(const NHttp::THttpIncomingRequestPtr& request) {
     NHttp::THeaders headers(request->Headers);
-    for (const auto& el : expectedHeaders) {
-        TStringBuf headerValue = headers.Get(el.first);
-        if (!headerValue || headerValue.find(el.second) == TStringBuf::npos) {
-            return false;
-        }
+
+    const TStringBuf mode = headers.Get("Sec-Fetch-Mode");
+    const TStringBuf dest = headers.Get("Sec-Fetch-Dest");
+    const bool hasFetchMetadata = mode && dest;
+    if (hasFetchMetadata) {
+        return mode == "navigate" && dest == "document";
     }
+
+    if (headers.Get("X-Requested-With") == "XMLHttpRequest") {
+        return false;
+    }
+
+    const TStringBuf accept = headers.Get("Accept");
+    if (accept && accept.find("application/json") != TStringBuf::npos) {
+        return false;
+    }
+
     return true;
 }
 
-TStringBuf TContext::GetRequestedUrl(const NHttp::THttpIncomingRequestPtr& request, bool isAjaxRequest) {
+TStringBuf TContext::GetRequestedUrl(const NHttp::THttpIncomingRequestPtr& request, bool isNavigationRequest) {
     NHttp::THeaders headers(request->Headers);
     TStringBuf requestedUrl = headers.Get("Referer");
-    if (!isAjaxRequest || requestedUrl.empty()) {
+    if (isNavigationRequest || requestedUrl.empty()) {
         return request->URL;
     }
     return requestedUrl;

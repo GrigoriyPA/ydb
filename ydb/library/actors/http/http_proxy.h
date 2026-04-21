@@ -61,6 +61,7 @@ struct TEvHttpProxy {
         EvHttpOutgoingDataChunk,
         EvSubscribeForCancel,
         EvRequestCancelled,
+        EvHttpOutgoingResponseProgress,
         EvEnd
     };
 
@@ -74,10 +75,12 @@ struct TEvHttpProxy {
         TString CertificateFile;
         TString PrivateKeyFile;
         TString SslCertificatePem;
+        TString CaFile;
         std::vector<TString> CompressContentTypes;
         ui32 MaxRequestsPerSecond = 0;
         ui32 MaxRecycledRequestsCount = DEFAULT_MAX_RECYCLED_REQUESTS_COUNT;
         TDuration InactivityTimeout = TDuration::Minutes(2);
+        bool AllowHttp2 = false; // enable HTTP/2 support on this port
 
         TEvAddListeningPort() = default;
 
@@ -124,6 +127,7 @@ struct TEvHttpProxy {
         THttpOutgoingRequestPtr Request;
         TDuration Timeout;
         bool AllowConnectionReuse = false;
+        bool UseHttp2 = false;
         std::vector<TString> StreamContentTypes;
 
         TEvHttpOutgoingRequest(THttpOutgoingRequestPtr request)
@@ -184,6 +188,11 @@ struct TEvHttpProxy {
 
     struct TEvHttpOutgoingResponse : NActors::TEventLocal<TEvHttpOutgoingResponse, EvHttpOutgoingResponse> {
         THttpOutgoingResponsePtr Response;
+        ui64 ProgressNotificationBytes = 0;
+        // If set to a non-zero value, enables progress notifications.
+        // Progress notifications will be sent approximately every N bytes (where N is this value).
+        // Notifications are sent to the sender of the TEvHttpOutgoingResponse event with the original cookie.
+        // The field value of 0 (default) disables progress notifications.
 
         TEvHttpOutgoingResponse(THttpOutgoingResponsePtr response)
             : Response(std::move(response))
@@ -200,6 +209,16 @@ struct TEvHttpProxy {
 
         TEvHttpOutgoingDataChunk(const TString& error)
             : Error(error)
+        {}
+    };
+
+    struct TEvHttpOutgoingResponseProgress : NActors::TEventLocal<TEvHttpOutgoingResponseProgress, EvHttpOutgoingResponseProgress> {
+        ui64 Bytes = 0;
+        ui64 DataChunks = 0;
+
+        TEvHttpOutgoingResponseProgress(ui64 bytes, ui64 dataChunks)
+            : Bytes(bytes)
+            , DataChunks(dataChunks)
         {}
     };
 
@@ -325,6 +344,7 @@ struct TPrivateEndpointInfo : THttpEndpointInfo {
     TSslHelpers::TSslHolder<SSL_CTX> SecureContext;
     TRateLimiter RateLimiter;
     TDuration InactivityTimeout;
+    bool AllowHttp2 = false;
 
     TPrivateEndpointInfo(const std::vector<TString>& compressContentTypes)
         : THttpEndpointInfo(compressContentTypes)

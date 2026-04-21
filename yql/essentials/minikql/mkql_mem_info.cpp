@@ -12,11 +12,11 @@ namespace {
 static constexpr char COLLECT_STACK_TRACE_KEY[] = "YQL_MKQL_COLLECT_STACKTRACES_FOR_ALLOCATIONS";
 
 bool ShouldCollectStackTracesForAllocations() {
-    static bool result = []() {
+    static bool Result = []() {
         auto collectEnvValue = TryGetEnv(TString(COLLECT_STACK_TRACE_KEY));
         return collectEnvValue.Defined();
     }();
-    return result;
+    return Result;
 }
 
 TMemoryUsageInfo::TAllocatorLocation WrapLocation(TMkqlLocation location) {
@@ -80,7 +80,7 @@ void TMemoryUsageInfo::Take(const void* mem, ui64 size, TMkqlLocation location) 
             AllocationsMap_.erase(it);
         }
     }
-    auto res = AllocationsMap_.emplace(mem, TAllocationInfo{size, WrapLocation(std::move(location)), false});
+    auto res = AllocationsMap_.emplace(mem, TAllocationInfo{.Size = size, .Location = WrapLocation(std::move(location)), .IsDeleted = false});
     Y_DEBUG_ABORT_UNLESS(res.second, "Duplicate allocation at: %p, "
                                      "already allocated at: %s", mem, LocationToString(res.first->second.Location).c_str());
     // Clog << Title_ << " take: " << size << " -> " << mem << " " << AllocationsMap_.size() << Endl;

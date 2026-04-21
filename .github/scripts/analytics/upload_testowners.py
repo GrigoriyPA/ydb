@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 
-import os
-import posixpath
-import time
 import ydb
-from collections import Counter
 from ydb_wrapper import YDBWrapper
+
+from testowners_utils import get_testowners_for_tests
 
 
 def create_tables(ydb_wrapper, table_path):
@@ -28,28 +26,26 @@ def create_tables(ydb_wrapper, table_path):
 
 
 def main():
-    script_name = os.path.basename(__file__)
-    
-    # Initialize YDB wrapper with context manager for automatic cleanup
-    with YDBWrapper(script_name=script_name) as ydb_wrapper:
+    with YDBWrapper() as ydb_wrapper:
         # Check credentials
         if not ydb_wrapper.check_credentials():
             return 1
         
-        table_path = f'test_results/analytics/testowners'    
+        # Get table paths from config
+        test_runs_table = ydb_wrapper.get_table_path("test_results")
+        table_path = ydb_wrapper.get_table_path("testowners")    
 
-        query_get_owners = f"""
-   select 
-        DISTINCT test_name, 
-        suite_folder, 
-        suite_folder || '/' || test_name as full_name, 
-        FIRST_VALUE(owners) OVER w AS owners, 
-        FIRST_VALUE (run_timestamp) OVER w AS run_timestamp_last 
-        FROM 
-        `test_results/test_runs_column` 
-    WHERE 
-        run_timestamp >= CurrentUtcDate()- Interval("P1D") 
-        AND branch = 'main' 
+        query = f"""
+   select
+        DISTINCT test_name,
+        suite_folder,
+        suite_folder || '/' || test_name as full_name,
+        FIRST_VALUE (run_timestamp) OVER w AS run_timestamp_last
+        FROM
+        `{test_runs_table}`
+    WHERE
+        run_timestamp >= CurrentUtcDate()- Interval("P1D")
+        AND branch = 'main'
         and job_name in (
             'Nightly-run',
             'Regression-run',
@@ -57,52 +53,49 @@ def main():
             'Regression-run_Small_and_Medium',
             'Regression-run_compatibility',
             'Regression-whitelist-run',
-            'Postcommit_relwithdebinfo', 
+            'Postcommit_relwithdebinfo',
             'Postcommit_asan'
-        ) 
+        )
+        and (pull IS NULL OR NOT String::Contains(pull, 'manual'))
         WINDOW w AS (
-            PARTITION BY test_name, 
-            suite_folder 
-            ORDER BY 
-            run_timestamp DESC
-        ) 
-        order by 
-        run_timestamp_last desc
-        
+            PARTITION BY test_name,
+            suite_folder
+            ORDER BY
+                run_timestamp DESC
+        )
+        order by
+            run_timestamp_last desc
     """
-    
-    # Execute query using ydb_wrapper
-    results = ydb_wrapper.execute_scan_query(query_get_owners)
+        results = ydb_wrapper.execute_scan_query(query)
 
-    print(f'testowners data captured, {len(results)} rows')
-    test_list = []
-    for row in results:
-        test_list.append({
-            'suite_folder': row['suite_folder'],
-            'test_name': row['test_name'],
-            'full_name': row['full_name'],
-            'owners': row['owners'],
-            'run_timestamp_last': row['run_timestamp_last'],
-        })
-    
-    print('upserting testowners')
-    create_tables(ydb_wrapper, table_path)
-    full_path = posixpath.join(ydb_wrapper.database_path, table_path)
-    
-    # Подготавливаем column_types
-    column_types = (
-        ydb.BulkUpsertColumns()
-        .add_column("test_name", ydb.OptionalType(ydb.PrimitiveType.Utf8))
-        .add_column("suite_folder", ydb.OptionalType(ydb.PrimitiveType.Utf8))
-        .add_column("full_name", ydb.OptionalType(ydb.PrimitiveType.Utf8))
-        .add_column("run_timestamp_last", ydb.OptionalType(ydb.PrimitiveType.Timestamp))
-        .add_column("owners", ydb.OptionalType(ydb.PrimitiveType.Utf8))
-    )
-    
-    # Используем bulk_upsert_batches
-    ydb_wrapper.bulk_upsert_batches(full_path, test_list, column_types, batch_size=1000)
+        print(f'testowners data captured, {len(results)} rows')
+        test_list = []
+        for row in results:
+            test_list.append({
+                'suite_folder': row['suite_folder'],
+                'test_name': row['test_name'],
+                'full_name': row['full_name'],
+                'run_timestamp_last': row['run_timestamp_last'],
+            })
 
-    print('testowners updated')
+        test_list = get_testowners_for_tests(test_list)
+
+        print('upserting testowners')
+        create_tables(ydb_wrapper, table_path)
+        
+        # Prepare column_types
+        column_types = (
+            ydb.BulkUpsertColumns()
+            .add_column("test_name", ydb.OptionalType(ydb.PrimitiveType.Utf8))
+            .add_column("suite_folder", ydb.OptionalType(ydb.PrimitiveType.Utf8))
+            .add_column("full_name", ydb.OptionalType(ydb.PrimitiveType.Utf8))
+            .add_column("run_timestamp_last", ydb.OptionalType(ydb.PrimitiveType.Timestamp))
+            .add_column("owners", ydb.OptionalType(ydb.PrimitiveType.Utf8))
+        )
+        
+        ydb_wrapper.bulk_upsert_batches(table_path, test_list, column_types, batch_size=1000)
+
+        print('testowners updated')
 
 
 if __name__ == "__main__":

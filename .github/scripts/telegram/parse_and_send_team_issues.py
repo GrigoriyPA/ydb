@@ -18,12 +18,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from send_telegram_message import send_telegram_message
 
+# Add analytics directory to path for ydb_wrapper import
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'analytics'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from github_issue_utils import DEFAULT_BRANCH, DEFAULT_BUILD_TYPE, canonical_team_slug
 try:
-    import ydb
+    from ydb_wrapper import YDBWrapper
     YDB_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     YDB_AVAILABLE = False
-    print("⚠️ YDB client not available. Install with: pip install ydb")
+    print(f"⚠️ YDBWrapper not available: {e}")
 
 try:
     import matplotlib.pyplot as plt
@@ -47,86 +51,22 @@ GITHUB_ORG_TEAMS_URL = "https://github.com/orgs/ydb-platform/teams"
 DATALENS_DASHBOARD_URL = "https://datalens.yandex/4un3zdm0zcnyr?owner_team={team_name}"
 
 
-def _setup_ydb_connection(database_endpoint=None, database_path=None, credentials_path=None):
-    """
-    Set up YDB connection parameters and credentials.
-    
-    Args:
-        database_endpoint (str): YDB database endpoint
-        database_path (str): YDB database path
-        credentials_path (str): Path to service account credentials JSON file
-        
-    Returns:
-        tuple: (database_endpoint, database_path) or (None, None) if error
-    """
+def _execute_ydb_query(query, description):
+    """Execute a YDB query using YDBWrapper and return results."""
     if not YDB_AVAILABLE:
-        print("❌ YDB client not available")
-        return None, None
+        print("❌ YDBWrapper not available")
+        return None
     
-    try:
-        # Set up credentials if provided
-        if credentials_path and os.path.exists(credentials_path):
-            os.environ["YDB_SERVICE_ACCOUNT_KEY_FILE_CREDENTIALS"] = credentials_path
-        elif "CI_YDB_SERVICE_ACCOUNT_KEY_FILE_CREDENTIALS" in os.environ:
-            os.environ["YDB_SERVICE_ACCOUNT_KEY_FILE_CREDENTIALS"] = os.environ["CI_YDB_SERVICE_ACCOUNT_KEY_FILE_CREDENTIALS"]
-        
-        # Try to load from config file if not provided
-        if not database_endpoint or not database_path:
-            try:
-                config = configparser.ConfigParser()
-                config_file_path = os.path.join(os.path.dirname(__file__), "../../config/ydb_qa_db.ini")
-                if os.path.exists(config_file_path):
-                    config.read(config_file_path)
-                    if not database_endpoint and "QA_DB" in config and "DATABASE_ENDPOINT" in config["QA_DB"]:
-                        database_endpoint = config["QA_DB"]["DATABASE_ENDPOINT"]
-                    if not database_path and "QA_DB" in config and "DATABASE_PATH" in config["QA_DB"]:
-                        database_path = config["QA_DB"]["DATABASE_PATH"]
-            except Exception as e:
-                print(f"⚠️ Could not load config file: {e}")
-        
-        # Use default values if still not provided
-        if not database_endpoint:
-            database_endpoint = os.getenv('YDB_ENDPOINT', 'grpcs://ydb.serverless.yandexcloud.net:2135')
-        if not database_path:
-            database_path = os.getenv('YDB_DATABASE', '/ru-central1/b1g8ejbrie0sfh5k0j2j/etn8l4e3hbti8k4n5g2e')
-        
-        return database_endpoint, database_path
-        
-    except Exception as e:
-        print(f"❌ Error setting up YDB connection: {e}")
-        return None, None
-
-
-def _execute_ydb_query(database_endpoint, database_path, query, description):
-    """
-    Execute a YDB query and return results.
-    
-    Args:
-        database_endpoint (str): YDB database endpoint
-        database_path (str): YDB database path
-        query (str): SQL query to execute
-        description (str): Description for logging
-        
-    Returns:
-        list: Query results or None if error
-    """
     try:
         print(f"🔍 {description}")
         
-        with ydb.Driver(
-            endpoint=database_endpoint,
-            database=database_path,
-            credentials=ydb.credentials_from_env_variables(),
-        ) as driver:
-            driver.wait(timeout=10, fail_fast=True)
-            print("✅ Successfully connected to YDB")
+        with YDBWrapper() as ydb_wrapper:
+            if not ydb_wrapper.check_credentials():
+                print("❌ YDB credentials check failed")
+                return None
             
-            table_client = ydb.TableClient(driver, ydb.TableClientSettings())
-            query_obj = ydb.ScanQuery(query, {})
-            it = table_client.scan_query(query_obj)
-            results = []
-            for result in it:
-                results.extend(result.result_set.rows)
+            print("✅ Successfully connected to YDB")
+            results = ydb_wrapper.execute_scan_query(query, query_name=description)
             
             print(f"📊 Query returned {len(results)} rows")
             return results
@@ -139,31 +79,33 @@ def _execute_ydb_query(database_endpoint, database_path, query, description):
         return None
 
 
-def get_all_team_data(database_endpoint=None, database_path=None, credentials_path=None, use_yesterday=False):
+def _sql_build_type_clause(build_type) -> str:
+    """Return YQL fragment ``AND build_type = '…'`` or empty string if ``all`` / unset."""
+    if build_type is None:
+        return ""
+    raw = str(build_type).strip()
+    if raw.lower() == "all":
+        return ""
+    if not raw:
+        raise ValueError(f"Invalid build_type: {build_type!r} (empty)")
+    escaped = raw.replace("'", "''")
+    return f"\n    AND build_type = '{escaped}'"
+
+
+def get_all_team_data(use_yesterday=False, build_type=DEFAULT_BUILD_TYPE, branch=DEFAULT_BRANCH):
     """
     Get all team data (stats + trends) from YDB in one optimized query.
-    
+
     Args:
-        database_endpoint (str): YDB database endpoint
-        database_path (str): YDB database path
-        credentials_path (str): Path to service account credentials JSON file
-        use_yesterday (bool): If True, use yesterday's data for development convenience
-        
+        use_yesterday: If True, use yesterday's data for development convenience.
+        build_type: ``test_muted_monitor_mart.build_type`` filter; ``"all"`` = no filter.
+
     Returns:
         dict: Dictionary with team names as keys and their data, or None if error
     """
-    # Set up connection
-    print(f"🔍 Setting up YDB connection:")
-    print(f"   database_endpoint: {database_endpoint}")
-    print(f"   database_path: {database_path}")
-    print(f"   credentials_path: {credentials_path}")
-    
-    endpoint, path = _setup_ydb_connection(database_endpoint, database_path, credentials_path)
-    if not endpoint or not path:
-        print("❌ Failed to set up YDB connection")
+    if not YDB_AVAILABLE:
+        print("❌ YDBWrapper not available")
         return None
-    
-    print(f"✅ YDB connection configured: {endpoint} / {path}")
     
     # Calculate target date
     if use_yesterday:
@@ -181,6 +123,12 @@ def get_all_team_data(database_endpoint=None, database_path=None, credentials_pa
     print(f"   start_date: {start_date}")
     print(f"   yesterday_date: {yesterday_date}")
     
+    # Get table path from config
+    with YDBWrapper() as ydb_wrapper:
+        test_muted_monitor_mart_table = ydb_wrapper.get_table_path("test_muted_monitor_mart")
+
+    bt_clause = _sql_build_type_clause(build_type)
+
     # Single optimized query for all data
     all_data_query = f"""
     SELECT 
@@ -188,12 +136,11 @@ def get_all_team_data(database_endpoint=None, database_path=None, credentials_pa
         date_window,
         COUNT(*) as daily_count,
         SUM(CASE WHEN mute_state_change_date = Date('{target_date.strftime('%Y-%m-%d')}') THEN 1 ELSE 0 END) as today_count
-    FROM `test_results/analytics/test_muted_monitor_mart`
+    FROM `{test_muted_monitor_mart_table}`
     WHERE date_window >= Date('{start_date.strftime('%Y-%m-%d')}')
     AND date_window <= Date('{target_date.strftime('%Y-%m-%d')}')
     AND is_muted = 1
-    AND branch = 'main'
-    AND build_type = 'relwithdebinfo'
+    AND branch = '{branch}'{bt_clause}
     AND is_test_chunk = 0
     AND resolution != 'Skipped'
     GROUP BY owner, date_window
@@ -204,10 +151,11 @@ def get_all_team_data(database_endpoint=None, database_path=None, credentials_pa
     print(f"🔍 Query details:")
     print(f"   Start date: {start_date.strftime('%Y-%m-%d')}")
     print(f"   Target date: {target_date.strftime('%Y-%m-%d')}")
-    print(f"   Endpoint: {endpoint}")
-    print(f"   Path: {path}")
     
-    results = _execute_ydb_query(endpoint, path, all_data_query, f"Getting all team data from {start_date.strftime('%Y-%m-%d')} to {target_date.strftime('%Y-%m-%d')}")
+    results = _execute_ydb_query(
+        all_data_query,
+        f"Getting all team data from {start_date.strftime('%Y-%m-%d')} to {target_date.strftime('%Y-%m-%d')}",
+    )
     if results is None:
         return None
     
@@ -216,17 +164,15 @@ def get_all_team_data(database_endpoint=None, database_path=None, credentials_pa
     base_date = datetime(1970, 1, 1)
     
     for row in results:
-        owner = row.owner
+        owner = row.get('owner') if isinstance(row, dict) else row.owner
         if not owner:
             continue
             
-        # Handle both "TEAM:@ydb-platform/teamname" and "Unknown" formats
-        if owner.startswith('TEAM:@ydb-platform/'):
-            team_name = owner.split('/')[-1]
-        elif owner == 'Unknown':
-            team_name = 'Unknown'
+        # Accept TEAM:@ydb-platform/<slug> and the sentinel unknown (any case);
+        # skip everything else (plain usernames, email addresses, etc.)
+        if owner.startswith('TEAM:@ydb-platform/') or str(owner).strip().lower() == 'unknown':
+            team_name = canonical_team_slug(owner)
         else:
-            # Skip other formats
             continue
         
         if team_name not in team_data:
@@ -236,16 +182,19 @@ def get_all_team_data(database_endpoint=None, database_path=None, credentials_pa
             }
         
         # Convert days since epoch to date
-        date_obj = base_date + timedelta(days=row.date_window)
+        date_window = row.get('date_window') if isinstance(row, dict) else row.date_window
+        date_obj = base_date + timedelta(days=date_window)
         date_str = date_obj.strftime('%Y-%m-%d')
         
         # Add to trend data
-        team_data[team_name]['trend'][date_str] = row.daily_count
+        daily_count = row.get('daily_count') if isinstance(row, dict) else row.daily_count
+        team_data[team_name]['trend'][date_str] = daily_count
         
         # Update stats for target date
         if date_str == target_date.strftime('%Y-%m-%d'):
-            team_data[team_name]['stats']['total'] = row.daily_count
-            team_data[team_name]['stats']['today'] = row.today_count
+            team_data[team_name]['stats']['total'] = daily_count
+            today_count = row.get('today_count') if isinstance(row, dict) else row.today_count
+            team_data[team_name]['stats']['today'] = today_count
     
     # Calculate "minus today" for each team and fix total if needed
     for team_name, data in team_data.items():
@@ -270,14 +219,11 @@ def get_all_team_data(database_endpoint=None, database_path=None, credentials_pa
     return team_data
 
 
-def get_muted_tests_stats(database_endpoint=None, database_path=None, credentials_path=None, use_yesterday=False):
+def get_muted_tests_stats(use_yesterday=False, build_type=DEFAULT_BUILD_TYPE, branch=DEFAULT_BRANCH):
     """
     Get statistics about muted tests from YDB by team.
     
     Args:
-        database_endpoint (str): YDB database endpoint
-        database_path (str): YDB database path
-        credentials_path (str): Path to service account credentials JSON file
         use_yesterday (bool): If True, use yesterday's data for development convenience
         
     Returns:
@@ -285,7 +231,7 @@ def get_muted_tests_stats(database_endpoint=None, database_path=None, credential
     """
     
     # Use the optimized function to get all data
-    all_data = get_all_team_data(database_endpoint, database_path, credentials_path, use_yesterday)
+    all_data = get_all_team_data(use_yesterday, build_type=build_type, branch=branch)
     if all_data is None:
         return None
     
@@ -298,26 +244,21 @@ def get_muted_tests_stats(database_endpoint=None, database_path=None, credential
     return team_stats
 
 
-def get_monthly_trend_data(database_endpoint=None, database_path=None, credentials_path=None, team_name=None, use_yesterday=False):
+def get_monthly_trend_data(team_name=None, use_yesterday=False, build_type=DEFAULT_BUILD_TYPE, branch=DEFAULT_BRANCH):
     """
     Get monthly trend data for a specific team.
     
     Args:
-        database_endpoint (str): YDB database endpoint
-        database_path (str): YDB database path
-        credentials_path (str): Path to service account credentials JSON file
         team_name (str): Team name to get data for
         use_yesterday (bool): If True, use yesterday as end date for development convenience
         
     Returns:
         dict: Dictionary with dates as keys and counts as values, or None if error
     """
-    # Use the optimized function to get all data
-    all_data = get_all_team_data(database_endpoint, database_path, credentials_path, use_yesterday)
+    all_data = get_all_team_data(use_yesterday, build_type=build_type, branch=branch)
     if all_data is None:
         return None
     
-    # Extract trend data for the specific team
     if team_name in all_data:
         trend_data = all_data[team_name]['trend']
         print(f"📊 Found trend data for {len(trend_data)} days for team '{team_name}'")
@@ -636,7 +577,9 @@ def get_team_config(team_name, team_channels):
     """
     if not team_channels:
         return None, None, None
-    
+
+    team_name = canonical_team_slug(team_name)
+
     # Get default channel first
     default_channel_name = team_channels.get('default_channel')
     default_chat_id, default_thread_id = None, None
@@ -672,37 +615,29 @@ def get_team_config(team_name, team_channels):
         
         return team_responsible, team_chat_id, team_thread_id
     
-    # Try Unknown team as fallback
-    elif 'teams' in team_channels and 'Unknown' in team_channels['teams']:
-        unknown_config = team_channels['teams']['Unknown']
-        
-        # Get responsible users from Unknown team
-        team_responsible = None
-        if 'responsible' in unknown_config:
-            team_responsible = {team_name: unknown_config['responsible']}
-        
-        # Use default channel or Unknown team's channel
-        if default_chat_id:
-            print(f"📨 Using default channel '{default_channel_name}' for unknown team {team_name}: {default_chat_id}" + (f" (thread {default_thread_id})" if default_thread_id else ""))
-            return team_responsible, default_chat_id, default_thread_id
-        elif 'channel' in unknown_config:
-            # Try Unknown team's specific channel
-            channel_name = unknown_config['channel']
-            if 'channels' in team_channels and channel_name in team_channels['channels']:
-                team_chat_id, team_thread_id = parse_chat_and_thread_id(team_channels['channels'][channel_name])
-                print(f"📨 Using Unknown team channel '{channel_name}' for team {team_name}: {team_chat_id}" + (f" (thread {team_thread_id})" if team_thread_id else ""))
-                return team_responsible, team_chat_id, team_thread_id
-            else:
-                print(f"❌ Unknown team channel '{channel_name}' not found")
+    # Fallback config: prefer key "unknown", accept legacy "Unknown"
+    elif 'teams' in team_channels:
+        unknown_config = team_channels['teams'].get('unknown') or team_channels['teams'].get('Unknown')
+        if unknown_config is not None:
+            team_responsible = None
+            if 'responsible' in unknown_config:
+                team_responsible = {team_name: unknown_config['responsible']}
+            if default_chat_id:
+                print(f"📨 Using default channel '{default_channel_name}' for unknown team {team_name}: {default_chat_id}" + (f" (thread {default_thread_id})" if default_thread_id else ""))
+                return team_responsible, default_chat_id, default_thread_id
+            if 'channel' in unknown_config:
+                channel_name = unknown_config['channel']
+                if 'channels' in team_channels and channel_name in team_channels['channels']:
+                    team_chat_id, team_thread_id = parse_chat_and_thread_id(team_channels['channels'][channel_name])
+                    print(f"📨 Using unknown-team channel '{channel_name}' for team {team_name}: {team_chat_id}" + (f" (thread {team_thread_id})" if team_thread_id else ""))
+                    return team_responsible, team_chat_id, team_thread_id
+                print(f"❌ Unknown-team channel '{channel_name}' not found")
                 return None, None, None
-        else:
             print(f"❌ No channel configuration found for unknown team {team_name}")
             return None, None, None
-    
-    # No configuration found
-    else:
-        print(f"❌ No channel configuration found for team {team_name}")
-        return None, None, None
+
+    print(f"❌ No channel configuration found for team {team_name}")
+    return None, None, None
 
 
 def send_team_messages(teams, bot_token, delay=2, max_retries=5, retry_delay=10, team_channels=None, dry_run=False, muted_stats=None, include_plots=False, ydb_config=None, debug_plots_dir=None, all_team_data=None, show_diff=False):
@@ -780,11 +715,9 @@ def send_team_messages(teams, bot_token, delay=2, max_retries=5, retry_delay=10,
                 elif ydb_config:
                     print(f"📊 Getting trend data for team: {team_name}")
                     trend_data = get_monthly_trend_data(
-                        database_endpoint=ydb_config.get('endpoint'),
-                        database_path=ydb_config.get('path'),
-                        credentials_path=ydb_config.get('credentials'),
                         team_name=team_name,
-                        use_yesterday=ydb_config.get('use_yesterday', False)
+                        use_yesterday=ydb_config.get('use_yesterday', False),
+                        build_type=ydb_config.get('build_type', DEFAULT_BUILD_TYPE),
                     )
                 else:
                     trend_data = None
@@ -927,6 +860,28 @@ def test_telegram_connection(bot_token, chat_id, message_thread_id=None):
         return False
 
 
+def _normalize_telegram_team_channels_config(data):
+    """Lowercase ``teams`` keys in mailing JSON so they match mart slugs (see ``canonical_team_slug``)."""
+    if not isinstance(data, dict):
+        return data
+    raw_teams = data.get("teams")
+    if not isinstance(raw_teams, dict):
+        return data
+    normalized: dict = {}
+    for k, v in raw_teams.items():
+        nk = canonical_team_slug(k)
+        if nk in normalized:
+            if normalized[nk] != v:
+                print(
+                    f"⚠️ Mailing config: duplicate team after normalizing keys {k!r} → {nk!r}; keeping first entry"
+                )
+        else:
+            normalized[nk] = v
+    out = dict(data)
+    out["teams"] = normalized
+    return out
+
+
 def load_team_channels(team_channels_json):
     """
     Load team channels configuration from JSON string or file.
@@ -943,16 +898,17 @@ def load_team_channels(team_channels_json):
     try:
         # Try to parse as JSON string first
         if team_channels_json.strip().startswith('{'):
-            return json.loads(team_channels_json)
+            data = json.loads(team_channels_json)
         else:
             # Try to read as file
             file_path = Path(team_channels_json)
             if file_path.exists():
                 with open(file_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    data = json.load(f)
             else:
                 print(f"⚠️ Team channels file not found: {file_path}")
                 return None
+        return _normalize_telegram_team_channels_config(data)
     except json.JSONDecodeError as e:
         print(f"❌ Error parsing team channels JSON: {e}")
         return None
@@ -983,12 +939,11 @@ def send_period_updates(period, bot_token, team_channels, ydb_config, delay=2, m
     
     # Get all team data for trends
     all_team_data = get_all_team_data(
-        database_endpoint=ydb_config.get('endpoint'),
-        database_path=ydb_config.get('path'),
-        credentials_path=ydb_config.get('credentials'),
-        use_yesterday=ydb_config.get('use_yesterday', False)
+        use_yesterday=ydb_config.get('use_yesterday', False),
+        build_type=ydb_config.get('build_type', DEFAULT_BUILD_TYPE),
+        branch=ydb_config.get('branch', DEFAULT_BRANCH),
     )
-    
+
     if not all_team_data:
         print("❌ Could not fetch team data for trend updates")
         return False
@@ -1025,8 +980,9 @@ def send_period_updates(period, bot_token, team_channels, ydb_config, delay=2, m
                     print(f"📨 Using default channel '{default_channel_name}' for team {team_name}: {team_chat_id}")
         
         # Determine channel name for logging
-        if team_channels and 'teams' in team_channels and team_name in team_channels['teams']:
-            team_config = team_channels['teams'][team_name]
+        team_key = canonical_team_slug(team_name)
+        if team_channels and 'teams' in team_channels and team_key in team_channels['teams']:
+            team_config = team_channels['teams'][team_key]
             team_channel_name = team_config.get('channel', team_channels.get('default_channel', 'default'))
         else:
             team_channel_name = team_channels.get('default_channel', 'default') if team_channels else 'default'
@@ -1220,14 +1176,23 @@ def main():
     mode_group.add_argument('--period-update', choices=['week', 'month'], help='Send periodic trend updates (week or month)')
     
     # YDB arguments for muted tests statistics
-    parser.add_argument('--ydb-endpoint', help='YDB database endpoint (or use YDB_ENDPOINT env var)')
-    parser.add_argument('--ydb-database', help='YDB database path (or use YDB_DATABASE env var)')
-    parser.add_argument('--ydb-credentials', help='Path to YDB service account credentials JSON file (or use YDB_SERVICE_ACCOUNT_KEY_FILE_CREDENTIALS env var)')
     parser.add_argument('--no-stats', action='store_true', help='Skip fetching muted tests statistics from YDB')
     parser.add_argument('--use-yesterday', action='store_true', help='Use yesterday\'s data for development convenience')
     parser.add_argument('--include-plots', action='store_true', help='Include trend plots in messages (requires matplotlib)')
     parser.add_argument('--debug-plots-dir', help='Directory to save debug plot files (enables debug mode)')
-    
+    parser.add_argument(
+        '--build-type',
+        default=DEFAULT_BUILD_TYPE,
+        dest='build_type',
+        help='test_muted_monitor_mart filter; use "all" to include every build_type (default: relwithdebinfo)',
+    )
+    parser.add_argument(
+        '--branch',
+        default=DEFAULT_BRANCH,
+        dest='branch',
+        help=f'Branch filter for YDB queries (default: {DEFAULT_BRANCH})',
+    )
+
     args = parser.parse_args()
     
     # Validate mode-specific requirements
@@ -1254,19 +1219,16 @@ def main():
     if args.period_update:
         # Prepare YDB config for period updates
         ydb_config = {
-            'endpoint': args.ydb_endpoint,
-            'path': args.ydb_database,
-            'credentials': args.ydb_credentials,
-            'use_yesterday': args.use_yesterday
+            'use_yesterday': args.use_yesterday,
+            'build_type': args.build_type,
+            'branch': args.branch,
         }
-        
-        # Check if we need Telegram connection (not for dry run)
+
         if not args.dry_run:
             if not bot_token:
                 print("❌ Bot token not provided. Use --bot-token or set TELEGRAM_BOT_TOKEN environment variable")
                 sys.exit(1)
-        
-        # Send period updates
+
         success = send_period_updates(
             period=args.period_update,
             bot_token=bot_token,
@@ -1292,10 +1254,8 @@ def main():
     if not args.no_stats:
         print("📊 Fetching muted tests statistics from YDB...")
         muted_stats = get_muted_tests_stats(
-            database_endpoint=args.ydb_endpoint,
-            database_path=args.ydb_database,
-            credentials_path=args.ydb_credentials,
-            use_yesterday=args.use_yesterday
+            use_yesterday=args.use_yesterday,
+            build_type=args.build_type,
         )
         if muted_stats:
             print(f"✅ Statistics loaded for {len(muted_stats)} teams")
@@ -1350,8 +1310,9 @@ def main():
         responsible_info = ""
         channel_info = ""
         
-        if team_channels and 'teams' in team_channels and team_name in team_channels['teams']:
-            team_config = team_channels['teams'][team_name]
+        team_key = canonical_team_slug(team_name)
+        if team_channels and 'teams' in team_channels and team_key in team_channels['teams']:
+            team_config = team_channels['teams'][team_key]
             
             # Get responsible info
             if 'responsible' in team_config:
@@ -1384,19 +1345,16 @@ def main():
     
     if args.include_plots and not args.no_stats:
         ydb_config = {
-            'endpoint': args.ydb_endpoint,
-            'path': args.ydb_database,
-            'credentials': args.ydb_credentials,
-            'use_yesterday': args.use_yesterday
+            'use_yesterday': args.use_yesterday,
+            'build_type': args.build_type,
+            'branch': args.branch,
         }
-        
-        # Get all team data in one optimized query
+
         print("📊 Fetching all team data in one optimized query...")
         all_team_data = get_all_team_data(
-            database_endpoint=args.ydb_endpoint,
-            database_path=args.ydb_database,
-            credentials_path=args.ydb_credentials,
-            use_yesterday=args.use_yesterday
+            use_yesterday=args.use_yesterday,
+            build_type=args.build_type,
+            branch=args.branch,
         )
         
         if all_team_data:

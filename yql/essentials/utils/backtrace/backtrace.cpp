@@ -19,7 +19,7 @@
 #include <util/system/mutex.h>
 
 #ifdef _linux_
-    #include <signal.h>
+    #include <csignal>
 #endif
 
 #include <functional>
@@ -80,7 +80,8 @@ namespace {
 std::vector<std::function<void(int)>> Before, After;
 TMutex FatalCallbackMutex;
 bool KikimrSymbolize = false;
-NYql::NBacktrace::TCollectedFrame Frames[NYql::NBacktrace::Limit];
+bool DoNotUnwind = false;
+NYql::NBacktrace::TCollectedFrame Frames[NYql::NBacktrace::Limit]; // NOLINT(modernize-avoid-c-arrays)
 
 void CallCallbacks(decltype(Before)& where, int signum) {
     for (const auto& fn : where) {
@@ -105,7 +106,7 @@ void DoBacktrace(IOutputStream* out, void** stack, size_t cnt) {
 void SignalHandler(int signum) {
     CallCallbacks(Before, signum);
 
-    if (!NMalloc::IsAllocatorCorrupted) {
+    if (!NMalloc::IsAllocatorCorrupted && !DoNotUnwind) {
         if (!AtomicTryLock(&BacktraceStarted)) {
             return;
         }
@@ -123,7 +124,7 @@ void SignalAction(int signum, siginfo_t*, void* context) {
     Y_UNUSED(SignalHandler);
     CallCallbacks(Before, signum);
 
-    if (!NMalloc::IsAllocatorCorrupted) {
+    if (!NMalloc::IsAllocatorCorrupted && !DoNotUnwind) {
         if (!AtomicTryLock(&BacktraceStarted)) {
             return;
         }
@@ -138,8 +139,7 @@ void SignalAction(int signum, siginfo_t*, void* context) {
 #endif
 } // namespace
 
-namespace NYql {
-namespace NBacktrace {
+namespace NYql::NBacktrace {
 THashMap<TString, TString> Mapping;
 
 void SetModulesMapping(const THashMap<TString, TString>& mapping) {
@@ -174,6 +174,10 @@ void KikimrBackTrace() {
     FormatBackTrace(&Cerr);
 }
 
+void DisableBacktraceUnwinding() {
+    DoNotUnwind = true;
+}
+
 void KikimrBackTraceFormatImpl(IOutputStream* out) {
     KikimrSymbolize = true;
     UnlockAllMemory();
@@ -185,22 +189,21 @@ void KikimrBacktraceFormatImpl(IOutputStream* out, void* const* stack, size_t st
     DoBacktrace(out, (void**)stack, stackSize);
 }
 
-} // namespace NBacktrace
-} // namespace NYql
+} // namespace NYql::NBacktrace
 
 void EnableKikimrBacktraceFormat() {
     SetFormatBackTraceFn(NYql::NBacktrace::KikimrBacktraceFormatImpl);
 }
 
 namespace {
-NYql::NBacktrace::TStackFrame SFrames[NYql::NBacktrace::Limit];
+NYql::NBacktrace::TStackFrame SFrames[NYql::NBacktrace::Limit]; // NOLINT(modernize-avoid-c-arrays)
 void PrintFrames(IOutputStream* out, const NYql::NBacktrace::TCollectedFrame* frames, size_t count) {
     auto& outp = *out;
     Y_UNUSED(SFrames);
 #if defined(_linux_) && defined(_x86_64_)
     if (KikimrSymbolize) {
         for (size_t i = 0; i < count; ++i) {
-            SFrames[i] = NYql::NBacktrace::TStackFrame{frames[i].File, frames[i].Address};
+            SFrames[i] = NYql::NBacktrace::TStackFrame{.File = frames[i].File, .Address = frames[i].Address};
         }
         NYql::NBacktrace::Symbolize(SFrames, count, out);
         return;

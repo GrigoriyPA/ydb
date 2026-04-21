@@ -115,9 +115,14 @@ namespace NKikimr::NStorage {
         TGroupRecord& group = it->second;
         group.MaxKnownGeneration = Max(group.MaxKnownGeneration, generation);
         if (newGroup) {
-            const auto erasure = static_cast<TBlobStorageGroupType::EErasureSpecies>(newGroup->GetErasureSpecies());
-            Y_DEBUG_ABORT_UNLESS(!group.GType || group.GType->GetErasure() == erasure);
-            group.GType.emplace(erasure);
+            if (newGroup->HasErasureSpecies()) {
+                const auto erasure = static_cast<TBlobStorageGroupType::EErasureSpecies>(newGroup->GetErasureSpecies());
+                Y_DEBUG_ABORT_UNLESS(!group.GType || group.GType->GetErasure() == erasure);
+                group.GType.emplace(erasure);
+            } else {
+                Y_ABORT_UNLESS(newGroup->RingsSize() == 0); // ensure no VDisks in group
+                group.GType.emplace(TBlobStorageGroupType::ErasureNone);
+            }
         }
 
         // forget pending queries
@@ -314,6 +319,11 @@ namespace NKikimr::NStorage {
                 ApplyGroupInfo(groupId, group.GetGroupGeneration(), &group, true, false);
             }
         }
+    }
+
+    bool TNodeWarden::HasGroupProxy(ui32 groupId) const {
+        auto it = Groups.find(groupId);
+        return it != Groups.end() && it->second.ProxyId;
     }
 
     void TNodeWarden::Handle(TEvBlobStorage::TEvUpdateGroupInfo::TPtr ev) {

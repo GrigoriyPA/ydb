@@ -1,5 +1,5 @@
 PY3TEST()
-INCLUDE(${ARCADIA_ROOT}/ydb/tests/ydbd_dep.inc)
+INCLUDE(${ARCADIA_ROOT}/ydb/tests/harness_dep.inc)
 
 FORK_TEST_FILES()
 FORK_TESTS()
@@ -8,6 +8,7 @@ SPLIT_FACTOR(10)
 
 TEST_SRCS(
     test_external_data_source.py
+    test_external_data_source_secret.py
 )
 
 SIZE(LARGE)

@@ -8,7 +8,7 @@
 #include <util/datetime/base.h>
 #include <util/string/printf.h>
 
-namespace NYql::DateTime {
+namespace NYql::NDateTime {
 
 constexpr size_t MAX_TIMEZONE_NAME_LEN = 64;
 
@@ -46,7 +46,13 @@ struct TTMStorage {
     }
 
     inline void FromDate(const NUdf::IDateBuilder& builder, ui16 value, ui16 timezoneId = 0) {
-        ui32 year, month, day, dayOfYear, weekOfYear, weekOfYearIso8601, dayOfWeek;
+        ui32 year;
+        ui32 month;
+        ui32 day;
+        ui32 dayOfYear;
+        ui32 weekOfYear;
+        ui32 weekOfYearIso8601;
+        ui32 dayOfWeek;
 
         if (!builder.FullSplitDate2(value, year, month, day, dayOfYear, weekOfYear, weekOfYearIso8601, dayOfWeek, timezoneId)) {
             ythrow yexception() << "Error in FullSplitDate";
@@ -81,7 +87,16 @@ struct TTMStorage {
     }
 
     inline void FromDatetime(const NUdf::IDateBuilder& builder, ui32 value, ui16 timezoneId = 0) {
-        ui32 year, month, day, hour, minute, second, dayOfYear, weekOfYear, weekOfYearIso8601, dayOfWeek;
+        ui32 year;
+        ui32 month;
+        ui32 day;
+        ui32 hour;
+        ui32 minute;
+        ui32 second;
+        ui32 dayOfYear;
+        ui32 weekOfYear;
+        ui32 weekOfYearIso8601;
+        ui32 dayOfWeek;
 
         if (!builder.FullSplitDatetime2(value, year, month, day, hour, minute, second, dayOfYear, weekOfYear, weekOfYearIso8601, dayOfWeek, timezoneId)) {
             ythrow yexception() << "Error in FullSplitDatetime";
@@ -119,17 +134,46 @@ struct TTMStorage {
         return ToDatetime(builder) * 1000000ull + Microsecond;
     }
 
-    inline bool Validate(const NUdf::IDateBuilder& builder) {
+    inline bool Validate(const NUdf::IDateBuilder& builder, TMaybe<i16> timezoneOffset = Nothing()) {
         ui32 datetime;
-        if (!builder.MakeDatetime(Year, Month, Day, Hour, Minute, Second, datetime, TimezoneId)) {
-            return false;
+        if (timezoneOffset.Defined()) {
+            Y_ENSURE(TimezoneId == 0);
+            if (!builder.MakeDatetime(Year, Month, Day, Hour, Minute, Second, datetime)) {
+                return false;
+            }
+            const auto tzOffset = *timezoneOffset.Get() * 60;
+            if (tzOffset >= 0 && datetime < static_cast<ui32>(tzOffset) ||
+                tzOffset < 0 && datetime >= tzOffset + NUdf::MAX_DATETIME)
+            {
+                return false;
+            }
+            datetime -= tzOffset;
+        } else {
+            if (!builder.MakeDatetime(Year, Month, Day, Hour, Minute, Second, datetime, TimezoneId)) {
+                return false;
+            }
         }
 
-        ui32 year, month, day, hour, minute, second, dayOfYear, weekOfYear, weekOfYearIso8601, dayOfWeek;
+        ui32 year;
+        ui32 month;
+        ui32 day;
+        ui32 hour;
+        ui32 minute;
+        ui32 second;
+        ui32 dayOfYear;
+        ui32 weekOfYear;
+        ui32 weekOfYearIso8601;
+        ui32 dayOfWeek;
         if (!builder.FullSplitDatetime2(datetime, year, month, day, hour, minute, second, dayOfYear, weekOfYear, weekOfYearIso8601, dayOfWeek, TimezoneId)) {
             ythrow yexception() << "Error in FullSplitDatetime.";
         }
 
+        Year = year;
+        Month = month;
+        Day = day;
+        Hour = hour;
+        Minute = minute;
+        Second = second;
         DayOfYear = dayOfYear;
         WeekOfYear = weekOfYear;
         WeekOfYearIso8601 = weekOfYearIso8601;
@@ -151,7 +195,7 @@ struct TTMStorage {
         return ((Hour * 60ull + Minute) * 60ull + Second) * 1000000ull + Microsecond;
     }
 
-    const TString ToString() const {
+    TString ToString() const {
         const auto& tzName = NTi::GetTimezones()[TimezoneId];
         return Sprintf("%4d-%02d-%02dT%02d:%02d:%02d.%06d,%.*s",
                        Year, Month, Day, Hour, Minute, Second, Microsecond,
@@ -207,4 +251,9 @@ TInstant DoAddMonths(TInstant current, i64 months, const NUdf::IDateBuilder& bui
 
 TInstant DoAddYears(TInstant current, i64 years, const NUdf::IDateBuilder& builder);
 
+} // namespace NYql::NDateTime
+
+// TODO(YQL-20086): Migrate YDB to NYql::NDateTime
+namespace NYql::DateTime { // NOLINT(readability-identifier-naming)
+using namespace NYql::NDateTime;
 } // namespace NYql::DateTime

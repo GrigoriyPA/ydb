@@ -11,6 +11,7 @@
 
 #include <yt/yt/client/api/file_reader.h>
 #include <yt/yt/client/api/file_writer.h>
+#include <yt/yt/client/api/formatted_table_reader.h>
 
 #include <yt/yt/client/api/rpc_proxy/client_base.h>
 #include <yt/yt/client/api/rpc_proxy/row_stream.h>
@@ -20,9 +21,13 @@
 #include <yt/yt/client/table_client/name_table.h>
 #include <yt/yt/client/table_client/row_buffer.h>
 
+#include <yt/yt/client/signature/signature.h>
+
 #include <yt/yt/client/transaction_client/timestamp_provider.h>
 
 #include <yt/yt/core/misc/protobuf_helpers.h>
+
+#include <yt/yt/core/concurrency/async_stream_helpers.h>
 
 #include <library/cpp/iterator/enumerate.h>
 
@@ -38,7 +43,9 @@ using namespace NYT::NConcurrency;
 // This timeout exceeds some timeouts in server code:
 //   - "replication_reader_failure_timeout"
 //   - "session_timeout"
-const TDuration TableReaderTimeout = TDuration::Minutes(35);
+[[maybe_unused]] const TDuration TableReaderTimeout = TDuration::Minutes(35);
+
+constexpr ssize_t MaxWriteChunkSize = 500_KB;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -177,6 +184,24 @@ EJobState FromApiJobState(NJobTrackerClient::EJobState state)
     }
 }
 
+NYTree::INodePtr ToApiNode(const TNode& node)
+{
+    return NYTree::ConvertToNode(NYson::TYsonString(NodeToYsonString(node, NYson::EYsonFormat::Binary)));
+}
+
+// Write data in small chunks to avoid generating large RPC attachments.
+template <class TWriteFn>
+void WriteInChunks(const void* buf, size_t len, const TWriteFn& writeFn)
+{
+    auto data = TSharedRef::MakeCopy<TDefaultSharedBlobTag>(TRef(buf, len));
+    std::vector<TFuture<void>> futures;
+    futures.reserve((std::ssize(data) + MaxWriteChunkSize - 1) / MaxWriteChunkSize);
+    for (ssize_t offset = 0; offset < std::ssize(data); offset += MaxWriteChunkSize) {
+        futures.push_back(writeFn(data.Slice(offset, Min(offset + MaxWriteChunkSize, std::ssize(data)))));
+    }
+    WaitAndProcess(AllSucceeded(std::move(futures)));
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 class TSyncRpcInputStream
@@ -200,6 +225,8 @@ private:
     }
 };
 
+////////////////////////////////////////////////////////////////////////////////
+
 class TSyncRpcOutputStream
     : public IOutputStream
 {
@@ -210,8 +237,9 @@ public:
 
     void DoWrite(const void* buf, size_t len) override
     {
-        auto sharedBuffer = TSharedRef::MakeCopy<TDefaultSharedBlobTag>(TRef(buf, len));
-        WaitAndProcess(Underlying_->Write(sharedBuffer));
+        WriteInChunks(buf, len, [this] (const TSharedRef& ref) {
+            return Underlying_->Write(ref);
+        });
     }
 
     void DoFinish() override
@@ -226,9 +254,9 @@ private:
 ////////////////////////////////////////////////////////////////////////////////
 
 TRpcRawClient::TRpcRawClient(
-    NApi::IClientPtr client,
+    TApiClients clients,
     const TConfigPtr& config)
-    : Client_(std::move(client))
+    : Clients_(std::move(clients))
     , Config_(config)
 { }
 
@@ -238,7 +266,7 @@ TNode TRpcRawClient::Get(
     const TGetOptions& options)
 {
     auto newPath = AddPathPrefix(path, Config_->Prefix);
-    auto future = Client_->GetNode(newPath, SerializeOptionsForGet(transactionId, options));
+    auto future = Clients_.Light->GetNode(newPath, SerializeOptionsForGet(transactionId, options));
     auto result = WaitAndProcess(future);
     return NodeFromYsonString(result.AsStringBuf());
 }
@@ -267,7 +295,7 @@ void TRpcRawClient::Set(
 {
     auto newPath = AddPathPrefix(path, Config_->Prefix);
     auto ysonValue = NYson::TYsonString(NodeToYsonString(value, NYson::EYsonFormat::Binary));
-    auto future = Client_->SetNode(newPath, ysonValue, SerializeOptionsForSet(mutationId, transactionId, options));
+    auto future = Clients_.Light->SetNode(newPath, ysonValue, SerializeOptionsForSet(mutationId, transactionId, options));
     WaitAndProcess(future);
 }
 
@@ -277,7 +305,7 @@ bool TRpcRawClient::Exists(
     const TExistsOptions& options)
 {
     auto newPath = AddPathPrefix(path, Config_->Prefix);
-    auto future = Client_->NodeExists(newPath, SerializeOptionsForExists(transactionId, options));
+    auto future = Clients_.Light->NodeExists(newPath, SerializeOptionsForExists(transactionId, options));
     return WaitAndProcess(future);
 }
 
@@ -291,7 +319,7 @@ void TRpcRawClient::MultisetAttributes(
     auto newPath = AddPathPrefix(path, Config_->Prefix);
     auto attributes = NYTree::ConvertToAttributes(
         NYson::TYsonString(NodeToYsonString(value, NYson::EYsonFormat::Binary)));
-    auto future = Client_->MultisetAttributesNode(newPath, attributes->ToMap(), SerializeOptionsForMultisetAttributes(mutationId, transactionId, options));
+    auto future = Clients_.Light->MultisetAttributesNode(newPath, attributes->ToMap(), SerializeOptionsForMultisetAttributes(mutationId, transactionId, options));
     WaitAndProcess(future);
 }
 
@@ -310,12 +338,12 @@ TNodeId TRpcRawClient::Create(
     // Call CreateObject on empty path except NT_MAP node
     // With NT_MAP path can be empty, but Config_->Prefix may exist
     if (path.empty() && type != ENodeType::NT_MAP) {
-        auto future = Client_->CreateObject(ToApiObjectType(type), SerializeOptionsForCreateObject(mutationId, options));
+        auto future = Clients_.Light->CreateObject(ToApiObjectType(type), SerializeOptionsForCreateObject(mutationId, options));
         return waitGuid(std::move(future));
     }
 
     auto newPath = AddPathPrefix(path, Config_->Prefix);
-    auto future = Client_->CreateNode(newPath, ToApiObjectType(type), SerializeOptionsForCreate(mutationId, transactionId, options));
+    auto future = Clients_.Light->CreateNode(newPath, ToApiObjectType(type), SerializeOptionsForCreate(mutationId, transactionId, options));
     return waitGuid(std::move(future));
 }
 
@@ -328,7 +356,7 @@ TNodeId TRpcRawClient::CopyWithoutRetries(
     TMutationId mutationId;
     auto newSourcePath = AddPathPrefix(sourcePath, Config_->Prefix);
     auto newDestinationPath = AddPathPrefix(destinationPath, Config_->Prefix);
-    auto future = Client_->CopyNode(newSourcePath, newDestinationPath, SerializeOptionsForCopy(mutationId, transactionId, options));
+    auto future = Clients_.Light->CopyNode(newSourcePath, newDestinationPath, SerializeOptionsForCopy(mutationId, transactionId, options));
     auto result = WaitAndProcess(future);
     return UtilGuidFromYtGuid(result);
 }
@@ -347,7 +375,7 @@ TNodeId TRpcRawClient::CopyInsideMasterCell(
     auto newOptions = SerializeOptionsForCopy(mutationId, transactionId, options);
     newOptions.EnableCrossCellCopying = false;
 
-    auto future = Client_->CopyNode(newSourcePath, newDestinationPath, newOptions);
+    auto future = Clients_.Light->CopyNode(newSourcePath, newDestinationPath, newOptions);
     auto result = WaitAndProcess(future);
     return UtilGuidFromYtGuid(result);
 }
@@ -361,7 +389,7 @@ TNodeId TRpcRawClient::MoveWithoutRetries(
     TMutationId mutationId;
     auto newSourcePath = AddPathPrefix(sourcePath, Config_->Prefix);
     auto newDestinationPath = AddPathPrefix(destinationPath, Config_->Prefix);
-    auto future = Client_->MoveNode(newSourcePath, newDestinationPath, SerializeOptionsForMove(mutationId, transactionId, options));
+    auto future = Clients_.Light->MoveNode(newSourcePath, newDestinationPath, SerializeOptionsForMove(mutationId, transactionId, options));
     auto result = WaitAndProcess(future);
     return UtilGuidFromYtGuid(result);
 }
@@ -380,7 +408,7 @@ TNodeId TRpcRawClient::MoveInsideMasterCell(
     auto newOptions = SerializeOptionsForMove(mutationId, transactionId, options);
     newOptions.EnableCrossCellCopying = false;
 
-    auto future = Client_->MoveNode(newSourcePath, newDestinationPath, newOptions);
+    auto future = Clients_.Light->MoveNode(newSourcePath, newDestinationPath, newOptions);
     auto result = WaitAndProcess(future);
     return UtilGuidFromYtGuid(result);
 }
@@ -392,7 +420,7 @@ void TRpcRawClient::Remove(
     const TRemoveOptions& options)
 {
     auto newPath = AddPathPrefix(path, Config_->Prefix);
-    auto future = Client_->RemoveNode(newPath, SerializeOptionsForRemove(mutationId, transactionId, options));
+    auto future = Clients_.Light->RemoveNode(newPath, SerializeOptionsForRemove(mutationId, transactionId, options));
     WaitAndProcess(future);
 }
 
@@ -405,7 +433,7 @@ TNode::TListType TRpcRawClient::List(
     if (path.empty() && newPath.EndsWith('/')) {
         newPath.pop_back();
     }
-    auto future = Client_->ListNode(newPath, SerializeOptionsForList(transactionId, options));
+    auto future = Clients_.Light->ListNode(newPath, SerializeOptionsForList(transactionId, options));
     auto result = WaitAndProcess(future);
     return NodeFromYsonString(result.AsStringBuf()).AsList();
 }
@@ -419,7 +447,7 @@ TNodeId TRpcRawClient::Link(
 {
     auto newTargetPath = AddPathPrefix(targetPath, Config_->Prefix);
     auto newLinkPath = AddPathPrefix(linkPath, Config_->Prefix);
-    auto future = Client_->LinkNode(newTargetPath, newLinkPath, SerializeOptionsForLink(mutationId, transactionId, options));
+    auto future = Clients_.Light->LinkNode(newTargetPath, newLinkPath, SerializeOptionsForLink(mutationId, transactionId, options));
     auto result = WaitAndProcess(future);
     return UtilGuidFromYtGuid(result);
 }
@@ -432,7 +460,7 @@ TLockId TRpcRawClient::Lock(
     const TLockOptions& options)
 {
     auto newPath = AddPathPrefix(path, Config_->Prefix);
-    auto future = Client_->LockNode(newPath, ToApiLockMode(mode), SerializeOptionsForLock(mutationId, transactionId, options));
+    auto future = Clients_.Light->LockNode(newPath, ToApiLockMode(mode), SerializeOptionsForLock(mutationId, transactionId, options));
     auto result = WaitAndProcess(future);
     return UtilGuidFromYtGuid(result.LockId);
 }
@@ -444,7 +472,7 @@ void TRpcRawClient::Unlock(
     const TUnlockOptions& options)
 {
     auto newPath = AddPathPrefix(path, Config_->Prefix);
-    auto future = Client_->UnlockNode(newPath, SerializeOptionsForUnlock(mutationId, transactionId, options));
+    auto future = Clients_.Light->UnlockNode(newPath, SerializeOptionsForUnlock(mutationId, transactionId, options));
     WaitAndProcess(future);
 }
 
@@ -468,7 +496,7 @@ void TRpcRawClient::Concatenate(
     }
 
     TMutationId mutationId;
-    auto future = Client_->ConcatenateNodes(newSourcePaths, newDestinationPath, SerializeOptionsForConcatenate(mutationId, transactionId, options));
+    auto future = Clients_.Light->ConcatenateNodes(newSourcePaths, newDestinationPath, SerializeOptionsForConcatenate(mutationId, transactionId, options));
     WaitAndProcess(future);
 }
 
@@ -477,7 +505,7 @@ TTransactionId TRpcRawClient::StartTransaction(
     const TTransactionId& parentId,
     const TStartTransactionOptions& options)
 {
-    auto future = Client_->StartTransaction(
+    auto future = Clients_.Light->StartTransaction(
         NTransactionClient::ETransactionType::Master,
         SerializeOptionsForStartTransaction(mutationId, parentId, Config_->TxTimeout, options));
     auto result = WaitAndProcess(future);
@@ -486,7 +514,7 @@ TTransactionId TRpcRawClient::StartTransaction(
 
 void TRpcRawClient::PingTransaction(const TTransactionId& transactionId)
 {
-    auto tx = Client_->AttachTransaction(YtGuidFromUtilGuid(transactionId));
+    auto tx = Clients_.Light->AttachTransaction(YtGuidFromUtilGuid(transactionId));
     WaitAndProcess(tx->Ping());
 }
 
@@ -494,7 +522,7 @@ void TRpcRawClient::AbortTransaction(
     TMutationId& mutationId,
     const TTransactionId& transactionId)
 {
-    auto tx = Client_->AttachTransaction(YtGuidFromUtilGuid(transactionId));
+    auto tx = Clients_.Light->AttachTransaction(YtGuidFromUtilGuid(transactionId));
     WaitAndProcess(tx->Abort(SerializeOptionsForAbortTransaction(mutationId)));
 }
 
@@ -502,7 +530,7 @@ void TRpcRawClient::CommitTransaction(
     TMutationId& mutationId,
     const TTransactionId& transactionId)
 {
-    auto tx = Client_->AttachTransaction(YtGuidFromUtilGuid(transactionId));
+    auto tx = Clients_.Light->AttachTransaction(YtGuidFromUtilGuid(transactionId));
     WaitAndProcess(tx->Commit(SerializeOptionsForCommitTransaction(mutationId)));
 }
 
@@ -512,7 +540,7 @@ TOperationId TRpcRawClient::StartOperation(
     EOperationType type,
     const TNode& spec)
 {
-    auto future = Client_->StartOperation(
+    auto future = Clients_.Light->StartOperation(
         NScheduler::EOperationType(type),
         NYson::TYsonString(NodeToYsonString(spec, NYson::EYsonFormat::Binary)),
         SerializeOptionsForStartOperation(mutationId, transactionId));
@@ -628,7 +656,7 @@ TOperationAttributes TRpcRawClient::GetOperation(
     const TOperationId& operationId,
     const TGetOperationOptions& options)
 {
-    auto future = Client_->GetOperation(
+    auto future = Clients_.Light->GetOperation(
         NScheduler::TOperationId(YtGuidFromUtilGuid(operationId)),
         SerializeOptionsForGetOperation(options, /*useAlias*/ false));
     auto result = WaitAndProcess(future);
@@ -639,7 +667,7 @@ TOperationAttributes TRpcRawClient::GetOperation(
     const TString& alias,
     const TGetOperationOptions& options)
 {
-    auto future = Client_->GetOperation(alias, SerializeOptionsForGetOperation(options, /*useAlias*/ true));
+    auto future = Clients_.Light->GetOperation(alias, SerializeOptionsForGetOperation(options, /*useAlias*/ true));
     auto result = WaitAndProcess(future);
     return ParseOperationAttributes(result);
 }
@@ -648,7 +676,7 @@ void TRpcRawClient::AbortOperation(
     TMutationId& /*mutationId*/,
     const TOperationId& operationId)
 {
-    auto future = Client_->AbortOperation(NScheduler::TOperationId(YtGuidFromUtilGuid(operationId)));
+    auto future = Clients_.Light->AbortOperation(NScheduler::TOperationId(YtGuidFromUtilGuid(operationId)));
     WaitAndProcess(future);
 }
 
@@ -656,7 +684,7 @@ void TRpcRawClient::CompleteOperation(
     TMutationId& /*mutationId*/,
     const TOperationId& operationId)
 {
-    auto future = Client_->CompleteOperation(NScheduler::TOperationId(YtGuidFromUtilGuid(operationId)));
+    auto future = Clients_.Light->CompleteOperation(NScheduler::TOperationId(YtGuidFromUtilGuid(operationId)));
     WaitAndProcess(future);
 }
 
@@ -665,7 +693,7 @@ void TRpcRawClient::SuspendOperation(
     const TOperationId& operationId,
     const TSuspendOperationOptions& options)
 {
-    auto future = Client_->SuspendOperation(
+    auto future = Clients_.Light->SuspendOperation(
         NScheduler::TOperationId(YtGuidFromUtilGuid(operationId)),
         SerializeOptionsForSuspendOperation(options));
     WaitAndProcess(future);
@@ -676,13 +704,13 @@ void TRpcRawClient::ResumeOperation(
     const TOperationId& operationId,
     const TResumeOperationOptions& /*options*/)
 {
-    auto future = Client_->ResumeOperation(NScheduler::TOperationId(YtGuidFromUtilGuid(operationId)));
+    auto future = Clients_.Light->ResumeOperation(NScheduler::TOperationId(YtGuidFromUtilGuid(operationId)));
     WaitAndProcess(future);
 }
 
 TListOperationsResult TRpcRawClient::ListOperations(const TListOperationsOptions& options)
 {
-    auto future = Client_->ListOperations(SerializeOptionsForListOperations(options));
+    auto future = Clients_.Light->ListOperations(SerializeOptionsForListOperations(options));
     auto listOperationsResult = WaitAndProcess(future);
 
     TListOperationsResult result;
@@ -720,7 +748,7 @@ void TRpcRawClient::UpdateOperationParameters(
     const TOperationId& operationId,
     const TUpdateOperationParametersOptions& options)
 {
-    auto future = Client_->UpdateOperationParameters(
+    auto future = Clients_.Light->UpdateOperationParameters(
         NScheduler::TOperationId(YtGuidFromUtilGuid(operationId)),
         SerializeParametersForUpdateOperationParameters(options));
     WaitAndProcess(future);
@@ -731,7 +759,7 @@ NYson::TYsonString TRpcRawClient::GetJob(
     const TJobId& jobId,
     const TGetJobOptions& options)
 {
-    auto future = Client_->GetJob(
+    auto future = Clients_.Light->GetJob(
         NScheduler::TOperationId(YtGuidFromUtilGuid(operationId)),
         NJobTrackerClient::TJobId(YtGuidFromUtilGuid(jobId)),
         SerializeOptionsForGetJob(options));
@@ -807,7 +835,7 @@ TListJobsResult TRpcRawClient::ListJobs(
     const TOperationId& operationId,
     const TListJobsOptions& options)
 {
-    auto future = Client_->ListJobs(
+    auto future = Clients_.Light->ListJobs(
         NScheduler::TOperationId(YtGuidFromUtilGuid(operationId)),
         SerializeOptionsForListJobs(options));
     auto listJobsResult = WaitAndProcess(future);
@@ -885,7 +913,7 @@ IFileReaderPtr TRpcRawClient::GetJobInput(
     const TJobId& jobId,
     const TGetJobInputOptions& /*options*/)
 {
-    auto future = Client_->GetJobInput(NJobTrackerClient::TJobId(YtGuidFromUtilGuid(jobId)));
+    auto future = Clients_.Heavy->GetJobInput(NJobTrackerClient::TJobId(YtGuidFromUtilGuid(jobId)));
     auto result = WaitAndProcess(future);
     auto stream = std::make_unique<TSyncRpcInputStream>(CreateSyncAdapter(CreateCopyingAdapter(result)));
     return MakeIntrusive<TRpcResponseStream>(std::move(stream));
@@ -896,7 +924,7 @@ IFileReaderPtr TRpcRawClient::GetJobFailContext(
     const TJobId& jobId,
     const TGetJobFailContextOptions& /*options*/)
 {
-    auto future = Client_->GetJobFailContext(
+    auto future = Clients_.Light->GetJobFailContext(
         NScheduler::TOperationId(YtGuidFromUtilGuid(operationId)),
         NJobTrackerClient::TJobId(YtGuidFromUtilGuid(jobId)));
     auto result = WaitAndProcess(future);
@@ -909,7 +937,7 @@ IFileReaderPtr TRpcRawClient::GetJobStderr(
     const TJobId& jobId,
     const TGetJobStderrOptions& /*options*/)
 {
-    auto future = Client_->GetJobStderr(
+    auto future = Clients_.Light->GetJobStderr(
         NScheduler::TOperationId(YtGuidFromUtilGuid(operationId)),
         NJobTrackerClient::TJobId(YtGuidFromUtilGuid(jobId)));
     auto result = WaitAndProcess(future);
@@ -922,7 +950,7 @@ IFileReaderPtr TRpcRawClient::GetJobTrace(
     const TJobId& jobId,
     const TGetJobTraceOptions& options)
 {
-    auto future = Client_->GetJobTrace(
+    auto future = Clients_.Heavy->GetJobTrace(
         NScheduler::TOperationId(YtGuidFromUtilGuid(operationId)),
         NJobTrackerClient::TJobId(YtGuidFromUtilGuid(jobId)),
         SerializeOptionsForGetJobTrace(options));
@@ -936,7 +964,7 @@ std::unique_ptr<IInputStream> TRpcRawClient::ReadFile(
     const TRichYPath& path,
     const TFileReaderOptions& options)
 {
-    auto future = Client_->CreateFileReader(path.Path_, SerializeOptionsForReadFile(transactionId, options));
+    auto future = Clients_.Heavy->CreateFileReader(path.Path_, SerializeOptionsForReadFile(transactionId, options));
     auto reader = WaitAndProcess(future);
     auto syncAdapter = CreateSyncAdapter(CreateCopyingAdapter(reader));
     return std::make_unique<TSyncRpcInputStream>(std::move(syncAdapter));
@@ -955,7 +983,9 @@ public:
 private:
     void DoWrite(const void* buf, size_t len) override
     {
-        WaitAndProcess(Writer_->Write(TSharedRef::MakeCopy<TDefaultSharedBlobTag>(TRef(buf, len))));
+        WriteInChunks(buf, len, [this] (const TSharedRef& ref) {
+            return Writer_->Write(ref);
+        });
     }
 
     void DoFinish() override
@@ -972,7 +1002,7 @@ std::unique_ptr<IOutputStream> TRpcRawClient::WriteFile(
     const TRichYPath& path,
     const TFileWriterOptions& options)
 {
-    auto writer = Client_->CreateFileWriter(ToApiRichPath(path), SerializeOptionsForWriteFile(transactionId, options));
+    auto writer = Clients_.Heavy->CreateFileWriter(ToApiRichPath(path), SerializeOptionsForWriteFile(transactionId, options));
     return std::make_unique<TRpcWriteFileRequestStream>(std::move(writer));
 }
 
@@ -982,7 +1012,7 @@ TMaybe<TYPath> TRpcRawClient::GetFileFromCache(
     const TYPath& cachePath,
     const TGetFileFromCacheOptions& options)
 {
-    auto future = Client_->GetFileFromCache(md5Signature, SerializeOptionsForGetFileFromCache(transactionId, cachePath, options));
+    auto future = Clients_.Light->GetFileFromCache(md5Signature, SerializeOptionsForGetFileFromCache(transactionId, cachePath, options));
     auto result = WaitAndProcess(future);
     return result.Path.empty() ? Nothing() : TMaybe<TYPath>(result.Path);
 }
@@ -995,7 +1025,7 @@ TYPath TRpcRawClient::PutFileToCache(
     const TPutFileToCacheOptions& options)
 {
     auto newFilePath = AddPathPrefix(filePath, Config_->Prefix);
-    auto future = Client_->PutFileToCache(newFilePath, md5Signature, SerializeOptionsForPutFileToCache(transactionId, cachePath, options));
+    auto future = Clients_.Light->PutFileToCache(newFilePath, md5Signature, SerializeOptionsForPutFileToCache(transactionId, cachePath, options));
     auto result = WaitAndProcess(future);
     return result.Path;
 }
@@ -1006,7 +1036,7 @@ void TRpcRawClient::MountTable(
     const TMountTableOptions& options)
 {
     auto newPath = AddPathPrefix(path, Config_->Prefix);
-    auto future = Client_->MountTable(newPath, SerializeOptionsForMountTable(mutationId, options));
+    auto future = Clients_.Light->MountTable(newPath, SerializeOptionsForMountTable(mutationId, options));
     WaitAndProcess(future);
 }
 
@@ -1016,7 +1046,7 @@ void TRpcRawClient::UnmountTable(
     const TUnmountTableOptions& options)
 {
     auto newPath = AddPathPrefix(path, Config_->Prefix);
-    auto future = Client_->UnmountTable(newPath, SerializeOptionsForUnmountTable(mutationId, options));
+    auto future = Clients_.Light->UnmountTable(newPath, SerializeOptionsForUnmountTable(mutationId, options));
     WaitAndProcess(future);
 }
 
@@ -1026,7 +1056,7 @@ void TRpcRawClient::RemountTable(
     const TRemountTableOptions& options)
 {
     auto newPath = AddPathPrefix(path, Config_->Prefix);
-    auto future = Client_->RemountTable(newPath, SerializeOptionsForRemountTable(mutationId, options));
+    auto future = Clients_.Light->RemountTable(newPath, SerializeOptionsForRemountTable(mutationId, options));
     WaitAndProcess(future);
 }
 
@@ -1048,13 +1078,12 @@ void TRpcRawClient::ReshardTableByPivotKeys(
         }
 
         NTableClient::TLegacyOwningKey pivotKey;
-        Deserialize(pivotKey, NYTree::ConvertToNode(NYson::TYsonString(
-            NodeToYsonString(keysNodesList, NYson::EYsonFormat::Binary))));
+        Deserialize(pivotKey, ToApiNode(keysNodesList));
 
         pivotKeys.emplace_back(std::move(pivotKey));
     }
 
-    auto future = Client_->ReshardTable(newPath, pivotKeys,  SerializeOptionsForReshardTable(mutationId, options));
+    auto future = Clients_.Light->ReshardTable(newPath, pivotKeys,  SerializeOptionsForReshardTable(mutationId, options));
     WaitAndProcess(future);
 }
 
@@ -1065,7 +1094,7 @@ void TRpcRawClient::ReshardTableByTabletCount(
     const TReshardTableOptions& options)
 {
     auto newPath = AddPathPrefix(path, Config_->Prefix);
-    auto future = Client_->ReshardTable(newPath, tabletCount, SerializeOptionsForReshardTable(mutationId, options));
+    auto future = Clients_.Light->ReshardTable(newPath, tabletCount, SerializeOptionsForReshardTable(mutationId, options));
     WaitAndProcess(future);
 }
 
@@ -1118,7 +1147,7 @@ void TRpcRawClient::AlterTable(
     const TYPath& path,
     const TAlterTableOptions& options)
 {
-    auto future = Client_->AlterTable(path, SerializeOptionsForAlterTable(mutationId, transactionId, options));
+    auto future = Clients_.Light->AlterTable(path, SerializeOptionsForAlterTable(mutationId, transactionId, options));
     WaitAndProcess(future);
 }
 
@@ -1180,7 +1209,7 @@ std::unique_ptr<IOutputStream> TRpcRawClient::WriteTable(
     const TMaybe<TFormat>& format,
     const TTableWriterOptions& options)
 {
-    auto* clientBase = VerifyDynamicCast<NApi::NRpcProxy::TClientBase*>(Client_.Get());
+    auto* clientBase = VerifyDynamicCast<NApi::NRpcProxy::TClientBase*>(Clients_.Heavy.Get());
 
     auto apiOptions = SerializeOptionsForWriteTable(transactionId, options);
 
@@ -1219,89 +1248,35 @@ std::unique_ptr<IOutputStream> TRpcRawClient::WriteTable(
 std::unique_ptr<IInputStream> TRpcRawClient::ReadTable(
     const TTransactionId& transactionId,
     const TRichYPath& path,
-    const TMaybe<TFormat>& format,
+    const TFormat& format,
     const TTableReaderOptions& options)
 {
-    auto* clientBase = VerifyDynamicCast<NApi::NRpcProxy::TClientBase*>(Client_.Get());
-
+    auto apiPath = ToApiRichPath(path);
+    auto apiFormat = NYson::TYsonString(NodeToYsonString(format.Config, NYson::EYsonFormat::Text));
     auto apiOptions = SerializeOptionsForReadTable(transactionId, options);
 
-    auto proxy = clientBase->CreateApiServiceProxy();
+    auto future = Clients_.Heavy->CreateFormattedTableReader(apiPath, apiFormat, apiOptions);
 
-    auto req = proxy.ReadTable();
-    clientBase->InitStreamingRequest(*req);
-    req->ClientAttachmentsStreamingParameters().ReadTimeout = TableReaderTimeout;
-    req->ClientAttachmentsStreamingParameters().WriteTimeout = TableReaderTimeout;
+    auto formatStream = WaitAndProcess(future);
 
-    ToProto(req->mutable_path(), ToApiRichPath(path));
-
-    req->set_unordered(apiOptions.Unordered);
-    req->set_omit_inaccessible_columns(apiOptions.OmitInaccessibleColumns);
-    req->set_enable_table_index(apiOptions.EnableTableIndex);
-    req->set_enable_row_index(apiOptions.EnableRowIndex);
-    req->set_enable_range_index(apiOptions.EnableRangeIndex);
-    req->set_enable_any_unpacking(apiOptions.EnableAnyUnpacking);
-
-    if (apiOptions.Config) {
-        req->set_config(NYson::ConvertToYsonString(*apiOptions.Config).ToString());
-    }
-
-    if (format) {
-        req->set_desired_rowset_format(NApi::NRpcProxy::NProto::RF_FORMAT);
-        req->set_format(NYson::TYsonString(NodeToYsonString(format->Config, NYson::EYsonFormat::Text)).ToString());
-    }
-
-    ToProto(req->mutable_transactional_options(), apiOptions);
-    ToProto(req->mutable_suppressable_access_tracking_options(), apiOptions);
-
-    auto future = NRpc::CreateRpcClientInputStream(std::move(req));
-    auto stream = WaitAndProcess(future);
-
-    auto metaRef = WaitAndProcess(stream->Read());
-
-    NApi::NRpcProxy::NProto::TRspReadTableMeta meta;
-    if (!TryDeserializeProto(&meta, metaRef)) {
-        THROW_ERROR_EXCEPTION("Failed to deserialize table reader meta information");
-    }
-
-    auto rowStream = New<TDeserializingRowStream>(std::move(stream));
-    auto syncAdapter = CreateSyncAdapter(CreateCopyingAdapter(std::move(rowStream)));
+    auto syncAdapter = CreateSyncAdapter(CreateCopyingAdapter(std::move(formatStream)));
     return std::make_unique<TSyncRpcInputStream>(std::move(syncAdapter));
 }
 
 std::unique_ptr<IInputStream> TRpcRawClient::ReadTablePartition(
     const TString& cookie,
-    const TMaybe<TFormat>& format,
+    const TFormat& format,
     const TTablePartitionReaderOptions& options)
 {
-    auto* clientBase = VerifyDynamicCast<NApi::NRpcProxy::TClientBase*>(Client_.Get());
-
-    auto proxy = clientBase->CreateApiServiceProxy();
-
-    auto req = proxy.ReadTablePartition();
-    clientBase->InitStreamingRequest(*req);
-
-    req->set_cookie(cookie);
-
+    auto apiCookie = NYTree::ConvertTo<NApi::TTablePartitionCookiePtr>(NYson::TYsonString(cookie));
+    auto apiFormat = NYson::TYsonString(NodeToYsonString(format.Config, NYson::EYsonFormat::Text));
     auto apiOptions = SerializeOptionsForReadTablePartition(options);
 
-    if (format) {
-        req->set_desired_rowset_format(NApi::NRpcProxy::NProto::RF_FORMAT);
-        req->set_format(NYson::TYsonString(NodeToYsonString(format->Config, NYson::EYsonFormat::Text)).ToString());
-    }
+    auto future = Clients_.Heavy->CreateFormattedTablePartitionReader(apiCookie, apiFormat, apiOptions);
 
-    auto future = NRpc::CreateRpcClientInputStream(std::move(req));
-    auto stream = WaitAndProcess(future);
+    auto formatStream = WaitAndProcess(future);
 
-    auto metaRef = WaitAndProcess(stream->Read());
-
-    NApi::NRpcProxy::NProto::TRspReadTablePartitionMeta meta;
-    if (!TryDeserializeProto(&meta, metaRef)) {
-        THROW_ERROR_EXCEPTION("Failed to deserialize table reader meta information");
-    }
-
-    auto rowStream = New<TDeserializingRowStream>(std::move(stream));
-    auto syncAdapter = CreateSyncAdapter(CreateCopyingAdapter(std::move(rowStream)));
+    auto syncAdapter = CreateSyncAdapter(CreateCopyingAdapter(std::move(formatStream)));
     return std::make_unique<TSyncRpcInputStream>(std::move(syncAdapter));
 }
 
@@ -1319,8 +1294,7 @@ std::unique_ptr<IInputStream> TRpcRawClient::ReadBlobTable(
     lowerLimitKeyNode.Add(lowerKeyNode);
 
     NTableClient::TOwningKeyBound lowerKeyBound;
-    Deserialize(lowerKeyBound, NYTree::ConvertToNode(NYson::TYsonString(
-        NodeToYsonString(lowerLimitKeyNode, NYson::EYsonFormat::Binary))));
+    Deserialize(lowerKeyBound, ToApiNode(lowerLimitKeyNode));
 
     auto upperKeyNode = TNode::CreateList(key.Parts_);
     upperKeyNode.Add(std::numeric_limits<i64>::max());
@@ -1330,8 +1304,7 @@ std::unique_ptr<IInputStream> TRpcRawClient::ReadBlobTable(
     upperLimitKeyNode.Add(upperKeyNode);
 
     NTableClient::TOwningKeyBound upperKeyBound;
-    Deserialize(upperKeyBound, NYTree::ConvertToNode(NYson::TYsonString(
-        NodeToYsonString(upperLimitKeyNode, NYson::EYsonFormat::Binary))));
+    Deserialize(upperKeyBound, ToApiNode(upperLimitKeyNode));
 
     auto richPath = ToApiRichPath(path);
     richPath.SetRanges({
@@ -1339,7 +1312,7 @@ std::unique_ptr<IInputStream> TRpcRawClient::ReadBlobTable(
             NChunkClient::TReadLimit{lowerKeyBound},
             NChunkClient::TReadLimit{upperKeyBound}}});
 
-    auto future = Client_->CreateTableReader(richPath, SerializeOptionsForReadTable(transactionId));
+    auto future = Clients_.Heavy->CreateTableReader(richPath, SerializeOptionsForReadTable(transactionId));
     auto reader = WaitAndProcess(future);
 
     std::optional<std::string> partIndexColumnName;
@@ -1367,7 +1340,7 @@ void TRpcRawClient::AlterTableReplica(
     const TReplicaId& replicaId,
     const TAlterTableReplicaOptions& options)
 {
-    auto future = Client_->AlterTableReplica(
+    auto future = Clients_.Light->AlterTableReplica(
         YtGuidFromUtilGuid(replicaId),
         SerializeOptionsForAlterTableReplica(mutationId, options));
     WaitAndProcess(future);
@@ -1386,7 +1359,7 @@ void TRpcRawClient::FreezeTable(
     const TFreezeTableOptions& options)
 {
     auto newPath = AddPathPrefix(path, Config_->Prefix);
-    auto future = Client_->FreezeTable(newPath, SerializeOptionsForFreezeTable(options));
+    auto future = Clients_.Light->FreezeTable(newPath, SerializeOptionsForFreezeTable(options));
     WaitAndProcess(future);
 }
 
@@ -1395,7 +1368,7 @@ void TRpcRawClient::UnfreezeTable(
     const TUnfreezeTableOptions& options)
 {
     auto newPath = AddPathPrefix(path, Config_->Prefix);
-    auto future = Client_->UnfreezeTable(newPath, SerializeOptionsForUnfreezeTable(options));
+    auto future = Clients_.Light->UnfreezeTable(newPath, SerializeOptionsForUnfreezeTable(options));
     WaitAndProcess(future);
 }
 
@@ -1426,6 +1399,283 @@ TCheckPermissionResponse ParseCheckPermissionResponse(const NApi::TCheckPermissi
     return result;
 }
 
+TDistributedWriteTableSessionWithCookies TRpcRawClient::StartDistributedWriteTableSession(
+    TMutationId& mutationId,
+    const TTransactionId& transactionId,
+    const TRichYPath& richPath,
+    i64 cookieCount,
+    const TStartDistributedWriteTableOptions& options)
+{
+    auto future = Clients_.Light->StartDistributedWriteSession(
+        ToApiRichPath(richPath),
+        SerializeOptionsForStartDistributedTableSession(mutationId, transactionId, cookieCount, options));
+
+    auto apiSession = WaitAndProcess(future);
+
+    TNode session;
+    TNodeBuilder builder(&session);
+    NYTree::Serialize(apiSession.Session, &builder);
+
+    TVector<TDistributedWriteTableCookie> cookies;
+    cookies.reserve(apiSession.Cookies.size());
+    for (const auto& cookie : apiSession.Cookies) {
+        TNode cookieNode;
+        TNodeBuilder cookieNodeBuilder(&cookieNode);
+        NYTree::Serialize(cookie, &cookieNodeBuilder);
+        cookies.push_back(TDistributedWriteTableCookie(std::move(cookieNode)));
+    }
+
+    TDistributedWriteTableSessionWithCookies result;
+    result.Session(TDistributedWriteTableSession(std::move(session)));
+    result.Cookies(std::move(cookies));
+    return result;
+}
+
+void TRpcRawClient::PingDistributedWriteTableSession(
+    const TDistributedWriteTableSession& session,
+    const TPingDistributedWriteTableOptions& /*options*/)
+{
+    auto apiSession = NYTree::ConvertTo<NApi::TSignedDistributedWriteSessionPtr>(ToApiNode(session.Underlying()));
+
+    auto future = Clients_.Light->PingDistributedWriteSession(apiSession);
+    WaitAndProcess(future);
+}
+
+void TRpcRawClient::FinishDistributedWriteTableSession(
+    TMutationId& mutationId,
+    const TDistributedWriteTableSession& session,
+    const TVector<TWriteTableFragmentResult>& results,
+    const TFinishDistributedWriteTableOptions& options)
+{
+    auto apiSession = NYTree::ConvertTo<NApi::TSignedDistributedWriteSessionPtr>(ToApiNode(session.Underlying()));
+
+    std::vector<NApi::TSignedWriteFragmentResultPtr> apiResults;
+    apiResults.reserve(results.size());
+
+    for (const auto& writeFragment : results) {
+        apiResults.push_back(NYTree::ConvertTo<NApi::TSignedWriteFragmentResultPtr>(ToApiNode(writeFragment.Underlying())));
+    }
+
+    NApi::TDistributedWriteSessionWithResults sessionWithResults;
+    sessionWithResults.Session = std::move(apiSession);
+    sessionWithResults.Results = std::move(apiResults);
+
+    auto future = Clients_.Light->FinishDistributedWriteSession(
+        sessionWithResults,
+        SerializeOptionsForFinishDistributedTableSession(mutationId, options));
+
+    WaitAndProcess(future);
+}
+
+class TTableFragmentStreamWithResponse
+    : public IOutputStreamWithResponse
+{
+    using TPromise = TPromise<NApi::TSignedWriteFragmentResultPtr>;
+
+public:
+    TTableFragmentStreamWithResponse(std::unique_ptr<IOutputStream> underlying, TPromise promise)
+        : Underlying_(std::move(underlying))
+        , ResponsePromise_(std::move(promise))
+    { }
+
+    TString GetResponse() const override
+    {
+        if (!ResponsePromise_.IsSet()) {
+            ythrow TApiUsageError() << "Can't get response before stream is closed.";
+        }
+        return Response_;
+    }
+
+private:
+    const std::unique_ptr<IOutputStream> Underlying_;
+    TPromise ResponsePromise_;
+    TString Response_;
+
+    void DoWrite(const void* buf, size_t len) override
+    {
+        Underlying_->Write(buf, len);
+    }
+
+    void DoFinish() override
+    {
+        Underlying_->Finish();
+        Response_ = ParseResponse();
+    }
+
+    TString ParseResponse() const
+    {
+        auto rsp = ResponsePromise_.BlockingGet().ValueOrThrow();
+        TNode writeResult;
+        TNodeBuilder builder(&writeResult);
+        NYTree::Serialize(rsp, &builder);
+        return NodeToYsonString(writeResult, NYson::EYsonFormat::Binary);
+    }
+};
+
+std::unique_ptr<IOutputStreamWithResponse> TRpcRawClient::WriteTableFragment(
+    const TDistributedWriteTableCookie& cookie,
+    const TMaybe<TFormat>& format,
+    const TTableFragmentWriterOptions& /*options*/)
+{
+    using TRspPtr = TIntrusivePtr<NRpc::TTypedClientResponse<NApi::NRpcProxy::NProto::TRspWriteTableFragment>>;
+
+    auto* clientBase = VerifyDynamicCast<NApi::NRpcProxy::TClientBase*>(Clients_.Heavy.Get());
+
+    auto proxy = clientBase->CreateApiServiceProxy();
+
+    auto req = proxy.WriteTableFragment();
+    clientBase->InitStreamingRequest(*req);
+
+    req->set_signed_cookie(NYson::TYsonString(NodeToYsonString(cookie.Underlying(), NYson::EYsonFormat::Text)).ToString());
+
+    if (format) {
+        req->set_format(NYson::TYsonString(NodeToYsonString(format->Config, NYson::EYsonFormat::Text)).ToString());
+    }
+
+    auto promise = NewPromise<NApi::TSignedWriteFragmentResultPtr>();
+
+    auto future = CreateRpcClientOutputStream(
+        std::move(req),
+        BIND ([=] (const TSharedRef& metaRef) {
+            NApi::NRpcProxy::NProto::TWriteTableMeta meta;
+            if (!TryDeserializeProto(&meta, metaRef)) {
+                THROW_ERROR_EXCEPTION("Failed to deserialize schema for table fragment writer");
+            }
+        }),
+        BIND([=] (TRspPtr&& rsp)  {
+            promise.Set(ConvertTo<NApi::TSignedWriteFragmentResultPtr>(NYson::TYsonString(rsp->signed_write_result())));
+        }));
+
+    auto stream = WaitAndProcess(future);
+
+    auto rowStream = New<TSerializingRowStream>(std::move(stream));
+    auto syncStream = std::make_unique<TSyncRpcOutputStream>(std::move(rowStream));
+
+    return std::make_unique<TTableFragmentStreamWithResponse>(std::move(syncStream), std::move(promise));
+}
+
+TDistributedWriteFileSessionWithCookies TRpcRawClient::StartDistributedWriteFileSession(
+    TMutationId& mutationId,
+    const TTransactionId& transactionId,
+    const TRichYPath& richPath,
+    i64 cookieCount,
+    const TStartDistributedWriteFileOptions& options)
+{
+    auto future = Clients_.Light->StartDistributedWriteFileSession(
+        ToApiRichPath(richPath),
+        SerializeOptionsForStartDistributedFileSession(mutationId, transactionId, cookieCount, options));
+
+    auto apiSession = WaitAndProcess(future);
+
+    TNode session;
+    TNodeBuilder builder(&session);
+    NYTree::Serialize(apiSession.Session, &builder);
+
+    TVector<TDistributedWriteFileCookie> cookies;
+    cookies.reserve(apiSession.Cookies.size());
+    for (const auto& cookie : apiSession.Cookies) {
+        TNode cookieNode;
+        TNodeBuilder cookieNodeBuilder(&cookieNode);
+        NYTree::Serialize(cookie, &cookieNodeBuilder);
+        cookies.push_back(TDistributedWriteFileCookie(std::move(cookieNode)));
+    }
+
+    TDistributedWriteFileSessionWithCookies result;
+    result.Session(TDistributedWriteFileSession(std::move(session)));
+    result.Cookies(std::move(cookies));
+    return result;
+}
+
+void TRpcRawClient::PingDistributedWriteFileSession(
+    const TDistributedWriteFileSession& session,
+    const TPingDistributedWriteFileOptions& /*options*/)
+{
+    auto apiSession = NYTree::ConvertTo<NApi::TSignedDistributedWriteFileSessionPtr>(ToApiNode(session.Underlying()));
+
+    auto future = Clients_.Light->PingDistributedWriteFileSession(apiSession);
+    WaitAndProcess(future);
+}
+
+void TRpcRawClient::FinishDistributedWriteFileSession(
+    TMutationId& mutationId,
+    const TDistributedWriteFileSession& session,
+    const TVector<TWriteFileFragmentResult>& results,
+    const TFinishDistributedWriteFileOptions& options)
+{
+    auto apiSession = NYTree::ConvertTo<NApi::TSignedDistributedWriteFileSessionPtr>(ToApiNode(session.Underlying()));
+
+    std::vector<NApi::TSignedWriteFileFragmentResultPtr> apiResults;
+    apiResults.reserve(results.size());
+
+    for (const auto& writeFragment : results) {
+        apiResults.push_back(NYTree::ConvertTo<NApi::TSignedWriteFileFragmentResultPtr>(ToApiNode(writeFragment.Underlying())));
+    }
+
+    NApi::TDistributedWriteFileSessionWithResults sessionWithResults;
+    sessionWithResults.Session = std::move(apiSession);
+    sessionWithResults.Results = std::move(apiResults);
+
+    auto future = Clients_.Light->FinishDistributedWriteFileSession(
+        sessionWithResults,
+        SerializeOptionsForFinishDistributedFileSession(mutationId, options));
+
+    WaitAndProcess(future);
+}
+
+class TFileFragmentStreamWithResponse
+    : public IOutputStreamWithResponse
+{
+public:
+    explicit TFileFragmentStreamWithResponse(NApi::IFileFragmentWriterPtr fileWriter)
+        : Underlying_(std::move(fileWriter))
+    {
+        WaitAndProcess(Underlying_->Open());
+    }
+
+    TString GetResponse() const override
+    {
+        if (!Response_) {
+            ythrow TApiUsageError() << "Can't get response before stream is closed.";
+        }
+        return *Response_;
+    }
+
+private:
+    NApi::IFileFragmentWriterPtr Underlying_;
+    TMaybe<TString> Response_;
+
+    void DoWrite(const void* buf, size_t len) override
+    {
+        WriteInChunks(buf, len, [this] (const TSharedRef& ref) {
+            return Underlying_->Write(ref);
+        });
+    }
+
+    void DoFinish() override
+    {
+        WaitAndProcess(Underlying_->Close());
+        Response_ = ParseResponse();
+    }
+
+    TString ParseResponse() const
+    {
+        TNode writeResult;
+        TNodeBuilder builder(&writeResult);
+        NYTree::Serialize(Underlying_->GetWriteFragmentResult(), &builder);
+        return NodeToYsonString(writeResult, NYson::EYsonFormat::Binary);
+    }
+};
+
+std::unique_ptr<IOutputStreamWithResponse> TRpcRawClient::WriteFileFragment(
+    const TDistributedWriteFileCookie& cookie,
+    const TFileFragmentWriterOptions& /*options*/)
+{
+    auto apiCookie = NYTree::ConvertTo<NApi::TSignedWriteFileFragmentCookiePtr>(ToApiNode(cookie.Underlying()));
+    auto fileWriter = Clients_.Heavy->CreateFileFragmentWriter(apiCookie);
+
+    return std::make_unique<TFileFragmentStreamWithResponse>(std::move(fileWriter));
+}
+
 TCheckPermissionResponse TRpcRawClient::CheckPermission(
     const TString& user,
     EPermission permission,
@@ -1433,7 +1683,7 @@ TCheckPermissionResponse TRpcRawClient::CheckPermission(
     const TCheckPermissionOptions& options)
 {
     auto newPath = AddPathPrefix(path, Config_->Prefix);
-    auto future = Client_->CheckPermission(user, newPath, ToApiPermission(permission), SerializeOptionsForCheckPermission(options));
+    auto future = Clients_.Light->CheckPermission(user, newPath, ToApiPermission(permission), SerializeOptionsForCheckPermission(options));
     auto result = WaitAndProcess(future);
     return ParseCheckPermissionResponse(result);
 }
@@ -1444,7 +1694,7 @@ TVector<TTabletInfo> TRpcRawClient::GetTabletInfos(
     const TGetTabletInfosOptions& /*options*/)
 {
     auto newPath = AddPathPrefix(path, Config_->Prefix);
-    auto future = Client_->GetTabletInfos(newPath, tabletIndexes);
+    auto future = Clients_.Light->GetTabletInfos(newPath, tabletIndexes);
     auto tabletInfos = WaitAndProcess(future);
 
     TVector<TTabletInfo> result;
@@ -1467,7 +1717,7 @@ TVector<TTableColumnarStatistics> TRpcRawClient::GetTableColumnarStatistics(
     std::vector<NYPath::TRichYPath> newPaths(paths.size());
     std::transform(paths.begin(), paths.end(), newPaths.begin(), ToApiRichPath);
 
-    auto future = Client_->GetColumnarStatistics(newPaths, SerializeOptionsForGetTableColumnarStatistics(transactionId, options));
+    auto future = Clients_.Light->GetColumnarStatistics(newPaths, SerializeOptionsForGetTableColumnarStatistics(transactionId, options));
     auto tableColumnarStatistics = WaitAndProcess(future);
 
     YT_VERIFY(newPaths.size() == tableColumnarStatistics.size());
@@ -1507,7 +1757,7 @@ TMultiTablePartitions TRpcRawClient::GetTablePartitions(
     std::vector<NYPath::TRichYPath> newPaths(paths.size());
     std::transform(paths.begin(), paths.end(), newPaths.begin(), ToApiRichPath);
 
-    auto future = Client_->PartitionTables(newPaths, SerializeOptionsForGetTablePartitions(transactionId, options));
+    auto future = Clients_.Light->PartitionTables(newPaths, SerializeOptionsForGetTablePartitions(transactionId, options));
     auto multiTablePartitions = WaitAndProcess(future);
 
     TMultiTablePartitions result;
@@ -1534,6 +1784,10 @@ TMultiTablePartitions TRpcRawClient::GetTablePartitions(
             .RowCount = statistics.RowCount,
         };
 
+        if (entry.Cookie) {
+            partition.Cookie = NYson::ConvertToYsonString(entry.Cookie).ToString();
+        }
+
         result.Partitions.emplace_back(std::move(partition));
     }
     return result;
@@ -1541,7 +1795,7 @@ TMultiTablePartitions TRpcRawClient::GetTablePartitions(
 
 ui64 TRpcRawClient::GenerateTimestamp()
 {
-    auto future = Client_->GetTimestampProvider()->GenerateTimestamps();
+    auto future = Clients_.Light->GetTimestampProvider()->GenerateTimestamps();
     auto result = WaitAndProcess(future);
     return result;
 }
@@ -1553,12 +1807,12 @@ IRawBatchRequestPtr TRpcRawClient::CreateRawBatchRequest()
 
 IRawClientPtr TRpcRawClient::Clone()
 {
-    return ::MakeIntrusive<TRpcRawClient>(Client_, Config_);
+    return ::MakeIntrusive<TRpcRawClient>(Clients_, Config_);
 }
 
 IRawClientPtr TRpcRawClient::Clone(const TClientContext& context)
 {
-    return ::MakeIntrusive<TRpcRawClient>(CreateApiClient(context), context.Config);
+    return ::MakeIntrusive<TRpcRawClient>(CreateApiClients(context), context.Config);
 }
 
 ////////////////////////////////////////////////////////////////////////////////

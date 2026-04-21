@@ -1,6 +1,8 @@
 #pragma once
 #include "portion_info.h"
 
+#include <ydb/core/formats/arrow/accessor/common/additional_data.h>
+#include <ydb/core/formats/arrow/accessor/common/chunk_data.h>
 #include <ydb/core/formats/arrow/accessor/composite_serial/accessor.h>
 
 #include <ydb/library/accessor/accessor.h>
@@ -21,6 +23,7 @@ private:
     ui32 DefaultRowsCount = 0;
     std::shared_ptr<arrow::Scalar> DefaultValue;
     TString Data;
+    std::shared_ptr<NArrow::NAccessor::IAdditionalAccessorData> AdditionalAccessorData;
 
 public:
     ui32 GetExpectedRowsCountVerified() const {
@@ -34,6 +37,13 @@ public:
         if (!Data) {
             AFL_VERIFY(*ExpectedRowsCount == DefaultRowsCount);
         }
+    }
+
+    void SetAdditionalAccessorData(std::shared_ptr<NArrow::NAccessor::IAdditionalAccessorData> value) {
+        AdditionalAccessorData = std::move(value);
+    }
+    const std::shared_ptr<NArrow::NAccessor::IAdditionalAccessorData>& GetAdditionalAccessorData() const {
+        return AdditionalAccessorData;
     }
 
     TAssembleBlobInfo(const ui32 rowsCount, const std::shared_ptr<arrow::Scalar>& defValue)
@@ -211,6 +221,7 @@ private:
     TPortionInfo::TConstPtr PortionInfo;
     std::optional<std::vector<TColumnRecord>> Records;
     std::optional<std::vector<TIndexChunk>> Indexes;
+    std::optional<std::vector<ui32>> SliceBorderOffsets;
 
     template <class TChunkInfo>
     static void CheckChunksOrder(const std::vector<TChunkInfo>& chunks) {
@@ -457,6 +468,8 @@ public:
     ui64 GetColumnRawBytes(const std::set<ui32>& entityIds, const bool validation = true) const;
     ui64 GetColumnBlobBytes(const std::set<ui32>& entityIds, const bool validation = true) const;
     ui64 GetIndexRawBytes(const std::set<ui32>& entityIds, const bool validation = true) const;
+    ui64 GetIndexBlobBytes(const std::set<ui32>& entityIds, const bool validation = true) const;
+    ui64 GetIndexBlobBytes(const bool validation = true) const;
     ui64 GetIndexRawBytes(const bool validation = true) const;
 
     void FillBlobRangesByStorage(
@@ -560,6 +573,12 @@ public:
     };
 
     std::vector<TReadPage> BuildReadPages(const ui64 memoryLimit, const std::set<ui32>& entityIds) const;
+
+    ui32 GetSliceOffsetRows(const ui32 sliceBorderIdx) const {
+        AFL_VERIFY(SliceBorderOffsets);
+        AFL_VERIFY(sliceBorderIdx < SliceBorderOffsets->size())("idx", sliceBorderIdx)("size", SliceBorderOffsets->size());
+        return (*SliceBorderOffsets)[sliceBorderIdx];
+    }
 };
 
 }   // namespace NKikimr::NOlap

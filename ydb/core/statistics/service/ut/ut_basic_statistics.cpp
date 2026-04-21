@@ -322,7 +322,7 @@ Y_UNIT_TEST_SUITE(BasicStatistics) {
         TTestEnv env(1, 1);
 
         CreateDatabase(env, "Database");
-        CreateUniformTable(env, "Database", "Table");
+        PrepareUniformTable(env, "Database", "Table");
 
         TestNotFullStatistics(env, /*shardCount=*/ 4, /*expectedRowCount=*/ 4);
     }
@@ -331,7 +331,7 @@ Y_UNIT_TEST_SUITE(BasicStatistics) {
         TTestEnv env(1, 1);
 
         CreateDatabase(env, "Database");
-        CreateColumnStoreTable(env, "Database", "Table", 4);
+        PrepareColumnTable(env, "Database", "Table", 4);
 
         TestNotFullStatistics(env, /*shardCount=*/ 4, /*expectedRowCount=*/ ColumnTableRowsNumber);
     }
@@ -354,7 +354,7 @@ Y_UNIT_TEST_SUITE(BasicStatistics) {
         ui64 saTabletId = 0;
 
         CreateDatabase(env, dbName);
-        CreateColumnStoreTable(env, dbName, table1, 4);
+        PrepareColumnTable(env, dbName, table1, 4);
         auto pathId1 = ResolvePathId(runtime, path1, nullptr, &saTabletId);
 
         ui64 ssTabletId = pathId1.OwnerId;
@@ -374,7 +374,7 @@ Y_UNIT_TEST_SUITE(BasicStatistics) {
             RebootTablet(runtime, id, sender);
         }
 
-        CreateColumnStoreTable(env, dbName, table2, 4);
+        PrepareColumnTable(env, dbName, table2, 4);
         auto pathId2 = ResolvePathId(runtime, path2, nullptr, &saTabletId);
 
         runtime.SimulateSleep(TDuration::Seconds(100));
@@ -385,7 +385,7 @@ Y_UNIT_TEST_SUITE(BasicStatistics) {
 
         RebootTablet(runtime, ssTabletId, runtime.AllocateEdgeActor());
 
-        CreateColumnStoreTable(env, dbName, table3, 4);
+        PrepareColumnTable(env, dbName, table3, 4);
         auto pathId3 = ResolvePathId(runtime, path3, nullptr, &saTabletId);
 
         runtime.SimulateSleep(TDuration::Seconds(140));
@@ -566,6 +566,27 @@ Y_UNIT_TEST_SUITE(BasicStatistics) {
         // After everything is healed, stats should get updated.
         blockSSUpdates.Stop();
         WaitForRowCount(runtime, otherNodeIdx, pathId, rowCount2);
+    }
+
+    Y_UNIT_TEST(TableSummary) {
+        TTestEnv env(1, 1);
+        auto& runtime = *env.GetServer().GetRuntime();
+        const size_t rowCount = 5;
+
+        CreateDatabase(env, "Database");
+        CreateTable(env, "Database", "Table", rowCount);
+
+        ui64 saTabletId = 0;
+        auto pathId = ResolvePathId(runtime, "/Root/Database/Table", nullptr, &saTabletId);
+        Analyze(runtime, saTabletId, {pathId});
+
+        auto responses = GetStatistics(runtime, pathId, EStatType::TABLE_SUMMARY, {std::nullopt});
+        UNIT_ASSERT_VALUES_EQUAL(responses.size(), 1);
+
+        const auto& resp = responses.at(0);
+        UNIT_ASSERT(resp.Success);
+        UNIT_ASSERT(resp.TableSummary.Data);
+        UNIT_ASSERT_VALUES_EQUAL(resp.TableSummary.Data->GetRowCount(), rowCount);
     }
 }
 

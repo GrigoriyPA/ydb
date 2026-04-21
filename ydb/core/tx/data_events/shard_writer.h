@@ -187,11 +187,10 @@ private:
     const std::optional<TDuration> Timeout;
     const bool RetryBySubscription;
     ui64 LastOverloadSeqNo = 0;
+    NACLib::TUserContext::TPtr UserCtx;
 
     void SendWriteRequest();
-    static TDuration OverloadTimeout() {
-        return TDuration::MilliSeconds(OverloadedDelayMs);
-    }
+    static TDuration OverloadTimeout() noexcept;
     void SendToTablet(THolder<IEventBase> event) {
         Send(LeaderPipeCache, new TEvPipeCache::TEvForward(event.Release(), ShardId, true), IEventHandle::FlagTrackDelivery, 0,
             ActorSpan.GetTraceId());
@@ -200,7 +199,8 @@ private:
 public:
     TShardWriter(const ui64 shardId, const ui64 tableId, const ui64 schemaVersion, const TString& dedupId, const IShardInfo::TPtr& data,
         const NWilson::TProfileSpan& parentSpan, TWritersController::TPtr externalController, const ui32 writePartIdx,
-        const std::optional<TDuration> timeout = std::nullopt);
+        const std::optional<TDuration> timeout = std::nullopt,
+        NACLib::TUserContext::TPtr userCtx = nullptr);
 
     STFUNC(StateMain) {
         switch (ev->GetTypeRewrite()) {
@@ -224,5 +224,6 @@ protected:
 private:
     bool RetryWriteRequest(const bool delayed = true);
     bool IsMaxRetriesReached() const;
+    ui32 GetMaxRetriesPerShard() const;
 };
 }   // namespace NKikimr::NEvWrite

@@ -3,6 +3,7 @@
 #include <ydb/core/testlib/test_client.h>
 #include <ydb/core/kqp/federated_query/kqp_federated_query_helpers.h>
 #include <ydb/core/tx/scheme_cache/scheme_cache.h>
+#include <ydb/library/testlib/common/test_utils.h>
 #include <ydb/library/yql/providers/s3/actors_factory/yql_s3_actors_factory.h>
 #include <yql/essentials/core/issue/yql_issue.h>
 #include <ydb/public/lib/yson_value/ydb_yson_value.h>
@@ -38,15 +39,7 @@ const TString KikimrDefaultUtDomainRoot = "Root";
 
 extern const TString EXPECTED_EIGHTSHARD_VALUE1;
 
-TVector<NKikimrKqp::TKqpSetting> SyntaxV1Settings();
-
-struct TTestLogSettings {
-    NLog::EPriority DefaultLogPriority = NLog::PRI_WARN;
-    std::unordered_map<NKikimrServices::EServiceKikimr, NLog::EPriority> LogPriorities;
-    bool Freeze = false;
-
-    TTestLogSettings& AddLogPriority(NKikimrServices::EServiceKikimr service, NLog::EPriority priority);
-};
+using TTestLogSettings = NTestUtils::TTestLogSettings;
 
 struct TKikimrSettings: public TTestFeatureFlagsHolder<TKikimrSettings> {
 private:
@@ -59,7 +52,7 @@ private:
         FeatureFlags.SetEnableSparsedColumns(true);
         FeatureFlags.SetEnableWritePortionsOnInsert(true);
         FeatureFlags.SetEnableParameterizedDecimal(true);
-        FeatureFlags.SetEnableTopicAutopartitioningForCDC(true);
+        FeatureFlags.SetEnableTopicMessageLevelParallelism(true);
         FeatureFlags.SetEnableFollowerStats(true);
         FeatureFlags.SetEnableColumnStore(true);
 
@@ -95,8 +88,10 @@ public:
     NKikimrConfig::TImmediateControlsConfig Controls;
     TMaybe<NYdbGrpc::TServerOptions> GrpcServerOptions;
     bool EnableStorageProxy = false;
+    bool UseLocalCheckpointsInStreamingQueries = false;
     TDuration CheckpointPeriod = TDuration::MilliSeconds(200);
     std::optional<TTestLogSettings> LogSettings;
+    bool Verbose = false;
 
     TKikimrSettings() {
         InitDefaultConfig();
@@ -136,8 +131,10 @@ public:
     }
     TKikimrSettings& SetGrpcServerOptions(const NYdbGrpc::TServerOptions& grpcServerOptions) { GrpcServerOptions = grpcServerOptions; return *this; };
     TKikimrSettings& SetEnableStorageProxy(bool value) { EnableStorageProxy = value; return *this; };
+    TKikimrSettings& SetUseLocalCheckpointsInStreamingQueries(bool value) { UseLocalCheckpointsInStreamingQueries = value; return *this; };
     TKikimrSettings& SetCheckpointPeriod(TDuration value) { CheckpointPeriod = value; return *this; };
     TKikimrSettings& SetLogSettings(TTestLogSettings value) { LogSettings = value; return *this; };
+    TKikimrSettings& SetVerbose(bool value) { Verbose = value; return *this; };
 };
 
 class TKikimrRunner {
@@ -164,15 +161,40 @@ public:
     ~TKikimrRunner() {
         Server->GetRuntime()->SetObserverFunc(TTestActorRuntime::DefaultObserverFunc);
 
-        RunCall([&] { Driver->Stop(true); return false; });
+        // Stop the driver to close all client-side gRPC connections
+        RunCall([&] { Driver->Stop(true); Driver.Reset(); return false; });
+
+        // In single-threaded mode (UseRealThreads=false), actor system events
+        // need explicit dispatching. After Driver->Stop(), there may be pending
+        // server-side session cleanup events in the actor system mailbox.
+        // Dispatch them so gRPC server doesn't see stale in-progress requests
+        // during shutdown (which would cause it to wait and leak memory).
+        // In real-threads mode, the actor system threads handle this automatically.
+        if (!Server->GetRuntime()->IsRealThreads()) {
+            auto savedTimeout = Server->GetRuntime()->SetDispatchTimeout(TDuration::MilliSeconds(500));
+            try {
+                TDispatchOptions opts;
+                Server->GetRuntime()->DispatchEvents(opts, TDuration::MilliSeconds(500));
+            } catch (const TEmptyEventQueueException&) {
+                // Timeout is expected when there are no more events to dispatch
+            }
+            Server->GetRuntime()->SetDispatchTimeout(savedTimeout);
+        }
+
         if (ThreadPoolStarted_) {
             ThreadPool.Stop();
         }
+
+        // Shutdown gRPC servers to stop accepting new connections
+        // This prevents memory leaks from connections being established during shutdown
+        Server->ShutdownGRpc();
 
         if (!WaitHttpGatewayFinalization(CountersRoot)) {
             Cerr << "Failed to finalize http gateway before destruction" << Endl;
         }
 
+        // Server.Reset() will call ShutdownGRpc() again in TServer destructor,
+        // but it's safe to call multiple times as Shutdown() is idempotent
         Server.Reset();
         Client.Reset();
     }
@@ -220,7 +242,6 @@ private:
     void Initialize(const TKikimrSettings& settings);
     void WaitForKqpProxyInit();
     void CreateSampleTables();
-    bool SetupLogLevelFromTestParam(NKikimrServices::EServiceKikimr service);
 
 private:
     THolder<Tests::TServerSettings> ServerSettings;
@@ -262,7 +283,9 @@ enum class EIndexTypeSql {
     GlobalSync,
     GlobalAsync,
     GlobalVectorKMeansTree,
-    GlobalFulltext
+    GlobalFulltextPlain,
+    GlobalFulltextRelevance,
+    GlobalJson
 };
 
 inline constexpr TStringBuf IndexTypeSqlString(EIndexTypeSql type) {
@@ -274,7 +297,9 @@ inline constexpr TStringBuf IndexTypeSqlString(EIndexTypeSql type) {
     case EIndexTypeSql::GlobalAsync:
         return "GLOBAL ASYNC";
     case NKqp::EIndexTypeSql::GlobalVectorKMeansTree:
-    case NKqp::EIndexTypeSql::GlobalFulltext:
+    case NKqp::EIndexTypeSql::GlobalFulltextPlain:
+    case NKqp::EIndexTypeSql::GlobalFulltextRelevance:
+    case NKqp::EIndexTypeSql::GlobalJson:
         return "GLOBAL";
     }
 }
@@ -288,13 +313,19 @@ inline NYdb::NTable::EIndexType IndexTypeSqlToIndexType(EIndexTypeSql type) {
         return NYdb::NTable::EIndexType::GlobalAsync;
     case EIndexTypeSql::GlobalVectorKMeansTree:
         return NYdb::NTable::EIndexType::GlobalVectorKMeansTree;
-    case EIndexTypeSql::GlobalFulltext:
-        Y_ABORT("Fulltext index isn't supported by sdk");
+    case EIndexTypeSql::GlobalFulltextPlain:
+        return NYdb::NTable::EIndexType::GlobalFulltextPlain;
+    case EIndexTypeSql::GlobalFulltextRelevance:
+        return NYdb::NTable::EIndexType::GlobalFulltextRelevance;
+    case EIndexTypeSql::GlobalJson:
+        return NYdb::NTable::EIndexType::GlobalJson;
     }
 }
 
 TString ReformatYson(const TString& yson);
+TString SortYsonList(const TString& yson);
 void CompareYson(const TString& expected, const TString& actual, const TString& message = {});
+void CompareYsonUnordered(const TString& expected, const TString& actual, const TString& message = {});
 void CompareYson(const TString& expected, const NKikimrMiniKQL::TResult& actual, const TString& message = {});
 
 void CreateLargeTable(TKikimrRunner& kikimr, ui32 rowsPerShard, ui32 keyTextSize,
@@ -338,7 +369,7 @@ inline NYdb::NTable::TDataQueryResult ExecQueryAndTestResult(NYdb::NTable::TSess
     return ExecQueryAndTestResult(session, query, NYdb::TParamsBuilder().Build(), expectedYson);
 }
 
-NYdb::NQuery::TExecuteQueryResult ExecQueryAndTestEmpty(NYdb::NQuery::TSession& session, const TString& query);
+NYdb::NQuery::TExecuteQueryResult ExecQueryAndTestEmpty(NYdb::NQuery::TSession& session, const TString& query, NYdb::NQuery::TTxControl txControl = NYdb::NQuery::TTxControl::NoTx());
 
 class TStreamReadError : public yexception {
 public:
@@ -371,6 +402,8 @@ void CreateSampleTablesWithIndex(NYdb::NTable::TSession& session, bool populateT
 void InitRoot(Tests::TServer::TPtr server, TActorId sender);
 
 void Grant(NYdb::NTable::TSession& adminSession, const char* permissions, const char* path, const char* user);
+
+void Revoke(NYdb::NTable::TSession& adminSession, const char* permissions, const char* path, const char* user);
 
 THolder<NKikimr::NSchemeCache::TSchemeCacheNavigate> Navigate(TTestActorRuntime& runtime, const TActorId& sender,
                                                      const TString& path, NKikimr::NSchemeCache::TSchemeCacheNavigate::EOp op);
@@ -427,6 +460,7 @@ public:
     void CreateDatabase(const TString& databaseName);
     Tests::TServer& GetServer() const;
     Tests::TClient& GetClient() const;
+    const TString& GetEndpoint() const;
 
 private:
     TPortManager PortManager;
@@ -444,6 +478,10 @@ private:
 };
 
 void CheckOwner(NYdb::NTable::TSession& session, const TString& path, const TString& name);
+
+// Waits until the KQP proxy recognizes the subject's connect permission.
+// Useful after GrantConnect to avoid UNAUTHORIZED/UNAVAILABLE races.
+void WaitForProxy(const TKikimrRunner& kikimr, const TString& subject);
 
 } // namespace NKqp
 } // namespace NKikimr

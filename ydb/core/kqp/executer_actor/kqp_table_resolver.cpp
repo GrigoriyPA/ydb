@@ -105,7 +105,7 @@ private:
                         stageMeta.TableKind = ETableKind::Olap;
                     }
 
-                    auto& stage = stageMeta.GetStage(stageId);
+                    const auto& stage = stageMeta.GetStage(stageId);
                     AFL_ENSURE(stage.GetSinks().size() == 1);
                     const auto& sink = stage.GetSinks(0);
 
@@ -325,7 +325,9 @@ private:
     void ResolveKeys() {
         auto requestNavigate = std::make_unique<NSchemeCache::TSchemeCacheNavigate>();
         auto request = MakeHolder<NSchemeCache::TSchemeCacheRequest>();
-        request->DatabaseName = TasksGraph.GetMeta().Database; 
+        const auto& databaseName = TasksGraph.GetMeta().Database;
+        requestNavigate->DatabaseName = databaseName;
+        request->DatabaseName = databaseName;
         request->ResultSet.reserve(TasksGraph.GetStagesInfo().size());
         if (UserToken && !UserToken->GetSerializedToken().empty()) {
             request->UserToken = UserToken;
@@ -349,8 +351,10 @@ private:
         for (auto& pair : TasksGraph.GetStagesInfo()) {
             auto& stageInfo = pair.second;
 
-            if (!stageInfo.Meta.ShardOperations.empty()) {
-                for (const auto& operation : stageInfo.Meta.ShardOperations) {
+            if (!stageInfo.Meta.ShardOperations.empty() || !stageInfo.Meta.AccessCheckOperations.empty()) {
+                auto ops = stageInfo.Meta.ShardOperations;
+                ops.insert(stageInfo.Meta.AccessCheckOperations.begin(), stageInfo.Meta.AccessCheckOperations.end());
+                for (const auto& operation : ops) {
                     const auto& tableInfo = stageInfo.Meta.TableConstInfo;
                     if (tableInfo) {
                         if (ResolvingNamesFinished) {
@@ -393,13 +397,13 @@ private:
                                 }
                             };
 
-                            addRequest(stageInfo.Meta.ShardKey);
+                            addRequest(std::move(stageInfo.Meta.ShardKey));
                             switch (operation) {
                                 case TKeyDesc::ERowOperation::Update:
                                 case TKeyDesc::ERowOperation::Erase:
                                     for (auto& indexMeta : stageInfo.Meta.IndexMetas) {
                                         indexMeta.ShardKey = ExtractKey(indexMeta.TableId, indexMeta.TableConstInfo->KeyColumnTypes, operation);
-                                        addRequest(indexMeta.ShardKey);
+                                        addRequest(std::move(indexMeta.ShardKey));
                                     }
                                     break;
                                 default:

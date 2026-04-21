@@ -18,8 +18,7 @@
 
 #include <utility>
 
-namespace NKikimr {
-namespace NMiniKQL {
+namespace NKikimr::NMiniKQL {
 
 namespace NDetails {
 
@@ -158,11 +157,13 @@ private:
 using TValuePacker = TValuePackerGeneric<false>;
 
 class TValuePackerBoxed: public TComputationValue<TValuePackerBoxed>, public TValuePacker {
-    typedef TComputationValue<TValuePackerBoxed> TBase;
+    using TBase = TComputationValue<TValuePackerBoxed>;
 
 public:
     TValuePackerBoxed(TMemoryUsageInfo* memInfo, bool stable, const TType* type);
 };
 
-} // namespace NMiniKQL
-} // namespace NKikimr
+bool IsLegacyStructBlock(const TType* type, ui32& blockLengthIndex, TVector<const TBlockType*>& items);
+bool IsMultiBlock(const TType* type, ui32& blockLengthIndex, TVector<const TBlockType*>& items);
+
+} // namespace NKikimr::NMiniKQL

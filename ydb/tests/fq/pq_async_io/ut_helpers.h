@@ -24,7 +24,8 @@ NYql::NPq::NProto::TDqPqTopicSource BuildPqTopicSourceSettings(
     TString topic,
     TMaybe<TDuration> watermarksPeriod = Nothing(),
     TDuration lateArrivalDelay = TDuration::Seconds(2),
-    bool idlePartitionsEnabled = false);
+    bool idlePartitionsEnabled = false,
+    bool streamingMode = true);
 
 NYql::NPq::NProto::TDqPqTopicSink BuildPqTopicSinkSettings(TString topic);
 
@@ -68,7 +69,10 @@ struct TPqIoTestFixture : public NUnitTest::TBaseFixture {
     }
 
     void LoadSource(const TSourceState& state) const {
-        return CaSetup->LoadSource(state);
+        CaSetup->LoadSource(state);
+
+        // Wait for reader to reconnect and resume from checkpoint
+        Sleep(TDuration::Seconds(10));
     }
 
 

@@ -18,6 +18,14 @@
 
 namespace NYdb::inline Dev {
 
+namespace NMetrics {
+    class IMetricRegistry;
+} // namespace NMetrics
+
+namespace NTrace {
+    class ITraceProvider;
+} // namespace NTrace
+
 constexpr TDeadline::Duration GRPC_KEEP_ALIVE_TIMEOUT_FOR_DISCOVERY = std::chrono::seconds(10);
 constexpr TDeadline::Duration INITIAL_DEFERRED_CALL_DELAY = std::chrono::milliseconds(10); // The delay before first deferred service call
 constexpr TDeadline::Duration GET_ENDPOINTS_TIMEOUT = std::chrono::seconds(10); // Time wait for ListEndpoints request, after this time we pass error to client
@@ -32,7 +40,6 @@ class ICredentialsProvider;
 using TDeferredResultCb = std::function<void(google::protobuf::Any*, TPlainStatus status)>;
 
 std::string GetAuthInfo(TDbDriverStatePtr p);
-void SetDatabaseHeader(TCallMeta& meta, const std::string& database);
 std::string CreateSDKBuildInfo();
 
 class TGRpcConnectionsImpl
@@ -46,7 +53,10 @@ public:
     ~TGRpcConnectionsImpl();
 
     void AddPeriodicTask(TPeriodicCb&& cb, TDeadline::Duration period) override;
-    void ScheduleOneTimeTask(TSimpleCb&& fn, TDeadline::Duration timeout);
+
+    void ScheduleDelayedTask(TSimpleCb&& fn, TDeadline deadline);
+    void ScheduleDelayedTask(TSimpleCb&& fn, TDeadline::Duration delay);
+
     NThreading::TFuture<bool> ScheduleFuture(
         TDuration timeout,
         IQueueClientContextPtr token = nullptr
@@ -76,6 +86,8 @@ public:
 
     static void SetGrpcKeepAlive(NYdbGrpc::TGRpcClientConfig& config, const TDeadline::Duration& timeout, bool permitWithoutCalls);
 
+    static void SetGrpcCompressionAlgorithm(NYdbGrpc::TGRpcClientConfig& config, EGrpcCompressionAlgorithm algorithm);
+
     template<typename TService>
     std::pair<std::unique_ptr<TServiceConnection<TService>>, TEndpointKey> GetServiceConnection(
         TDbDriverStatePtr dbState, const TEndpointKey& preferredEndpoint,
@@ -98,7 +110,9 @@ public:
             clientConfig.MaxOutboundMessageSize = MaxOutboundMessageSize_;
         }
 
-        clientConfig.LoadBalancingPolicy = "round_robin";
+        clientConfig.LoadBalancingPolicy = GRpcLoadBalancingPolicy_;
+
+        SetGrpcCompressionAlgorithm(clientConfig, GRpcCompressionAlgorithm_);
 
         if (dbState->DiscoveryMode != EDiscoveryMode::Off) {
             if (std::is_same<TService,Ydb::Discovery::V1::DiscoveryService>()
@@ -233,42 +247,16 @@ public:
                 }
 
                 TCallMeta meta;
-                meta.Timeout = requestSettings.Deadline;
-        #ifndef YDB_GRPC_UNSECURE_AUTH
-                meta.CallCredentials = dbState->CallCredentials;
-        #else
-                if (requestSettings.UseAuth && dbState->CredentialsProvider && dbState->CredentialsProvider->IsValid()) {
-                    try {
-                        meta.Aux.push_back({ YDB_AUTH_TICKET_HEADER, GetAuthInfo(dbState) });
-                    } catch (const std::exception& e) {
-                        userResponseCb(
-                            nullptr,
-                            TPlainStatus(
-                                EStatus::CLIENT_UNAUTHENTICATED,
-                                TStringBuilder() << "Can't get Authentication info from CredentialsProvider. " << e.what()
-                            )
-                        );
-                        return;
-                    }
-                }
-        #endif
-                if (!requestSettings.TraceId.empty()) {
-                    meta.Aux.push_back({YDB_TRACE_ID_HEADER, requestSettings.TraceId});
-                }
 
-                if (!requestSettings.RequestType.empty()) {
-                    meta.Aux.push_back({YDB_REQUEST_TYPE_HEADER, requestSettings.RequestType});
+                try {
+                    meta = MakeCallMeta(requestSettings, dbState);
+                } catch (const TAuthenticationError& e) {
+                    userResponseCb(
+                        nullptr,
+                        TPlainStatus(EStatus::CLIENT_UNAUTHENTICATED, e.what())
+                    );
+                    return;
                 }
-
-                if (!dbState->Database.empty()) {
-                    SetDatabaseHeader(meta, dbState->Database);
-                }
-
-                static const std::string clientPid = GetClientPIDHeaderValue();
-
-                meta.Aux.push_back({YDB_SDK_BUILD_INFO_HEADER, CreateSDKBuildInfo()});
-                meta.Aux.push_back({YDB_CLIENT_PID, clientPid});
-                meta.Aux.insert(meta.Aux.end(), requestSettings.Header.begin(), requestSettings.Header.end());
 
                 dbState->StatCollector.IncGRpcInFlight();
                 dbState->StatCollector.IncGRpcInFlightByHost(endpoint.GetEndpoint());
@@ -460,42 +448,21 @@ public:
         }
 
         WithServiceConnection<TService>(
-            [request, responseCb = std::move(responseCb), rpc, requestSettings, context = std::move(context), dbState](TPlainStatus status, TConnection serviceConnection, TEndpointKey endpoint) mutable {
+            [this, request, responseCb = std::move(responseCb), rpc, requestSettings, context = std::move(context), dbState](TPlainStatus status, TConnection serviceConnection, TEndpointKey endpoint) mutable {
                 if (!status.Ok()) {
                     responseCb(std::move(status), nullptr);
                     return;
                 }
 
                 TCallMeta meta;
-                meta.Timeout = requestSettings.Deadline;
-#ifndef YDB_GRPC_UNSECURE_AUTH
-                meta.CallCredentials = dbState->CallCredentials;
-#else
-                if (requestSettings.UseAuth && dbState->CredentialsProvider && dbState->CredentialsProvider->IsValid()) {
-                    try {
-                        meta.Aux.push_back({ YDB_AUTH_TICKET_HEADER, GetAuthInfo(dbState) });
-                    } catch (const std::exception& e) {
-                        responseCb(
-                            TPlainStatus(
-                                EStatus::CLIENT_UNAUTHENTICATED,
-                                TStringBuilder() << "Can't get Authentication info from CredentialsProvider. " << e.what()
-                            ),
-                            nullptr
-                        );
-                        return;
-                    }
-                }
-#endif
-                if (!requestSettings.TraceId.empty()) {
-                    meta.Aux.push_back({YDB_TRACE_ID_HEADER, requestSettings.TraceId});
-                }
-
-                if (!requestSettings.RequestType.empty()) {
-                    meta.Aux.push_back({YDB_REQUEST_TYPE_HEADER, requestSettings.RequestType});
-                }
-
-                if (!dbState->Database.empty()) {
-                    SetDatabaseHeader(meta, dbState->Database);
+                try {
+                    meta = MakeCallMeta(requestSettings, dbState);
+                } catch (const TAuthenticationError& e) {
+                    responseCb(
+                        TPlainStatus(EStatus::CLIENT_UNAUTHENTICATED, e.what()),
+                        nullptr
+                    );
+                    return;
                 }
 
                 dbState->StatCollector.IncGRpcInFlight();
@@ -554,7 +521,7 @@ public:
         }
 
         WithServiceConnection<TService>(
-            [connectedCallback = std::move(connectedCallback), rpc, requestSettings, context = std::move(context), dbState]
+            [this, connectedCallback = std::move(connectedCallback), rpc, requestSettings, context = std::move(context), dbState]
             (TPlainStatus status, TConnection serviceConnection, TEndpointKey endpoint) mutable {
                 if (!status.Ok()) {
                     connectedCallback(std::move(status), nullptr);
@@ -562,40 +529,15 @@ public:
                 }
 
                 TCallMeta meta;
-        #ifndef YDB_GRPC_UNSECURE_AUTH
-                meta.CallCredentials = dbState->CallCredentials;
-        #else
-                if (requestSettings.UseAuth && dbState->CredentialsProvider && dbState->CredentialsProvider->IsValid()) {
-                    try {
-                        meta.Aux.push_back({ YDB_AUTH_TICKET_HEADER, GetAuthInfo(dbState) });
-                    } catch (const std::exception& e) {
-                        connectedCallback(
-                            TPlainStatus(
-                                EStatus::CLIENT_UNAUTHENTICATED,
-                                TStringBuilder() << "Can't get Authentication info from CredentialsProvider. " << e.what()
-                            ),
-                            nullptr
-                        );
-                        return;
-                    }
+                try {
+                    meta = MakeCallMeta(requestSettings, dbState);
+                } catch (const TAuthenticationError& e) {
+                    connectedCallback(
+                        TPlainStatus(EStatus::CLIENT_UNAUTHENTICATED, e.what()),
+                        nullptr
+                    );
+                    return;
                 }
-        #endif
-                if (!requestSettings.TraceId.empty()) {
-                    meta.Aux.push_back({YDB_TRACE_ID_HEADER, requestSettings.TraceId});
-                }
-
-                if (!requestSettings.RequestType.empty()) {
-                    meta.Aux.push_back({YDB_REQUEST_TYPE_HEADER, requestSettings.RequestType});
-                }
-
-                if (!dbState->Database.empty()) {
-                    SetDatabaseHeader(meta, dbState->Database);
-                }
-
-                static const std::string clientPid = GetClientPIDHeaderValue();
-                meta.Aux.push_back({YDB_SDK_BUILD_INFO_HEADER, CreateSDKBuildInfo()});
-                meta.Aux.push_back({YDB_CLIENT_PID, clientPid});
-                meta.Aux.insert(meta.Aux.end(), requestSettings.Header.begin(), requestSettings.Header.end());
 
                 dbState->StatCollector.IncGRpcInFlight();
                 dbState->StatCollector.IncGRpcInFlightByHost(endpoint.GetEndpoint());
@@ -635,7 +577,7 @@ public:
     }
 
     TAsyncListEndpointsResult GetEndpoints(TDbDriverStatePtr dbState) override;
-    TListEndpointsResult MutateDiscovery(TListEndpointsResult result, const TDbDriverState& dbDriverState);
+    TListEndpointsResult MutateDiscovery(TListEndpointsResult result, const TDbDriverState* dbDriverState);
 
 #ifndef YDB_GRPC_BYPASS_CHANNEL_POOL
     void DeleteChannels(const std::vector<std::string>& endpoints) override {
@@ -651,6 +593,9 @@ public:
     ::NMonitoring::TMetricRegistry* GetMetricRegistry() override;
     void RegisterExtension(IExtension* extension);
     void RegisterExtensionApi(IExtensionApi* api);
+    std::shared_ptr<NMetrics::IMetricRegistry> GetExternalMetricRegistry() const override;
+    std::shared_ptr<NTrace::ITraceProvider> GetTraceProvider() const;
+
     void SetDiscoveryMutator(IDiscoveryMutatorApi::TMutatorCb&& cb);
     const TLog& GetLog() const override;
 
@@ -748,6 +693,8 @@ private:
     void EnqueueResponse(IObjectInQueue* action);
 
 private:
+    TCallMeta MakeCallMeta(const TRpcRequestSettings& requestSettings, const TDbDriverStatePtr& dbState) const;
+
     std::mutex ExtensionsLock_;
     ::NMonitoring::TMetricRegistry* MetricRegistryPtr_ = nullptr;
 
@@ -766,6 +713,8 @@ private:
     const TBalancingPolicy::TImpl BalancingSettings_;
     const TDeadline::Duration GRpcKeepAliveTimeout_;
     const bool GRpcKeepAlivePermitWithoutCalls_;
+    const std::string GRpcLoadBalancingPolicy_;
+    const EGrpcCompressionAlgorithm GRpcCompressionAlgorithm_;
     const std::uint64_t MemoryQuota_;
     const std::uint64_t MaxInboundMessageSize_;
     const std::uint64_t MaxOutboundMessageSize_;
@@ -773,6 +722,7 @@ private:
 
     std::atomic_int64_t QueuedRequests_;
     const NYdbGrpc::TTcpKeepAliveSettings TcpKeepAliveSettings_;
+    const bool TcpNoDelay_;
     const TDeadline::Duration SocketIdleTimeout_;
 #ifndef YDB_GRPC_BYPASS_CHANNEL_POOL
     NYdbGrpc::TChannelPool ChannelPool_;
@@ -782,8 +732,12 @@ private:
 
     std::vector<std::unique_ptr<IExtension>> Extensions_;
     std::vector<std::unique_ptr<IExtensionApi>> ExtensionApis_;
+    std::shared_ptr<NMetrics::IMetricRegistry> MetricRegistry_;
+    std::shared_ptr<NTrace::ITraceProvider> TraceProvider_;
 
     IDiscoveryMutatorApi::TMutatorCb DiscoveryMutatorCb;
+
+    const std::string BuildInfo_;
 
     const std::size_t NetworkThreadsNum_;
     bool UsePerChannelTcpConnection_;

@@ -3,10 +3,12 @@
 #include "datashard.h"
 #include "cdc_stream_heartbeat.h"
 #include "cdc_stream_scan.h"
+#include "build_index/build_index_scan_manager.h"
 #include "change_exchange.h"
 #include "change_record.h"
 #include "change_record_cdc_serializer.h"
 #include "conflicts_cache.h"
+#include "datashard__lock_rows.h"
 #include "datashard_outreadset.h"
 #include "datashard_pipeline.h"
 #include "datashard_repl_offsets.h"
@@ -20,6 +22,9 @@
 #include "datashard_user_table.h"
 #include "datashard_write.h"
 #include "incr_restore_scan.h"
+#include "datashard_integrity_trails.h"
+#include "datashard_tli.h"
+#include "multi_txids.h"
 #include "progress_queue.h"
 #include "read_iterator.h"
 #include "reject_reason.h"
@@ -58,6 +63,10 @@
 
 #include <ydb/public/api/protos/ydb_status_codes.pb.h>
 
+#include <ydb/library/actors/async/async.h>
+#include <ydb/library/actors/async/continuation.h>
+#include <ydb/library/actors/async/event.h>
+#include <ydb/library/actors/async/low_priority.h>
 #include <ydb/library/actors/interconnect/interconnect.h>
 #include <ydb/library/actors/wilson/wilson_span.h>
 #include <ydb/library/actors/wilson/wilson_trace.h>
@@ -234,16 +243,25 @@ class TDataShard
 
     class TTxHandleSafeKqpScan;
     class TTxHandleSafeBuildIndexScan;
+    class TTxHandleBuildIndexScanProgress;
     class TTxHandleSafeValidateUniqueIndexScan;
     class TTxHandleSafeSampleKScan;
     class TTxHandleSafeLocalKMeansScan;
     class TTxHandleSafePrefixKMeansScan;
+    class TTxHandleSafeFilterKMeansScan;
     class TTxHandleSafeReshuffleKMeansScan;
     class TTxHandleSafeRecomputeKMeansScan;
     class TTxHandleSafeStatisticsScan;
     class TTxHandleSafeBuildFulltextIndexScan;
+    class TTxHandleSafeBuildFulltextDictScan;
+    class TTxHandleSafeValidateRowConditionScan;
 
     class TTxMediatorStateRestored;
+
+    class TTxLockRows;
+    class TLockRowsTxObserver;
+    class TLockRowsNotifyWaitGuard;
+    class TTxMultiTxIdCleanup;
 
     void HandleMonIndexPage(NMon::TEvRemoteHttpInfo::TPtr& ev);
     void HandleMonVolatileTxs(NMon::TEvRemoteHttpInfo::TPtr& ev);
@@ -277,8 +295,10 @@ class TDataShard
     friend class TConflictsCache;
     friend class TCdcStreamScanManager;
     friend class TCdcStreamHeartbeatManager;
+    friend class TBuildIndexScanManager;
     friend class TReplicationSourceOffsetsClient;
     friend class TReplicationSourceOffsetsServer;
+    friend class TMultiTxIdManager;
 
     friend class TTableStatsCoroBuilder;
     friend class TReadTableScan;
@@ -291,7 +311,7 @@ class TDataShard
 
     friend class TS3UploadsManager;
     friend class TS3DownloadsManager;
-    friend class TS3Downloader;
+    template <typename TSettings> friend class TS3Downloader;
     template <typename T> friend class TBackupRestoreUnitBase;
     friend class TCreateIncrementalRestoreSrcUnit;
     friend struct TSetupSysLocks;
@@ -337,7 +357,6 @@ class TDataShard
             EvPersistScanState,
             EvPersistScanStateAck,
             EvConditionalEraseRowsRegistered,
-            EvAsyncJobComplete,
             EvSubDomainPathIdFound, // unused
             EvRequestChangeRecords,
             EvRemoveChangeRecords,
@@ -481,15 +500,6 @@ class TDataShard
 
             const ui64 TxId;
             const TActorId ActorId;
-        };
-
-        struct TEvAsyncJobComplete : public TEventLocal<TEvAsyncJobComplete, EvAsyncJobComplete> {
-            explicit TEvAsyncJobComplete(TAutoPtr<IDestructable> prod)
-                : Prod(prod)
-            {
-            }
-
-            TAutoPtr<IDestructable> Prod;
         };
 
         struct TEvRequestChangeRecords : public TEventLocal<TEvRequestChangeRecords, EvRequestChangeRecords> {};
@@ -843,9 +853,11 @@ class TDataShard
             struct Kind :  Column<2, NScheme::NTypeIds::Uint8> { using Type = TChangeRecord::EKind; };
             struct Body :  Column<3, NScheme::NTypeIds::String> { using Type = TString; };
             struct Source :  Column<4, NScheme::NTypeIds::Uint8> { using Type = TChangeRecord::ESource; };
+            struct UserSID :  Column<5, NScheme::NTypeIds::Utf8> { using Type = TString; };
+            struct UserTraceId :  Column<6, NScheme::NTypeIds::String> { using Type = TString; };
 
             using TKey = TableKey<Order>;
-            using TColumns = TableColumns<Order, Kind, Body, Source>;
+            using TColumns = TableColumns<Order, Kind, Body, Source, UserSID, UserTraceId>;
         };
 
         struct ChangeSenders : Table<19> {
@@ -991,9 +1003,11 @@ class TDataShard
             struct Kind :       Column<3, NScheme::NTypeIds::Uint8> { using Type = TChangeRecord::EKind; };
             struct Body :       Column<4, NScheme::NTypeIds::String> { using Type = TString; };
             struct Source :     Column<5, NScheme::NTypeIds::Uint8> { using Type = TChangeRecord::ESource; };
-
+            struct UserSID :    Column<6, NScheme::NTypeIds::Utf8> { using Type = TString; };
+            struct UserTraceId :  Column<7, NScheme::NTypeIds::String> { using Type = TString; };
+            
             using TKey = TableKey<LockId, LockOffset>;
-            using TColumns = TableColumns<LockId, LockOffset, Kind, Body, Source>;
+            using TColumns = TableColumns<LockId, LockOffset, Kind, Body, Source, UserSID, UserTraceId>;
         };
 
         // Maps [Order ... Order+N-1] change records in the shard order
@@ -1099,6 +1113,35 @@ class TDataShard
             >;
         };
 
+        struct MultiTxIds : Table<37> {
+            struct MultiTxId : Column<1, NScheme::NTypeIds::Uint64> {};
+            struct LockedRowsCount : Column<2, NScheme::NTypeIds::Uint64> {};
+            struct Flags : Column<3, NScheme::NTypeIds::Uint64> {};
+
+            using TKey = TableKey<MultiTxId>;
+            using TColumns = TableColumns<MultiTxId, LockedRowsCount, Flags>;
+        };
+
+        struct MultiTxIdGraph : Table<38> {
+            struct EdgeId : Column<1, NScheme::NTypeIds::Uint64> {};
+            struct MultiTxId : Column<2, NScheme::NTypeIds::Uint64> {};
+            struct NestedTxId : Column<3, NScheme::NTypeIds::Uint64> {};
+            struct NestedLockMode : Column<4, NScheme::NTypeIds::Uint8> { using Type = NTable::ELockMode; };
+
+            using TKey = TableKey<EdgeId>;
+            using TColumns = TableColumns<EdgeId, MultiTxId, NestedTxId, NestedLockMode>;
+        };
+        struct IndexBuildScans : Table<39> {
+            struct BuildId : Column<1, NScheme::NTypeIds::Uint64> {};
+            struct SeqNoGeneration : Column<2, NScheme::NTypeIds::Uint64> {};
+            struct SeqNoRound : Column<3, NScheme::NTypeIds::Uint64> {};
+            struct ResponseType : Column<4, NScheme::NTypeIds::Uint32> {};
+            struct FinalProgressRecord : Column<5, NScheme::NTypeIds::String> {};
+
+            using TKey = TableKey<BuildId, SeqNoGeneration, SeqNoRound>;
+            using TColumns = TableColumns<BuildId, SeqNoGeneration, SeqNoRound, ResponseType, FinalProgressRecord>;
+        };
+
         using TTables = SchemaTables<Sys, UserTables, TxMain, TxDetails, InReadSets, OutReadSets, PlanQueue,
             DeadlineQueue, SchemaOperations, SplitSrcSnapshots, SplitDstReceivedSnapshots, TxArtifacts, ScanProgress,
             Snapshots, S3Uploads, S3Downloads, ChangeRecords, ChangeRecordDetails, ChangeSenders, S3UploadedParts,
@@ -1107,7 +1150,7 @@ class TDataShard
             UserTablesStats, SchemaSnapshots, Locks, LockRanges, LockConflicts,
             LockChangeRecords, LockChangeRecordDetails, ChangeRecordCommits,
             TxVolatileDetails, TxVolatileParticipants, CdcStreamScans,
-            LockVolatileDependencies, CdcStreamHeartbeats>;
+            LockVolatileDependencies, CdcStreamHeartbeats, MultiTxIds, MultiTxIdGraph, IndexBuildScans>;
 
         // These settings are persisted on each Init. So we use empty settings in order not to overwrite what
         // was changed by the user
@@ -1269,6 +1312,13 @@ class TDataShard
     void ProposeTransaction(TEvDataShard::TEvProposeTransaction::TPtr &&ev, const TActorContext &ctx);
     void Handle(NEvents::TDataEvents::TEvWrite::TPtr& ev, const TActorContext& ctx);
     void ProposeTransaction(NEvents::TDataEvents::TEvWrite::TPtr&& ev, const TActorContext& ctx);
+    void CheckLockRowsRejectAll();
+    bool CheckLockRowsReject(TLockRowsRequestState& state);
+    TLockInfo::TPtr FindValidLockOwner(ui64 lockId);
+    void HandleLockRowsRequest(NEvents::TDataEvents::TEvLockRows::TPtr ev);
+    void HandleLockRowsCancel(NEvents::TDataEvents::TEvLockRowsCancel::TPtr& ev);
+    void HandleLockRowsDeadlock(TEvLongTxService::TEvWaitingLockDeadlock::TPtr& ev);
+    void StartLockRowsBrokenWatcher(TLockRowsRequestId requestId, TTableId tableId, TLockInfo::TPtr lock);
     void Handle(TEvTxProcessing::TEvPlanStep::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvTxProcessing::TEvReadSet::TPtr &ev, const TActorContext &ctx);
     void Handle(TEvTxProcessing::TEvReadSetAck::TPtr &ev, const TActorContext &ctx);
@@ -1336,6 +1386,7 @@ class TDataShard
     void Handle(TEvDataShard::TEvObjectStorageListingRequest::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvBuildIndexCreateRequest::TPtr& ev, const TActorContext& ctx);
     void HandleSafe(TEvDataShard::TEvBuildIndexCreateRequest::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvDataShard::TEvBuildIndexProgressResponse::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvValidateUniqueIndexRequest::TPtr& ev, const TActorContext& ctx);
     void HandleSafe(TEvDataShard::TEvValidateUniqueIndexRequest::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvSampleKRequest::TPtr& ev, const TActorContext& ctx);
@@ -1348,12 +1399,18 @@ class TDataShard
     void HandleSafe(TEvDataShard::TEvLocalKMeansRequest::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvPrefixKMeansRequest::TPtr& ev, const TActorContext& ctx);
     void HandleSafe(TEvDataShard::TEvPrefixKMeansRequest::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvDataShard::TEvFilterKMeansRequest::TPtr& ev, const TActorContext& ctx);
+    void HandleSafe(TEvDataShard::TEvFilterKMeansRequest::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvBuildFulltextIndexRequest::TPtr& ev, const TActorContext& ctx);
     void HandleSafe(TEvDataShard::TEvBuildFulltextIndexRequest::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvDataShard::TEvBuildFulltextDictRequest::TPtr& ev, const TActorContext& ctx);
+    void HandleSafe(TEvDataShard::TEvBuildFulltextDictRequest::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvDataShard::TEvValidateRowConditionRequest::TPtr& ev, const TActorContext& ctx);
+    void HandleSafe(TEvDataShard::TEvValidateRowConditionRequest::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvCdcStreamScanRequest::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvPrivate::TEvCdcStreamScanRegistered::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvPrivate::TEvCdcStreamScanProgress::TPtr& ev, const TActorContext& ctx);
-    void Handle(TEvPrivate::TEvAsyncJobComplete::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvDataShard::TEvAsyncJobComplete::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvPrivate::TEvRestartOperation::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvPrivate::TEvBlockFailPointUnblock::TPtr& ev, const TActorContext& ctx);
     void Handle(NStat::TEvStatistics::TEvStatisticsRequest::TPtr& ev, const TActorContext& ctx);
@@ -1427,10 +1484,10 @@ class TDataShard
     void DoPeriodicTasks(const TActorContext &ctx);
     void DoPeriodicTasks(TEvPrivate::TEvPeriodicWakeup::TPtr&, const TActorContext &ctx);
 
-    TDuration GetDataTxCompleteLag()
+    TDuration GetTxCompleteLag()
     {
         ui64 mediatorTime = MediatorTimeCastEntry ? MediatorTimeCastEntry->Get(TabletID()) : 0;
-        return TDuration::MilliSeconds(Pipeline.GetDataTxCompleteLag(mediatorTime));
+        return TDuration::MilliSeconds(Pipeline.GetTxCompleteLag(mediatorTime));
     }
     TDuration GetScanTxCompleteLag()
     {
@@ -1633,7 +1690,7 @@ public:
     ui64 TxPlanned() const { return TransQueue.TxPlanned(); }
     ui64 TxPlanWaiting() const { return TransQueue.TxPlanWaiting(); }
     ui64 ImmediateInFly() const { return Pipeline.ImmediateInFly(); }
-    ui64 TxWaiting() const { return Pipeline.WaitingTxs() + Pipeline.WaitingReadIterators(); }
+    ui64 TxWaiting() const { return Pipeline.WaitingTxs() + Pipeline.WaitingReadIterators() + Pipeline.WaitingCoroutinesCount(); }
 
     // note that not part of ImmediateInFly() to not block scheme ops:
     // we rather abort iterator if scheme changes between iterations
@@ -1685,6 +1742,21 @@ public:
     }
 
     void RemoveUserTable(const TPathId& tableId, ILocksDb* locksDb) {
+        // Collect lock IDs before removal for TLI logging
+        TVector<ui64> locksToInvalidate;
+        const auto& allLocks = SysLocks.GetLocks();
+        for (const auto& [lockId, lockInfo] : allLocks) {
+            if (lockInfo->GetReadTables().contains(tableId) || lockInfo->GetWriteTables().contains(tableId)) {
+                locksToInvalidate.push_back(lockId);
+            }
+        }
+        if (!locksToInvalidate.empty()) {
+            auto victimQuerySpanIds = SysLocks.ExtractVictimQuerySpanIds(locksToInvalidate);
+            NKikimr::NDataIntegrity::LogLocksBroken(TlsActivationContext->AsActorContext(), TabletID(),
+                "Schema change: table removed invalidated locks",
+                locksToInvalidate, Nothing(), victimQuerySpanIds);
+        }
+
         SysLocks.RemoveSchema(tableId, locksDb);
         Pipeline.GetDepTracker().RemoveSchema(tableId);
         TableInfos.erase(tableId.LocalPathId);
@@ -1993,6 +2065,7 @@ public:
     ui64 AllocateChangeRecordOrder(NIceDb::TNiceDb& db, ui64 count = 1);
     ui64 AllocateChangeRecordGroup(NIceDb::TNiceDb& db);
     ui64 GetNextChangeRecordLockOffset(ui64 lockId);
+    void FillUserCtxColumns(NACLib::TUserContext::TPtr userCtx, TString& userSID, TString& userTraceId);
     void PersistChangeRecord(NIceDb::TNiceDb& db, const TChangeRecord& record);
     bool HasLockChangeRecords(ui64 lockId) const;
     void CommitLockChangeRecords(NIceDb::TNiceDb& db, ui64 lockId, ui64 group, const TRowVersion& rowVersion, TVector<IDataShardChangeCollector::TChange>& collected);
@@ -2025,6 +2098,7 @@ public:
 
     static void PersistSchemeTxResult(NIceDb::TNiceDb &db, const TSchemaOperation& op);
     void NotifySchemeshard(const TActorContext& ctx, ui64 txId = 0);
+    void SendPendingBuildIndexFinalResponses(const TActorContext& ctx);
 
     TThrRefBase* GetDataShardSysTables() { return DataShardSysTables.Get(); }
 
@@ -2044,9 +2118,19 @@ public:
     TCdcStreamScanManager& GetCdcStreamScanManager() { return CdcStreamScanManager; }
     const TCdcStreamScanManager& GetCdcStreamScanManager() const { return CdcStreamScanManager; }
 
+    TBuildIndexScanManager& GetBuildIndexScanManager() { return BuildIndexScanManager; }
+    const TBuildIndexScanManager& GetBuildIndexScanManager() const { return BuildIndexScanManager; }
+
+    void ClearPendingBuildIndexFinalResponse(ui64 buildId) {
+        PendingBuildIndexFinalResponses.erase(buildId);
+    }
+
     TCdcStreamHeartbeatManager& GetCdcStreamHeartbeatManager() { return CdcStreamHeartbeatManager; }
     const TCdcStreamHeartbeatManager& GetCdcStreamHeartbeatManager() const { return CdcStreamHeartbeatManager; }
     void EmitHeartbeats();
+
+    TMultiTxIdManager& GetMultiTxIdManager() { return MultiTxIdManager; }
+    const TMultiTxIdManager& GetMultiTxIdManager() const { return MultiTxIdManager; }
 
     template <typename... Args>
     bool PromoteCompleteEdge(Args&&... args) {
@@ -2200,6 +2284,9 @@ public:
         Y_ENSURE(type != ELogThrottlerType::LAST);
         return LogThrottlers[type];
     };
+
+    async<ui64> AllocateGlobalTxId();
+    void RecycleGlobalTxId(ui64 txId);
 
     void OnTableCreated(TTransactionContext& txc, const TActorContext& ctx);
 
@@ -2567,6 +2654,7 @@ private:
 
         TActorId InterconnectSession;
         THashMap<TActorId, TOverloadSubscriber> OverloadSubscribers;
+        TIntrusiveList<TLockRowsRequestState, TLockRowsRequestPipeServerListTag> LockRowsRequests;
     };
 
     using TPipeServers = THashMap<TActorId, TPipeServerInfo>;
@@ -2671,11 +2759,13 @@ private:
 
     TProposeQueue ProposeQueue;
     TVector<THolder<IEventHandle>> DelayedProposeQueue;
+    TAsyncEvent DelayedProposeCoroutines;
 
     TActorId PersistentPipeCache;
     NTabletPipe::TClientRetryPolicy SchemeShardPipeRetryPolicy;
     TActorId SchemeShardPipe;   // For notifications about schema changes
     TActorId StateReportPipe;   // For notifications about shard state changes
+    TActorId BuildIndexPipe;   // For notifications about index build
     ui64 PathOwnerId; // TabletID of the schmemeshard that allocated the TPathId(ownerId,localId)
     ui64 CurrentSchemeShardId; // TabletID of SchemeShard wich manages the path right now
     ui64 LastKnownMediator;
@@ -2750,6 +2840,9 @@ private:
     TConflictsCache ConflictsCache;
     TCdcStreamScanManager CdcStreamScanManager;
     TCdcStreamHeartbeatManager CdcStreamHeartbeatManager;
+    TMultiTxIdManager MultiTxIdManager;
+    TBuildIndexScanManager BuildIndexScanManager;
+    THashMap<ui64, THolder<TEvDataShard::TEvBuildIndexProgressResponse>> PendingBuildIndexFinalResponses;
 
     TReplicationSourceOffsetsServerLink ReplicationSourceOffsetsServer;
 
@@ -2814,6 +2907,7 @@ private:
     ui64 CoordinatorPrevReadStepMax = Max<ui64>();
 
     TVector<THolder<IEventHandle>> MediatorStateWaitingMsgs;
+    TAsyncEvent MediatorStateWaitingCoroutines;
     bool MediatorStateWaiting = false;
     bool MediatorStateRestoreTxPending = false;
 
@@ -3014,8 +3108,11 @@ private:
     void RunChangeExchangeHandshakeTx();
     void ChangeExchangeHandshakeExecuted();
 
-    // compactionId, actorId
-    using TCompactionWaiter = std::tuple<ui64, TActorId>;
+    struct TCompactionWaiter {
+        ui64 CompactionId;
+        TActorId ActorId;
+        ui64 Cookie;
+    };
     using TCompactionWaiterList = TList<TCompactionWaiter>;
 
     // tableLocalTid -> waiters, note that compactionId is monotonically
@@ -3063,6 +3160,9 @@ private:
     TReadIteratorsLocalMap ReadIteratorsByLocalReadId;
     THashMap<TActorId, TReadIteratorSession> ReadIteratorSessions;
 
+    THashMap<TLockRowsRequestId, TLockRowsRequestState> LockRowsRequests;
+    THashMap<ui64, TLockRowsRequestState*> LockRowsWaitRequests;
+
     NTable::ITransactionObserverPtr BreakWriteConflictsTxObserver;
 
     bool UpdateFollowerReadEdgePending = false;
@@ -3078,7 +3178,58 @@ private:
 
     ui64 CurrentVacuumGeneration = 0;
 
+    // Cache for tracking recent writes for TLI breaker linkage in deferred lock creation scenarios
+    // Maps (MvccVersion) -> QuerySpanId for writes that may have broken locks
+    // Used when InvisibleRowSkips are detected to identify the breaker
+    static constexpr size_t MaxRecentWritesForTli = 10000;
+    struct TRecentWriteForTli {
+        TRowVersion WriteVersion;
+        ui64 QuerySpanId;
+        ui32 SenderNodeId;  // Node where the breaker's SessionActor ran (where TNodeQueryTextCache is populated)
+    };
+    TDeque<TRecentWriteForTli> RecentWritesForTli;
+
+    TAsyncLowPriorityQueue LowPriorityQueue;
+
+    struct TGlobalTxIdAwaiter : public TIntrusiveListItem<TGlobalTxIdAwaiter> {
+        TAsyncContinuation<ui64> Continuation;
+    };
+    TIntrusiveList<TGlobalTxIdAwaiter> GlobalTxIdAwaiters;
+    TVector<ui64> GlobalTxIdCache;
+
 public:
+    struct TBreakerInfo {
+        ui64 QuerySpanId;
+        ui32 SenderNodeId;
+    };
+
+    // Add a recent write entry for TLI breaker tracking
+    void AddRecentWriteForTli(const TRowVersion& writeVersion, ui64 querySpanId, ui32 senderNodeId) {
+        if (querySpanId == 0) {
+            return; // Don't track writes without QuerySpanId
+        }
+        // Keep the cache bounded
+        while (RecentWritesForTli.size() >= MaxRecentWritesForTli) {
+            RecentWritesForTli.pop_front();
+        }
+        RecentWritesForTli.push_back({writeVersion, querySpanId, senderNodeId});
+    }
+
+    // Find breaker info (QuerySpanId + SenderNodeId) for writes that happened after a given read version
+    TVector<TBreakerInfo> FindBreakerInfoForTli(const TRowVersion& readVersion) const {
+        TVector<TBreakerInfo> result;
+        // Iterate from newest to oldest for efficiency
+        for (auto it = RecentWritesForTli.rbegin(); it != RecentWritesForTli.rend(); ++it) {
+            if (it->WriteVersion > readVersion) {
+                result.push_back({it->QuerySpanId, it->SenderNodeId});
+            } else {
+                // Since writes are added in order, older writes won't match
+                break;
+            }
+        }
+        return result;
+    }
+
     auto& GetLockChangeRecords() {
         return LockChangeRecords;
     }
@@ -3223,6 +3374,9 @@ protected:
             hFunc(TEvDataShard::TEvReadScanFinished, Handle);
             HFunc(TEvDataShard::TEvReadColumnsRequest, Handle);
             HFunc(NEvents::TDataEvents::TEvWrite, Handle);
+            hFunc(NEvents::TDataEvents::TEvLockRows, HandleLockRowsRequest);
+            hFunc(NEvents::TDataEvents::TEvLockRowsCancel, HandleLockRowsCancel);
+            hFunc(TEvLongTxService::TEvWaitingLockDeadlock, HandleLockRowsDeadlock);
             hFunc(TEvDataShard::TEvGetInfoRequest, Handle);
             hFunc(TEvDataShard::TEvListOperationsRequest, Handle);
             hFunc(TEvDataShard::TEvGetDataHistogramRequest, Handle);
@@ -3235,17 +3389,21 @@ protected:
             HFunc(TEvDataShard::TEvRefreshVolatileSnapshotRequest, Handle);
             HFunc(TEvDataShard::TEvDiscardVolatileSnapshotRequest, Handle);
             HFuncTraced(TEvDataShard::TEvBuildIndexCreateRequest, Handle);
+            HFunc(TEvDataShard::TEvBuildIndexProgressResponse, Handle);
             HFuncTraced(TEvDataShard::TEvValidateUniqueIndexRequest, Handle);
             HFunc(TEvDataShard::TEvSampleKRequest, Handle);
             HFunc(TEvDataShard::TEvReshuffleKMeansRequest, Handle);
             HFunc(TEvDataShard::TEvRecomputeKMeansRequest, Handle);
             HFunc(TEvDataShard::TEvLocalKMeansRequest, Handle);
             HFunc(TEvDataShard::TEvPrefixKMeansRequest, Handle);
+            HFunc(TEvDataShard::TEvFilterKMeansRequest, Handle);
             HFunc(TEvDataShard::TEvBuildFulltextIndexRequest, Handle);
+            HFunc(TEvDataShard::TEvBuildFulltextDictRequest, Handle);
+            HFunc(TEvDataShard::TEvValidateRowConditionRequest, Handle);
             HFunc(TEvDataShard::TEvCdcStreamScanRequest, Handle);
             HFunc(TEvPrivate::TEvCdcStreamScanRegistered, Handle);
             HFunc(TEvPrivate::TEvCdcStreamScanProgress, Handle);
-            HFunc(TEvPrivate::TEvAsyncJobComplete, Handle);
+            HFunc(TEvDataShard::TEvAsyncJobComplete, Handle);
             HFunc(TEvPrivate::TEvRestartOperation, Handle);
             HFunc(TEvPrivate::TEvBlockFailPointUnblock, Handle);
             HFunc(TEvPrivate::TEvPeriodicWakeup, DoPeriodicTasks);
@@ -3310,6 +3468,8 @@ protected:
             HFuncTraced(TEvDataShard::TEvReadCancel, Handle);
             hFuncTraced(TEvDataShard::TEvReadScanStarted, Handle);
             hFuncTraced(TEvDataShard::TEvReadScanFinished, Handle);
+            hFunc(TEvDataShard::TEvGetInfoRequest, Handle);
+            HFunc(TEvDataShard::TEvGetTableStats, Handle);
             HFuncTraced(TEvPrivate::TEvPeriodicWakeup, DoPeriodicTasks);
             HFunc(TEvPrivate::TEvBuildTableStatsResult, Handle);
             HFunc(TEvPrivate::TEvBuildTableStatsError, Handle);
@@ -3324,15 +3484,20 @@ protected:
 
     void Die(const TActorContext &ctx) override;
 
-    void SendViaSchemeshardPipe(const TActorContext &ctx, ui64 tabletId, THolder<TEvDataShard::TEvSchemaChanged> event) {
+    template <class TEvent>
+    void SendViaSchemeshardPipe(const TActorContext &ctx, ui64 tabletId, TActorId& pipe, THolder<TEvent> event) {
         Y_ENSURE(tabletId);
         Y_ENSURE(CurrentSchemeShardId == tabletId);
 
-        if (!SchemeShardPipe) {
+        if (!pipe) {
             NTabletPipe::TClientConfig clientConfig;
-            SchemeShardPipe = ctx.Register(NTabletPipe::CreateClient(ctx.SelfID, tabletId, clientConfig));
+            pipe = ctx.Register(NTabletPipe::CreateClient(ctx.SelfID, tabletId, clientConfig));
         }
-        NTabletPipe::SendData(ctx, SchemeShardPipe, event.Release());
+        NTabletPipe::SendData(ctx, pipe, event.Release());
+    }
+
+    void SendViaSchemeshardPipe(const TActorContext &ctx, ui64 tabletId, THolder<TEvDataShard::TEvSchemaChanged> event) {
+        SendViaSchemeshardPipe(ctx, tabletId, SchemeShardPipe, std::move(event));
     }
 
     void ReportState(const TActorContext &ctx, ui32 state) {
@@ -3440,10 +3605,10 @@ protected:
             ev->Record.MutableTableStats()->SetPlannedTxCompleted(TabletCounters->Cumulative()[COUNTER_PLANNED_TX_COMPLETE].Get());
             ev->Record.MutableTableStats()->SetTxRejectedByOverload(TabletCounters->Cumulative()[COUNTER_PREPARE_OVERLOADED].Get() + TabletCounters->Cumulative()[COUNTER_WRITE_OVERLOADED].Get());
             ev->Record.MutableTableStats()->SetTxRejectedBySpace(
-                TabletCounters->Cumulative()[COUNTER_PREPARE_OUT_OF_SPACE].Get()
-              + TabletCounters->Cumulative()[COUNTER_PREPARE_DISK_SPACE_EXHAUSTED].Get()
-              + TabletCounters->Cumulative()[COUNTER_WRITE_OUT_OF_SPACE].Get()
-              + TabletCounters->Cumulative()[COUNTER_WRITE_DISK_SPACE_EXHAUSTED].Get()
+                TabletCounters->Cumulative()[COUNTER_PREPARE_DISK_GROUP_OUT_OF_SPACE].Get()
+              + TabletCounters->Cumulative()[COUNTER_PREPARE_DATABASE_DISK_SPACE_QUOTA_EXCEEDED].Get()
+              + TabletCounters->Cumulative()[COUNTER_WRITE_DISK_GROUP_OUT_OF_SPACE].Get()
+              + TabletCounters->Cumulative()[COUNTER_WRITE_DATABASE_DISK_SPACE_QUOTA_EXCEEDED].Get()
             );
 
             ev->Record.MutableTableStats()->SetTxCompleteLagMsec(TabletCounters->Simple()[COUNTER_TX_COMPLETE_LAG].Get());

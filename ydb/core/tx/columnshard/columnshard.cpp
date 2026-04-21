@@ -12,6 +12,7 @@
 #include <ydb/core/protos/table_stats.pb.h>
 #include <ydb/core/tx/columnshard/bg_tasks/adapter/adapter.h>
 #include <ydb/core/tx/columnshard/diagnostics/scan_diagnostics_actor.h>
+#include <ydb/core/tx/columnshard/engines/reader/tracing/data_source_probes.h>
 #include <ydb/core/tx/columnshard/engines/reader/tracing/probes.h>
 #include <ydb/core/tx/columnshard/tablet/write_queue.h>
 #include <ydb/core/tx/columnshard/tracing/probes.h>
@@ -89,8 +90,10 @@ void TColumnShard::TrySwitchToWork(const TActorContext& ctx) {
     ctx.Send(SelfId(), new NActors::TEvents::TEvWakeup());
     ctx.Send(SelfId(), new TEvPrivate::TEvPeriodicWakeup());
     ctx.Send(SelfId(), new TEvPrivate::TEvPingSnapshotsUsage());
-    ctx.Send(SelfId(), new TEvPrivate::TEvReportExecutorStatistics());
-    ctx.Send(SelfId(), new TEvPrivate::TEvReportBaseStatistics());
+    ExecutorStatsEvInflight++;
+    ctx.Send(SelfId(), new TEvPrivate::TEvReportExecutorStatistics);
+    ScheduleBaseStatistics();
+
     NYDBTest::TControllers::GetColumnShardController()->OnSwitchToWork(TabletID());
     AFL_VERIFY(!!StartInstant);
     Counters.GetCSCounters().Initialization.OnSwitchToWork(TMonotonic::Now() - *StartInstant, TMonotonic::Now() - CreateInstant);
@@ -99,7 +102,8 @@ void TColumnShard::TrySwitchToWork(const TActorContext& ctx) {
 
 void TColumnShard::OnActivateExecutor(const TActorContext& ctx) {
     using namespace NOlap::NReader;
-    NLwTraceMonPage::ProbeRegistry().AddProbesList(LWTRACE_GET_PROBES(YDB_CS_READER));
+    NLwTraceMonPage::ProbeRegistry().AddProbesList(LWTRACE_GET_PROBES(YDB_CS_SCAN));
+    NLwTraceMonPage::ProbeRegistry().AddProbesList(LWTRACE_GET_PROBES(YDB_CS_DATA_SOURCE));
     NLwTraceMonPage::ProbeRegistry().AddProbesList(LWTRACE_GET_PROBES(YDB_CS));
     StartInstant = TMonotonic::Now();
     Counters.GetCSCounters().Initialization.OnActivateExecutor(TMonotonic::Now() - CreateInstant);
@@ -126,7 +130,10 @@ void TColumnShard::OnActivateExecutor(const TActorContext& ctx) {
 
     AFL_INFO(NKikimrServices::TX_COLUMNSHARD)("event", "initialize_shard")("step", "initialize_tiring_finished");
     auto& icb = *AppData(ctx)->Icb;
-    SpaceWatcherId = RegisterWithSameMailbox(SpaceWatcher);
+    auto* spaceWatcherRawPtr = SpaceWatcher.release();
+    SpaceWatcherId = RegisterWithSameMailbox(spaceWatcherRawPtr);
+    // Actor System will keep this object
+    SpaceWatcher = std::unique_ptr<TSpaceWatcher, std::function<void(TSpaceWatcher*)>>(spaceWatcherRawPtr, [](auto*){});
     ScanDiagnosticsActorId = Register(new NDiagnostics::TScanDiagnosticsActor());
     ActorsToStop.push_back(ScanDiagnosticsActorId);
     Limits.RegisterControls(icb);
@@ -164,8 +171,11 @@ void TColumnShard::Handle(TEvTabletPipe::TEvClientConnected::TPtr& ev, const TAc
             LOG_S_DEBUG("Connected to " << tabletId << " at tablet " << TabletID());
         } else {
             LOG_S_INFO("Failed to connect to " << tabletId << " at tablet " << TabletID());
+            LastStats = {};
             StatsReportPipe = {};
         }
+        ExecutorStatsEvInflight++;
+        ActorContext().Send(SelfId(), new TEvPrivate::TEvReportExecutorStatistics());
         return;
     }
 
@@ -413,44 +423,51 @@ void TColumnShard::FillColumnTableStats(const TActorContext& ctx, std::unique_pt
     AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD)("There are stats for tables", tables.size());
     ev->Record.ClearTables();
     for (const auto& [internalPathId, table] : tables) {
-        const auto& schemeShardLocalPathId = table.GetPathId().SchemeShardLocalPathId;
-        auto* periodicTableStats = ev->Record.AddTables();
-        periodicTableStats->SetDatashardId(TabletID());
-        periodicTableStats->SetTableLocalId(schemeShardLocalPathId.GetRawValue());
+        for (const auto& unifiedPathId : table.GetPathIds()) {
+            const auto& schemeShardLocalPathId = unifiedPathId.SchemeShardLocalPathId;
+            auto* periodicTableStats = ev->Record.AddTables();
+            periodicTableStats->SetDatashardId(TabletID());
+            periodicTableStats->SetTableLocalId(schemeShardLocalPathId.GetRawValue());
 
-        periodicTableStats->SetShardState(2);
-        if (ev->Record.HasGeneration()) {
-            periodicTableStats->SetGeneration(ev->Record.GetGeneration());
-        }
-        periodicTableStats->SetRound(StatsReportRound);
-        periodicTableStats->SetNodeId(ctx.SelfID.NodeId());
-        periodicTableStats->SetStartTime(StartTime().MilliSeconds());
-
-        if (executor) {
-            if (auto* resourceMetrics = executor->GetResourceMetrics()) {
-                resourceMetrics->Fill(*ev->Record.MutableTabletMetrics());
+            periodicTableStats->SetShardState(2);
+            if (ev->Record.HasGeneration()) {
+                periodicTableStats->SetGeneration(ev->Record.GetGeneration());
             }
-        }
+            periodicTableStats->SetRound(StatsReportRound);
+            periodicTableStats->SetNodeId(ctx.SelfID.NodeId());
+            periodicTableStats->SetStartTime(StartTime().MilliSeconds());
 
-        tableStatsBuilder.FillTableStats(internalPathId, *(periodicTableStats->MutableTableStats()));
-        AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD)("Add stats for table, tableLocalID", schemeShardLocalPathId);
+            if (executor) {
+                if (auto* resourceMetrics = executor->GetResourceMetrics()) {
+                    resourceMetrics->Fill(*ev->Record.MutableTabletMetrics());
+                }
+            }
+
+            tableStatsBuilder.FillTableStats(internalPathId, *(periodicTableStats->MutableTableStats()));
+            AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD)("Add stats for table, tableLocalID", schemeShardLocalPathId);
+        }
     }
 }
 
 void TColumnShard::SendPeriodicStats(bool withExecutor) {
-    if (!CurrentSchemeShardId || !TablesManager.GetTabletPathIdOptional()) {
-        AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD)("Disabled periodic stats at tablet", TabletID());
+    if (!CurrentSchemeShardId) {
+        AFL_INFO(NKikimrServices::TX_COLUMNSHARD)("No CurrentSchemeShardId", TabletID());
+        return;
+    }
+
+    if (!StatsReportPipe) {
+        AFL_INFO(NKikimrServices::TX_COLUMNSHARD)("StatsReportPipe created", TabletID());
+        StatsReportPipe = ActorContext().Register(NTabletPipe::CreateClient(ActorContext().SelfID, CurrentSchemeShardId, {}));
+        return;
+    }
+
+    if (!TablesManager.GetTabletPathIdOptional()) {
+        AFL_ERROR(NKikimrServices::TX_COLUMNSHARD)("TablesManager not ready", TabletID());
         return;
     }
 
     const auto& tabletSchemeShardLocalPathId = TablesManager.GetTabletPathIdVerified().SchemeShardLocalPathId;
     const TActorContext& ctx = ActorContext();
-
-    if (!StatsReportPipe) {
-        AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD)("reate periodic stats pipe to ", CurrentSchemeShardId)("at tablet", TabletID());
-        NTabletPipe::TClientConfig clientConfig;
-        StatsReportPipe = ctx.Register(NTabletPipe::CreateClient(ctx.SelfID, CurrentSchemeShardId, clientConfig));
-    }
 
     if (!LastStats) {
         LastStats = std::make_unique<TEvDataShard::TEvPeriodicTableStats>(TabletID(), tabletSchemeShardLocalPathId.GetRawValue());
@@ -475,21 +492,35 @@ void TColumnShard::SendPeriodicStats(bool withExecutor) {
 }
 
 void TColumnShard::Handle(TEvPrivate::TEvReportBaseStatistics::TPtr& /*ev*/) {
-    auto statistics = AppDataVerified().ColumnShardConfig.GetStatistics();
-    auto scheduleDuration = TDuration::MilliSeconds(statistics.GetReportBaseStatisticsPeriodMs() + RandomNumber<ui32>(JitterIntervalMS));
-    ActorContext().Schedule(scheduleDuration, new TEvPrivate::TEvReportBaseStatistics);
-    AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD)("event", "TEvReportBaseStatistics")("ReportBaseStatisticsPeriodMs", statistics.GetReportBaseStatisticsPeriodMs())("scheduleDuration", scheduleDuration);
+    BaseStatsEvInflight--;
+    ScheduleBaseStatistics();
     SendPeriodicStats(false);
-    return;
 }
 
 void TColumnShard::Handle(TEvPrivate::TEvReportExecutorStatistics::TPtr& /*ev*/) {
+    ExecutorStatsEvInflight--;
+    ScheduleExecutorStatistics();
+    SendPeriodicStats(true);
+}
+
+void TColumnShard::ScheduleBaseStatistics() {
+    auto statistics = AppDataVerified().ColumnShardConfig.GetStatistics();
+    auto scheduleDuration = TDuration::MilliSeconds(statistics.GetReportBaseStatisticsPeriodMs() + RandomNumber<ui32>(JitterIntervalMS));
+    if (!BaseStatsEvInflight) {
+        BaseStatsEvInflight++;
+        ActorContext().Schedule(scheduleDuration, new TEvPrivate::TEvReportBaseStatistics);
+        AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD)("event", "TEvReportBaseStatistics")("ReportBaseStatisticsPeriodMs", statistics.GetReportBaseStatisticsPeriodMs())("scheduleDuration", scheduleDuration);
+    }
+}
+
+void TColumnShard::ScheduleExecutorStatistics() {
     auto statistics = AppDataVerified().ColumnShardConfig.GetStatistics();
     auto scheduleDuration = TDuration::MilliSeconds(statistics.GetReportExecutorStatisticsPeriodMs() + RandomNumber<ui32>(JitterIntervalMS));
-    ActorContext().Schedule(scheduleDuration, new TEvPrivate::TEvReportExecutorStatistics);
-    AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD)("event", "TEvReportExecutorStatistics")("ReportExecutorStatisticsPeriodMs", statistics.GetReportExecutorStatisticsPeriodMs())("scheduleDuration", scheduleDuration);
-    SendPeriodicStats(true);
-    return;
+    if (!ExecutorStatsEvInflight) {
+        ExecutorStatsEvInflight++;
+        ActorContext().Schedule(scheduleDuration, new TEvPrivate::TEvReportExecutorStatistics);
+        AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD)("event", "TEvReportExecutorStatistics")("ReportExecutorStatisticsPeriodMs", statistics.GetReportExecutorStatisticsPeriodMs())("scheduleDuration", scheduleDuration);
+    }
 }
 
 }   // namespace NKikimr::NColumnShard

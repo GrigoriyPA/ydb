@@ -6,8 +6,7 @@
 
 #include <arrow/type.h>
 
-namespace NYql {
-namespace NUdf {
+namespace NYql::NUdf {
 
 template <typename TTraits, typename... TArgs>
 std::unique_ptr<typename TTraits::TResult> MakeTupleArrowTraitsImpl(bool isOptional, TVector<std::unique_ptr<typename TTraits::TResult>>&& children, const TType* type, TArgs&&... args) {
@@ -112,12 +111,12 @@ std::unique_ptr<typename TTraits::TResult> DispatchByArrowTraits(const ITypeInfo
             ++nestLevel;
         }
 
-        auto reader = DispatchByArrowTraits<TTraits>(typeInfoHelper, previousType, pgBuilder, std::forward<TArgs>(args)...);
+        auto reader = DispatchByArrowTraits<TTraits>(typeInfoHelper, previousType, pgBuilder, args...);
         for (ui32 i = 1; i < nestLevel; ++i) {
             if constexpr (TTraits::PassType) {
-                reader = std::make_unique<typename TTraits::TExtOptional>(std::move(reader), types[nestLevel - 1 - i], std::forward<TArgs>(args)...);
+                reader = std::make_unique<typename TTraits::TExtOptional>(std::move(reader), types[nestLevel - 1 - i], args...);
             } else {
-                reader = std::make_unique<typename TTraits::TExtOptional>(std::move(reader), std::forward<TArgs>(args)...);
+                reader = std::make_unique<typename TTraits::TExtOptional>(std::move(reader), args...);
             }
         }
 
@@ -130,7 +129,7 @@ std::unique_ptr<typename TTraits::TResult> DispatchByArrowTraits(const ITypeInfo
     if (typeStruct) {
         TVector<std::unique_ptr<typename TTraits::TResult>> members;
         for (ui32 i = 0; i < typeStruct.GetMembersCount(); i++) {
-            members.emplace_back(DispatchByArrowTraits<TTraits>(typeInfoHelper, SkipTaggedType(typeInfoHelper, typeStruct.GetMemberType(i)), pgBuilder, std::forward<TArgs>(args)...));
+            members.emplace_back(DispatchByArrowTraits<TTraits>(typeInfoHelper, SkipTaggedType(typeInfoHelper, typeStruct.GetMemberType(i)), pgBuilder, args...));
         }
         // XXX: Use Tuple block reader for Struct.
         return MakeTupleArrowTraitsImpl<TTraits>(isOptional, std::move(members), type, std::forward<TArgs>(args)...);
@@ -140,7 +139,7 @@ std::unique_ptr<typename TTraits::TResult> DispatchByArrowTraits(const ITypeInfo
     if (typeTuple) {
         TVector<std::unique_ptr<typename TTraits::TResult>> children;
         for (ui32 i = 0; i < typeTuple.GetElementsCount(); ++i) {
-            children.emplace_back(DispatchByArrowTraits<TTraits>(typeInfoHelper, SkipTaggedType(typeInfoHelper, typeTuple.GetElementType(i)), pgBuilder, std::forward<TArgs>(args)...));
+            children.emplace_back(DispatchByArrowTraits<TTraits>(typeInfoHelper, SkipTaggedType(typeInfoHelper, typeTuple.GetElementType(i)), pgBuilder, args...));
         }
 
         return MakeTupleArrowTraitsImpl<TTraits>(isOptional, std::move(children), type, std::forward<TArgs>(args)...);
@@ -254,5 +253,4 @@ std::unique_ptr<typename TTraits::TResult> DispatchByArrowTraits(const ITypeInfo
     Y_ENSURE(false, "Unsupported type");
 }
 
-} // namespace NUdf
-} // namespace NYql
+} // namespace NYql::NUdf

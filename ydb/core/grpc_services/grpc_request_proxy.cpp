@@ -182,6 +182,7 @@ private:
         // do not check connect rights for the deprecated requests without database
         // remove this along with AllowYdbRequestsWithoutDatabase flag
         bool skipCheckConnectRights = false;
+        const EEmptyDatabaseMode emptyDatabaseMode = requestBaseCtx->GetEmptyDatabaseMode();
 
         if (state.State == NYdbGrpc::TAuthState::AS_NOT_PERFORMED) {
             if (IsBootstrapClusterEvent(event)) {
@@ -193,15 +194,20 @@ private:
             if (maybeDatabaseName && !maybeDatabaseName.GetRef().empty()) {
                 databaseName = CanonizePath(maybeDatabaseName.GetRef());
             } else {
-                if (!AllowYdbRequestsWithoutDatabase && DynamicNode && !std::is_same_v<TEvent, TEvRequestAuthAndCheck>) { // TEvRequestAuthAndCheck is allowed to be processed without database
-                    requestBaseCtx->ReplyUnauthenticated("Requests without specified database are not allowed");
-                    requestBaseCtx->FinishSpan();
-                    return;
-                } else {
-                    databaseName = RootDatabase;
-                    skipResourceCheck = true;
-                    skipCheckConnectRights = true;
+                if (!std::is_same_v<TEvent, TEvRequestAuthAndCheck>) { // TEvRequestAuthAndCheck is allowed to be processed without database
+                    Counters->IncEmptyDatabaseNameCounter();
+                    if (!AllowYdbRequestsWithoutDatabase &&
+                        (DynamicNode || emptyDatabaseMode == EEmptyDatabaseMode::EmptyDatabaseForbidden))
+                    {
+                        requestBaseCtx->ReplyUnauthenticated("Requests without specified database are not allowed");
+                        requestBaseCtx->FinishSpan();
+                        return;
+                    }
                 }
+
+                databaseName = RootDatabase;
+                skipResourceCheck = true;
+                skipCheckConnectRights = true;
             }
             if (databaseName.empty()) {
                 Counters->IncDatabaseUnavailableCounter();
@@ -546,19 +552,20 @@ void TGRpcRequestProxyImpl::HandleSchemeBoard(TSchemeBoardEvents::TEvNotifyUpdat
     }
 
     if (describeScheme.GetPathDescription().HasDomainDescription()
-        && describeScheme.GetPathDescription().GetDomainDescription().HasSecurityState()
-        && describeScheme.GetPathDescription().GetDomainDescription().GetSecurityState().PublicKeysSize() > 0) {
+        && describeScheme.GetPathDescription().GetDomainDescription().HasSecurityState())
+    {
+        const auto& securityState = describeScheme.GetPathDescription().GetDomainDescription().GetSecurityState();
         LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::GRPC_SERVER, "Updating SecurityState for " << databaseName);
-        Send(MakeTicketParserID(), new TEvTicketParser::TEvUpdateLoginSecurityState(
-            describeScheme.GetPathDescription().GetDomainDescription().GetSecurityState()
-            ));
+        if (securityState.PublicKeysSize() > 0) {
+            Send(MakeTicketParserID(), new TEvTicketParser::TEvUpdateLoginSecurityState(securityState));
+        } else {
+            LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::GRPC_SERVER, "Can't update SecurityState for " << databaseName << " - no PublicKeys");
+        }
     } else {
         if (!describeScheme.GetPathDescription().HasDomainDescription()) {
             LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::GRPC_SERVER, "Can't update SecurityState for " << databaseName << " - no DomainDescription");
         } else if (!describeScheme.GetPathDescription().GetDomainDescription().HasSecurityState()) {
             LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::GRPC_SERVER, "Can't update SecurityState for " << databaseName << " - no SecurityState");
-        } else if (describeScheme.GetPathDescription().GetDomainDescription().GetSecurityState().PublicKeysSize() == 0) {
-            LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::GRPC_SERVER, "Can't update SecurityState for " << databaseName << " - no PublicKeys");
         }
     }
 

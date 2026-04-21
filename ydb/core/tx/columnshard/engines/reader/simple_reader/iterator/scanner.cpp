@@ -10,10 +10,13 @@
 
 #include <ydb/core/tx/columnshard/engines/reader/abstract/read_metadata.h>
 #include <ydb/core/tx/columnshard/engines/reader/common/result.h>
+#include <ydb/core/tx/columnshard/engines/reader/tracing/data_source_probes.h>
 
 #include <ydb/library/actors/core/log.h>
 
 namespace NKikimr::NOlap::NReader::NSimple {
+
+LWTRACE_USING(YDB_CS_DATA_SOURCE);
 
 TConclusionStatus TScanHead::Start() {
     return TConclusionStatus::Success();
@@ -29,7 +32,7 @@ TScanHead::TScanHead(std::unique_ptr<NCommon::ISourcesConstructor>&& sourcesCons
         SyncPoints.emplace_back(std::make_shared<TSyncPointResultsAggregationControl>(
             SourcesCollection, Context->GetSourcesAggregationScript(), Context->GetRestoreResultScript(), SyncPoints.size(), context));
     } else if (readMetadataContext->IsSorted()) {
-        if (readMetadataContext->HasLimit() && !readMetadataContext->GetFakeSort()) {
+        if (readMetadataContext->HasLimit() && readMetadataContext->OrderByLimitAllowed()) {
             auto collection = std::make_shared<TScanWithLimitCollection>(Context, std::move(sourcesConstructor));
             SourcesCollection = collection;
             SyncPoints.emplace_back(std::make_shared<TSyncPointLimitControl>(
@@ -57,6 +60,7 @@ TConclusion<bool> TScanHead::BuildNextInterval() {
         if (!source) {
             return changed;
         }
+        source->OnStartProcessing();
         SyncPoints.front()->AddSource(std::move(source));
         changed = true;
     }

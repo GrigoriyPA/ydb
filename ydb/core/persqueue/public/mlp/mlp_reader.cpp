@@ -1,6 +1,9 @@
 #include "mlp_reader.h"
 
+#include <ydb/core/persqueue/public/constants.h>
+#include <ydb/core/persqueue/public/utils.h>
 #include <ydb/core/protos/grpc_pq_old.pb.h>
+#include <ydb/core/protos/pqdata_mlp.pb.h>
 #include <ydb/public/api/protos/ydb_topic.pb.h>
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/topic/codecs.h>
 
@@ -39,7 +42,12 @@ void TReaderActor::Handle(NDescriber::TEvDescribeTopicsResponse::TPtr& ev) {
     auto& topic = topics.begin()->second;
     switch(topic.Status) {
         case NDescriber::EStatus::SUCCESS: {
-            ReadBalancerTabletId = topic.Info->Description.GetBalancerTabletID();
+            Info = topic.Info;
+            ConsumerConfig = GetConsumer(Info->Description.GetPQTabletConfig(), Settings.Consumer);
+            if (!ConsumerConfig) {
+                return ReplyErrorAndDie(Ydb::StatusIds::SCHEME_ERROR,
+                    TStringBuilder() << "Consumer '" << Settings.Consumer << "' does not exist");
+            }
             return DoSelectPartition();
         }
         default: {
@@ -59,7 +67,7 @@ STFUNC(TReaderActor::DescribeState) {
 void TReaderActor::DoSelectPartition() {
     LOG_D("Start select partition");
     Become(&TReaderActor::SelectPartitionState);
-    SendToTablet(ReadBalancerTabletId, new TEvPQ::TEvMLPGetPartitionRequest(Settings.TopicName, Settings.Consumer));
+    SendToTablet(Info->Description.GetBalancerTabletID(), new TEvPQ::TEvMLPGetPartitionRequest(Settings.TopicName, Settings.Consumer));
 }
 
 void TReaderActor::Handle(TEvPQ::TEvMLPGetPartitionResponse::TPtr& ev) {
@@ -100,8 +108,17 @@ STFUNC(TReaderActor::SelectPartitionState) {
 void TReaderActor::DoRead() {
     LOG_D("Start read");
     Become(&TReaderActor::ReadState);
-    SendToTablet(PQTabletId, new TEvPQ::TEvMLPReadRequest(Settings.TopicName, Settings.Consumer, PartitionId,
-        Settings.WaitTime.ToDeadLine(), Settings.VisibilityTimeout.ToDeadLine(), Settings.MaxNumberOfMessage));
+
+    auto* request = new TEvPQ::TEvMLPReadRequest(
+        Settings.TopicName,
+        Settings.Consumer,
+        PartitionId,
+        Settings.WaitTime ? Settings.WaitTime->ToDeadLine() : TDuration::MilliSeconds(ConsumerConfig->GetDefaultReceiveMessageWaitTimeMs()).ToDeadLine(),
+        Settings.ProcessingTimeout ? Settings.ProcessingTimeout.value() : TDuration::Seconds(ConsumerConfig->GetDefaultProcessingTimeoutSeconds()),
+        Settings.MaxNumberOfMessage,
+        Settings.SkipMessageGroups
+    );
+    SendToTablet(PQTabletId, request);
 }
 
 void TReaderActor::Handle(TEvPQ::TEvMLPReadResponse::TPtr& ev) {
@@ -119,7 +136,7 @@ void TReaderActor::Handle(TEvPQ::TEvMLPReadResponse::TPtr& ev) {
 
         TString data;
         Ydb::Topic::Codec codec;
-        if (Settings.UncompressMessages &&proto.has_codec() && proto.codec() != Ydb::Topic::CODEC_RAW - 1) {
+        if (Settings.UncompressMessages && proto.has_codec() && proto.codec() != Ydb::Topic::CODEC_RAW - 1) {
             const NYdb::NTopic::ICodec* codecImpl = NYdb::NTopic::TCodecMap::GetTheCodecMap().GetOrThrow(static_cast<ui32>(proto.codec() + 1));
             data = codecImpl->Decompress(proto.GetData());
             codec = static_cast<Ydb::Topic::Codec>(proto.codec() + 1);
@@ -128,10 +145,34 @@ void TReaderActor::Handle(TEvPQ::TEvMLPReadResponse::TPtr& ev) {
             codec = Ydb::Topic::CODEC_RAW;
         }
 
+        TString messageGroupId;
+        TString messageDeduplicationId;
+
+        std::unordered_multimap<TString, TString> attributes(proto.GetMessageMeta().size());
+        for (const auto& meta : proto.GetMessageMeta()) {
+            if (meta.key() == MESSAGE_ATTRIBUTE_KEY) {
+                messageGroupId = std::move(meta.value());
+            } else if (meta.key() == MESSAGE_ATTRIBUTE_DEDUPLICATION_ID) {
+                messageDeduplicationId = std::move(meta.value());
+            } else {
+            attributes.emplace(meta.key(), meta.value());
+            }
+        }
+
         response->Messages.push_back(TEvReadResponse::TMessage{
             .MessageId = {PartitionId, message.GetId().GetOffset()},
             .Codec = codec,
-            .Data = std::move(data)
+            .Data = std::move(data),
+            .SentTimestamp = TInstant::MilliSeconds(message.GetMessageMeta().GetSentTimestampMilliseconds()),
+            .MessageGroupId = messageGroupId,
+            .MessageDeduplicationId = messageDeduplicationId,
+            .ApproximateReceiveCount = message.GetMessageMeta().HasApproximateReceiveCount()
+                ? std::make_optional(message.GetMessageMeta().GetApproximateReceiveCount())
+                : std::nullopt,
+            .ApproximateFirstReceiveTimestamp = message.GetMessageMeta().HasApproximateFirstReceiveTimestampMilliseconds() 
+                ? std::make_optional(TInstant::MilliSeconds(message.GetMessageMeta().GetApproximateFirstReceiveTimestampMilliseconds()))
+                : std::nullopt,
+            .Attributes = std::move(attributes),
         });
     }
 
@@ -143,7 +184,6 @@ void TReaderActor::Handle(TEvPQ::TEvMLPErrorResponse::TPtr& ev) {
     // TODO MLP Retry
     LOG_D("Handle TEvPQ::TEvMLPErrorResponse " << ev->Get()->Record.ShortDebugString());
     ReplyErrorAndDie(ev->Get()->GetStatus(), std::move(ev->Get()->GetErrorMessage()));
-    PassAway();
 }
 
 void TReaderActor::HandleOnRead(TEvPipeCache::TEvDeliveryProblem::TPtr& ev) {
@@ -184,6 +224,7 @@ void TReaderActor::PassAway() {
         Send(ChildActorId, new TEvents::TEvPoison());
     }
     Send(MakePipePerNodeCacheID(false), new TEvPipeCache::TEvUnlink(0));
+    TBaseActor::PassAway();
 }
 
 bool TReaderActor::OnUnhandledException(const std::exception& exc) {

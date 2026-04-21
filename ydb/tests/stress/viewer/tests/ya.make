@@ -1,5 +1,5 @@
 PY3TEST()
-INCLUDE(${ARCADIA_ROOT}/ydb/tests/ydbd_dep.inc)
+INCLUDE(${ARCADIA_ROOT}/ydb/tests/harness_dep.inc)
 ENV(YDB_TEST_PATH="ydb/tests/stress/viewer/viewer")
 
 TEST_SRCS(
@@ -7,10 +7,11 @@ TEST_SRCS(
 )
 
 IF (SANITIZER_TYPE)
-    REQUIREMENTS(ram:32)
+    REQUIREMENTS(ram:32 cpu:2)
 ENDIF()
 
 SIZE(MEDIUM)
+REQUIREMENTS(cpu:2)
 
 DEPENDS(
     ydb/tests/stress/viewer

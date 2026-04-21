@@ -8,7 +8,7 @@
 
 namespace NSQLComplete {
 
-const TVector<TStringBuf> FilteredByPrefix(
+TVector<TStringBuf> FilteredByPrefix(
     const TString& prefix,
     const TVector<TString>& sorted Y_LIFETIME_BOUND) {
     auto [first, last] = EqualRange(
@@ -52,6 +52,8 @@ void NameIndexScan(
 class IRankingNameService: public INameService {
 private:
     auto Ranking(const TNameRequest& request) const {
+        // TODO(YQL-20095): Explore real problem to fix this.
+        // NOLINTNEXTLINE(bugprone-exception-escape)
         return [request, this](auto f) {
             TNameResponse response = f.ExtractValue();
             Ranking_->CropToSortedPrefix(
@@ -259,9 +261,9 @@ private:
 };
 
 INameService::TPtr MakeStaticNameService(TNameSet names, TFrequencyData frequency) {
-    return MakeStaticNameService(
-        Pruned(std::move(names), frequency),
-        MakeDefaultRanking(std::move(frequency)));
+    names = Pruned(std::move(names), frequency);
+    IRanking::TPtr ranking = MakeDefaultRanking(std::move(frequency));
+    return MakeStaticNameService(std::move(names), std::move(ranking));
 }
 
 INameService::TPtr MakeStaticNameService(TNameSet names, IRanking::TPtr ranking) {

@@ -24,6 +24,8 @@ SRCS(
     interconnect.h
     interconnect_handshake.cpp
     interconnect_handshake.h
+    interconnect_host_metrics_aggregator.cpp
+    interconnect_host_metrics_aggregator.h
     interconnect_impl.h
     interconnect_mon.cpp
     interconnect_mon.h
@@ -66,11 +68,14 @@ PEERDIR(
     ydb/library/actors/helpers
     ydb/library/actors/interconnect/address
     ydb/library/actors/interconnect/poller
+    ydb/library/actors/interconnect/rdma
+    ydb/library/actors/interconnect/rdma/cq_actor
     ydb/library/actors/prof
     ydb/library/actors/protos
     ydb/library/actors/util
     ydb/library/actors/wilson
     library/cpp/digest/crc32c
+    library/cpp/html/pcdata
     library/cpp/json
     library/cpp/lwtrace
     library/cpp/monlib/dynamic_counters
@@ -87,10 +92,15 @@ IF (OS_LINUX)
     RECURSE(
         rdma
     )
+
+    RECURSE_FOR_TESTS(
+        ut_rdma
+    )
 ENDIF()
 
 RECURSE_FOR_TESTS(
     ut
     ut_fat
     ut_huge_cluster
+    ut_kernel_liveness
 )

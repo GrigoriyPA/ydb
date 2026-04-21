@@ -3,7 +3,6 @@
 
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/formats/arrow/reader/position.h>
-#include <ydb/core/protos/config.pb.h>
 #include <ydb/core/tx/columnshard/common/limits.h>
 #include <ydb/core/tx/columnshard/common/path_id.h>
 #include <ydb/core/tx/columnshard/common/portion.h>
@@ -56,6 +55,10 @@ public:
         return !Level && !InternalLevelWeight;
     }
 
+    bool IsCritical() const {
+        return Level >= 10;
+    }
+
     TString DebugString() const {
         return TStringBuilder() << "(" << Level << "," << InternalLevelWeight << ")";
     }
@@ -66,6 +69,10 @@ public:
 
     static TOptimizationPriority Optimization(const i64 weight) {
         return TOptimizationPriority(0, weight);
+    }
+
+    static TOptimizationPriority LevelOptimization(const i64 weight) {
+        return TOptimizationPriority(1, weight);
     }
 
     static TOptimizationPriority Zero() {
@@ -112,7 +119,7 @@ private:
 
 protected:
     virtual void DoModifyPortions(
-        const THashMap<ui64, std::shared_ptr<TPortionInfo>>& add, const THashMap<ui64, std::shared_ptr<TPortionInfo>>& remove) = 0;
+        const std::vector<std::shared_ptr<TPortionInfo>>& add, const std::vector<std::shared_ptr<TPortionInfo>>& remove) = 0;
     virtual std::vector<std::shared_ptr<TColumnEngineChanges>> DoGetOptimizationTasks(
         std::shared_ptr<TGranuleMeta> granule, const std::shared_ptr<NDataLocks::TManager>& dataLocksManager) const = 0;
     virtual TOptimizationPriority DoGetUsefulMetric() const = 0;
@@ -123,7 +130,6 @@ protected:
     virtual NJson::TJsonValue DoSerializeToJsonVisual() const {
         return NJson::JSON_NULL;
     }
-    virtual bool DoIsLocked(const std::shared_ptr<NDataLocks::TManager>& dataLocksManager) const = 0;
     virtual std::vector<TTaskDescription> DoGetTasksDescription() const = 0;
     virtual TConclusionStatus DoCheckWriteData() const {
         return TConclusionStatus::Success();
@@ -150,6 +156,7 @@ public:
         : PathId(pathId)
         , NodePortionsCountLimit(nodePortionsCountLimit) {
         Counters->NodePortionsCountLimit->Set(NodePortionsCountLimit ? *NodePortionsCountLimit : DynamicPortionsCountLimit.load());
+        Counters->BadPortionsCountLimit->Set(GetBadPortionsLimit());
     }
 
     bool IsOverloaded(const NMonitoring::TDynamicCounters::TCounterPtr& badPortions) const {
@@ -172,12 +179,7 @@ public:
         return DoIsOverloaded();
     }
 
-    ui64 GetBadPortionsLimit() const {
-        if (AppDataVerified().ColumnShardConfig.GetBadPortionsLimit()) {
-            return AppDataVerified().ColumnShardConfig.GetBadPortionsLimit();
-        }
-        return 2 * GetNodePortionsCountLimit();
-    }
+    ui64 GetBadPortionsLimit() const;
 
     ui64 GetNodePortionsCountLimit() const {
         return NodePortionsCountLimit.value_or(DynamicPortionsCountLimit.load());
@@ -208,8 +210,8 @@ public:
     class TModificationGuard: TNonCopyable {
     private:
         IOptimizerPlanner& Owner;
-        THashMap<ui64, std::shared_ptr<TPortionInfo>> AddPortions;
-        THashMap<ui64, std::shared_ptr<TPortionInfo>> RemovePortions;
+        std::vector<std::shared_ptr<TPortionInfo>> AddPortions;
+        std::vector<std::shared_ptr<TPortionInfo>> RemovePortions;
 
     public:
         TModificationGuard& AddPortion(const std::shared_ptr<TPortionInfo>& portion);
@@ -241,7 +243,7 @@ public:
         return DoSerializeToJsonVisual();
     }
 
-    void ModifyPortions(const THashMap<ui64, std::shared_ptr<TPortionInfo>>& add, const THashMap<ui64, std::shared_ptr<TPortionInfo>>& remove) {
+    void ModifyPortions(const std::vector<std::shared_ptr<TPortionInfo>>& add, const std::vector<std::shared_ptr<TPortionInfo>>& remove) {
         NActors::TLogContextGuard g(NActors::TLogContextBuilder::Build(NKikimrServices::TX_COLUMNSHARD)("path_id", PathId));
         LocalPortionsCount.Add(add.size());
         LocalPortionsCount.Sub(remove.size());
@@ -306,8 +308,10 @@ public:
         return NodePortionsCountLimit;
     }
 
-    static std::shared_ptr<IOptimizerPlannerConstructor> BuildDefault() {
-        auto result = TFactory::MakeHolder("tiling");
+    static std::shared_ptr<IOptimizerPlannerConstructor> BuildDefault();
+
+    static std::shared_ptr<IOptimizerPlannerConstructor> BuildDefault(const TString& defaultCompactionName) {
+        auto result = TFactory::MakeHolder(defaultCompactionName);
         AFL_VERIFY(!!result);
         return std::shared_ptr<IOptimizerPlannerConstructor>(result.Release());
     }

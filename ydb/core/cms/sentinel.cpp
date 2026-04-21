@@ -85,11 +85,14 @@ void TNodeStatusComputer::AddState(ENodeState newState) {
 
 /// TPDiskStatusComputer
 
-TPDiskStatusComputer::TPDiskStatusComputer(const ui32& defaultStateLimit, const ui32& goodStateLimit, const TLimitsMap& stateLimits)
+TPDiskStatusComputer::TPDiskStatusComputer(const ui32& defaultStateLimit, const ui32& goodStateLimit, const TLimitsMap& stateLimits,
+                                           TInstant cmsFirstBootTimestamp, const TDuration& initialDeploymentGracePeriod)
     : DefaultStateLimit(defaultStateLimit)
     , GoodStateLimit(goodStateLimit)
     , StateLimits(stateLimits)
     , StateCounter(0)
+    , CMSFirstBootTimestamp(cmsFirstBootTimestamp)
+    , InitialDeploymentGracePeriod(initialDeploymentGracePeriod)
 {
 }
 
@@ -171,7 +174,11 @@ EPDiskStatus TPDiskStatusComputer::Compute(EPDiskStatus current, TString& reason
             }
         }
 
-        return EPDiskStatus::INACTIVE;
+        if (IsInitialDeploymentGracePeriod() && State == NKikimrBlobStorage::TPDiskState::Normal) {
+            return EPDiskStatus::ACTIVE;
+        } else {
+            return EPDiskStatus::INACTIVE;
+        }
     }
 
     reason = TStringBuilder()
@@ -219,10 +226,21 @@ void TPDiskStatusComputer::ResetForcedStatus() {
     ForcedStatus.Clear();
 }
 
+bool TPDiskStatusComputer::IsInitialDeploymentGracePeriod() const {
+    if (TlsActivationContext) {
+        return CMSFirstBootTimestamp + InitialDeploymentGracePeriod > TActivationContext::Now();
+    } else {
+        return false; // unsupported outside of actorsystem
+    }
+}
+
 /// TPDiskStatus
 
-TPDiskStatus::TPDiskStatus(EPDiskStatus initialStatus, const ui32& defaultStateLimit, const ui32& goodStateLimit, const TLimitsMap& stateLimits)
-    : TPDiskStatusComputer(defaultStateLimit, goodStateLimit, stateLimits)
+
+TPDiskStatus::TPDiskStatus(EPDiskStatus initialStatus, const ui32& defaultStateLimit,
+                           const ui32& goodStateLimit, const TLimitsMap& stateLimits,
+                           TInstant cmsFirstBootTimestamp, const TDuration& initialDeploymentGracePeriod)
+    : TPDiskStatusComputer(defaultStateLimit, goodStateLimit, stateLimits, cmsFirstBootTimestamp, initialDeploymentGracePeriod)
     , Current(initialStatus)
     , ChangingAllowed(true)
 {
@@ -284,8 +302,11 @@ void TPDiskStatus::DisallowChanging() {
 
 /// TPDiskInfo
 
-TPDiskInfo::TPDiskInfo(EPDiskStatus initialStatus, const ui32& defaultStateLimit, const ui32& goodStateLimit, const TLimitsMap& stateLimits)
-    : TPDiskStatus(initialStatus, defaultStateLimit, goodStateLimit, stateLimits)
+TPDiskInfo::TPDiskInfo(EPDiskStatus initialStatus, const ui32& defaultStateLimit,
+                       const ui32& goodStateLimit, const TLimitsMap& stateLimits,
+                       TInstant cmsFirstBootTimestamp, const TDuration& initialDeploymentGracePeriod)
+    : TPDiskStatus(initialStatus, defaultStateLimit, goodStateLimit, stateLimits,
+                   cmsFirstBootTimestamp, initialDeploymentGracePeriod)
     , ActualStatus(initialStatus)
 {
     Touch();
@@ -619,7 +640,9 @@ class TConfigUpdater: public TUpdaterBase<TEvSentinel::TEvConfigUpdated, TConfig
                     continue;
                 }
 
-                pdisks.emplace(id, new TPDiskInfo(pdisk.GetDriveStatus(), Config.DefaultStateLimit, Config.GoodStateLimit, Config.StateLimits));
+                pdisks.emplace(id, new TPDiskInfo(pdisk.GetDriveStatus(), Config.DefaultStateLimit,
+                                                  Config.GoodStateLimit, Config.StateLimits,
+                                                  CmsState->FirstBootTimestamp, Config.InitialDeploymentGracePeriod));
             }
 
             SentinelState->ConfigUpdaterState.GotBSCResponse = true;
@@ -1094,7 +1117,9 @@ class TSentinel: public TActorBootstrapped<TSentinel> {
 
         // we ignore all previous unhandled requests
         // usually it will never happen with correct config
-        SentinelState->ChangeRequests.clear();
+        if (SentinelState->StatusChangeAttempt == 0) {
+            SentinelState->ChangeRequests.clear();
+        }
 
         for (const auto& id : allowed) {
             Y_ABORT_UNLESS(SentinelState->PDisks.contains(id));
@@ -1121,8 +1146,10 @@ class TSentinel: public TActorBootstrapped<TSentinel> {
             LogStatusChange(id, status, requiredStatus, reason);
 
             if (!Config.DryRun) {
-                SentinelState->ChangeRequests.emplace(id, info);
-                (*Counters->PDisksPendingChange)++;
+                auto [_, inserted] = SentinelState->ChangeRequests.insert_or_assign(id, info);
+                if (inserted) {
+                    (*Counters->PDisksPendingChange)++;
+                }
             }
         }
 

@@ -3,8 +3,7 @@
 #include <util/system/yassert.h> // Y_ASSERT
 #include "udf_type_size_check.h"
 
-namespace NYql {
-namespace NUdf {
+namespace NYql::NUdf {
 
 namespace NDetails {
 struct TDelete {
@@ -21,6 +20,8 @@ struct TDelete {
 template <typename T, typename D = NDetails::TDelete>
 class TUniquePtr {
 public:
+    // Implicit ownership capturing is okay for smart pointers
+    // NOLINTNEXTLINE(google-explicit-constructor)
     inline TUniquePtr(T* ptr = nullptr)
         : Ptr_(ptr)
     {
@@ -114,21 +115,24 @@ public:
 template <typename T, typename Ops = TDefaultRefCountedPtrOps<T>>
 class TRefCountedPtr {
 public:
-    enum AddRef {
+    enum EAddRef {
         ADD_REF
     };
-    enum StealRef {
+
+    enum EStealRef {
         STEAL_REF
     };
 
 public:
+    // Implicit ownership capturing is okay for smart pointers
+    // NOLINTNEXTLINE(google-explicit-constructor)
     inline TRefCountedPtr(T* ptr = nullptr)
         : Ptr_(ptr)
     {
         Ref();
     }
 
-    inline TRefCountedPtr(T* ptr, StealRef)
+    inline TRefCountedPtr(T* ptr, EStealRef)
         : Ptr_(ptr)
     {
         // do not call Ref() on new pointer
@@ -178,7 +182,7 @@ public:
         }
     }
 
-    inline void Reset(T* ptr, StealRef) {
+    inline void Reset(T* ptr, EStealRef) {
         if (Ptr_ != ptr) {
             UnRef();
             Ptr_ = ptr;
@@ -262,5 +266,4 @@ private:
 
 UDF_ASSERT_TYPE_SIZE(IRefCounted, 16);
 
-} // namespace NUdf
-} // namespace NYql
+} // namespace NYql::NUdf

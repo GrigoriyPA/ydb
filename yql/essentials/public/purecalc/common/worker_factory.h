@@ -11,8 +11,7 @@
 #include <yql/essentials/core/yql_type_annotation.h>
 #include <utility>
 
-namespace NYql {
-namespace NPureCalc {
+namespace NYql::NPureCalc {
 struct TWorkerFactoryOptions {
     IProgramFactoryPtr Factory;
     const TInputSpecBase& InputSpec;
@@ -33,8 +32,8 @@ struct TWorkerFactoryOptions {
     TMaybe<ui64> DeterministicTimeProviderSeed;
     bool UseSystemColumns;
     bool UseWorkerPool;
-    bool UseAntlr4;
     TInternalProgramSettings InternalSettings;
+    TString IssueReportTarget;
 
     TWorkerFactoryOptions(
         IProgramFactoryPtr Factory,
@@ -56,8 +55,8 @@ struct TWorkerFactoryOptions {
         TMaybe<ui64> deterministicTimeProviderSeed,
         bool useSystemColumns,
         bool useWorkerPool,
-        bool useAntlr4,
-        const TInternalProgramSettings& internalSettings)
+        const TInternalProgramSettings& internalSettings,
+        TString issueReportTarget)
         : Factory(std::move(Factory))
         , InputSpec(InputSpec)
         , OutputSpec(OutputSpec)
@@ -77,8 +76,8 @@ struct TWorkerFactoryOptions {
         , DeterministicTimeProviderSeed(deterministicTimeProviderSeed)
         , UseSystemColumns(useSystemColumns)
         , UseWorkerPool(useWorkerPool)
-        , UseAntlr4(useAntlr4)
         , InternalSettings(internalSettings)
+        , IssueReportTarget(std::move(issueReportTarget))
     {
     }
 };
@@ -111,6 +110,7 @@ protected:
     bool UseWorkerPool_;
     TLangVersion LangVer_;
     TVector<THolder<IWorker>> WorkerPool_;
+    const TString IssueReportTarget_;
 
 public:
     TWorkerFactory(TWorkerFactoryOptions, EProcessorMode);
@@ -141,7 +141,6 @@ private:
                             const THashMap<TString, TString>& modules,
                             const TInputSpecBase& inputSpec,
                             const TOutputSpecBase& outputSpec,
-                            bool useAntlr4,
                             EProcessorMode processorMode,
                             TTypeAnnotationContext* typeContext);
 };
@@ -178,5 +177,4 @@ public:
 public:
     TWorkerHolder<IPushStreamWorker> MakeWorker() override;
 };
-} // namespace NPureCalc
-} // namespace NYql
+} // namespace NYql::NPureCalc

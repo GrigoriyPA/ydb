@@ -17,9 +17,10 @@ void TGRpcYdbImportService::SetupIncomingRequests(NYdbGrpc::TLoggerPtr logger) {
 #endif
 
 #define SETUP_IMPORT_METHOD(methodName, methodCallback, rlMode, requestType, auditMode) \
-    SETUP_METHOD(methodName, methodCallback, rlMode, requestType, import, auditMode)
+    SETUP_METHOD(methodName, methodCallback, rlMode, requestType, import, auditMode, EEmptyDatabaseMode::EmptyDatabaseForbidden)
 
     SETUP_IMPORT_METHOD(ImportFromS3, DoImportFromS3Request, RLMODE(Off), UNSPECIFIED, TAuditMode::Modifying(TAuditMode::TLogClassConfig::ExportImport));
+    SETUP_IMPORT_METHOD(ImportFromFs, DoImportFromFsRequest, RLMODE(Off), UNSPECIFIED, TAuditMode::Modifying(TAuditMode::TLogClassConfig::ExportImport));
     SETUP_IMPORT_METHOD(ListObjectsInS3Export, DoListObjectsInS3ExportRequest, RLMODE(Off), UNSPECIFIED, TAuditMode::NonModifying());
     SETUP_IMPORT_METHOD(ImportData, DoImportDataRequest, RLMODE(Off), UNSPECIFIED, TAuditMode::Modifying(TAuditMode::TLogClassConfig::ExportImport));
 

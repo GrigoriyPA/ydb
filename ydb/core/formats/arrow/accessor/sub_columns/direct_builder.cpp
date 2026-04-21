@@ -2,15 +2,11 @@
 #include "columns_storage.h"
 #include "direct_builder.h"
 
+#include <util/string/escape.h>
 #include <ydb/core/formats/arrow/accessor/plain/accessor.h>
 #include <ydb/core/formats/arrow/accessor/sparsed/accessor.h>
 
-#include <contrib/libs/simdjson/include/simdjson/dom/array-inl.h>
-#include <contrib/libs/simdjson/include/simdjson/dom/document-inl.h>
-#include <contrib/libs/simdjson/include/simdjson/dom/element-inl.h>
-#include <contrib/libs/simdjson/include/simdjson/dom/object-inl.h>
-#include <contrib/libs/simdjson/include/simdjson/dom/parser-inl.h>
-#include <contrib/libs/simdjson/include/simdjson/ondemand.h>
+#include <contrib/libs/simdjson/include/simdjson.h>
 
 namespace NKikimr::NArrow::NAccessor::NSubColumns {
 
@@ -121,19 +117,14 @@ TOthersData TDataBuilder::MergeOthers(const std::vector<TColumnElements*>& other
 }
 
 std::string BuildString(const TStringBuf currentPrefix, const TStringBuf key) {
-    if (key.find(".") != std::string::npos) {
-        if (currentPrefix.size()) {
-            return Sprintf("%.*s.\"%.*s\"", currentPrefix.size(), currentPrefix.data(), key.size(), key.data());
-        } else {
-            return Sprintf("\"%.*s\"", key.size(), key.data());
-        }
-    } else {
-        if (currentPrefix.size()) {
-            return Sprintf("%.*s.%.*s", currentPrefix.size(), currentPrefix.data(), key.size(), key.data());
-        } else {
-            return std::string(key.data(), key.size());
-        }
+    TStringBuilder builder;
+    const auto escapedKey = QuoteJsonItem(key);
+    if (currentPrefix.size()) {
+        builder << currentPrefix << ".";
     }
+    builder << escapedKey;
+
+    return builder;
 }
 
 TStringBuf TDataBuilder::AddKeyOwn(const TStringBuf currentPrefix, std::string&& key) {

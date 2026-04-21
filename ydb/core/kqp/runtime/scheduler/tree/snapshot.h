@@ -10,10 +10,10 @@ namespace NKikimr::NKqp::NScheduler::NHdrf::NSnapshot {
         ui64 TotalLimit = Infinity();
         ui64 FairShare = 0;
 
-        ui64 Demand = 0;
-        ui64 Usage = 0;
-        ui64 BurstUsage = 0;
-        ui64 BurstThrottle = 0;
+        ui64 CpuDemand = 0;
+        ui64 CpuUsage = 0;
+        ui64 CpuBurstUsage = 0;
+        ui64 CpuBurstThrottle = 0;
         std::optional<float> Satisfaction;
 
         const TMonotonic Timestamp = TMonotonic::Now();
@@ -24,12 +24,12 @@ namespace NKikimr::NKqp::NScheduler::NHdrf::NSnapshot {
 
         virtual void AccountSnapshotDuration(const TDuration& period);
         virtual void UpdateBottomUp(ui64 totalLimit);
-        void UpdateTopDown(bool allowFairShareOverlimit);
+        void UpdateTopDown(ELeafFairShare fairShareMode);
     };
 
     class TQuery : public TTreeElement, public NHdrf::TQuery<ETreeType::SNAPSHOT>, public std::enable_shared_from_this<TQuery> {
     public:
-        TQuery(const TQueryId& queryId, NDynamic::TQueryPtr query);
+        TQuery(const TQueryId& queryId, const NDynamic::TQueryPtr& query);
 
         std::weak_ptr<NDynamic::TQuery> Origin; // TODO: why public?
     };
@@ -51,7 +51,7 @@ namespace NKikimr::NKqp::NScheduler::NHdrf::NSnapshot {
     public:
         TRoot();
 
-        inline bool IsRoot() const final {
+        bool IsRoot() const final {
             return true;
         }
 
@@ -62,4 +62,4 @@ namespace NKikimr::NKqp::NScheduler::NHdrf::NSnapshot {
         void AccountPreviousSnapshot(const TRootPtr& snapshot);
     };
 
-}
+} // namespace NKikimr::NKqp::NScheduler::NHdrf::NSnapshot

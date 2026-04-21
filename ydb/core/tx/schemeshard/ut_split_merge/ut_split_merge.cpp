@@ -1,8 +1,11 @@
 #include <ydb/core/protos/counters_schemeshard.pb.h>
+#include <ydb/core/protos/schemeshard_config.pb.h>
 #include <ydb/core/protos/table_stats.pb.h>
 #include <ydb/core/tablet_flat/util_fmt_cell.h>
 #include <ydb/core/testlib/actors/block_events.h>
 #include <ydb/core/tx/schemeshard/ut_helpers/helpers.h>
+#include <ydb/core/tx/schemeshard/ut_helpers/helpers_flags_n.h>  // for Y_UNIT_TEST_FLAGS_N
+#include <ydb/core/tx/schemeshard/ut_helpers/test_with_reboots.h>
 
 using namespace NKikimr;
 using namespace NKikimr::NMiniKQL;
@@ -10,6 +13,19 @@ using namespace NSchemeShard;
 using namespace NSchemeShardUT_Private;
 
 namespace {
+
+constexpr ui32 MAX_SPLIT_PROTOCOL_VERSION = 3;
+
+ui32 GetSplitProtocolVersion(TTestActorRuntime& runtime) {
+    if (runtime.GetAppData().FeatureFlags.GetEnableDataShardSplitHistogramOmission()) {
+        return 3;
+    } else if (runtime.GetAppData().FeatureFlags.GetEnableDataShardSplitKeySelection()) {
+        return 2;
+    } else if (runtime.GetAppData().FeatureFlags.GetEnableDataShardSplitHistogramSorting()) {
+        return 1;
+    }
+    return 0;
+}
 
 void WaitForTableSplit(TTestActorRuntime& runtime, const TString& path, size_t requiredPartitionCount = 10) {
     while (true) {
@@ -27,7 +43,8 @@ void WaitForTableSplit(TTestActorRuntime& runtime, const TString& path, size_t r
             return;
     }
 }
-}
+
+}  // namespace anonymous
 
 Y_UNIT_TEST_SUITE(TSchemeShardSplitBySizeTest) {
     Y_UNIT_TEST(Test) {
@@ -134,14 +151,21 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitBySizeTest) {
                            {NLs::PartitionKeys({""})});
     }
 
-    Y_UNIT_TEST(Split10Shards) {
-        TTestBasicRuntime runtime;
-
+    void Split10Shards(ui32 splitProtocolVersion) {
         TTestEnvOptions opts;
+        if (splitProtocolVersion == 1) {
+            opts.EnableDataShardSplitHistogramSorting(true);
+        } else if (splitProtocolVersion == 2) {
+            opts.EnableDataShardSplitKeySelection(true);
+        } else if (splitProtocolVersion == 3) {
+            opts.EnableDataShardSplitHistogramOmission(true);
+        }
         opts.EnableBackgroundCompaction(false);
         opts.DataShardStatsReportIntervalSeconds(1);
-
+        TTestBasicRuntime runtime;
         TTestEnv env(runtime, opts);
+
+        UNIT_ASSERT_VALUES_EQUAL(splitProtocolVersion, GetSplitProtocolVersion(runtime));
 
         ui64 txId = 100;
 
@@ -201,6 +225,22 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitBySizeTest) {
 
         WaitForTableSplit(runtime, "/MyRoot/Table");
     }
+    struct TTestRegistrationSplit10Shards {
+        TTestRegistrationSplit10Shards() {
+            static std::vector<TString> TestNames;
+
+            for (const auto& i : xrange(MAX_SPLIT_PROTOCOL_VERSION + 1)) {
+                TestNames.emplace_back(TStringBuilder() << "Split10Shards-protocol" << i);
+
+                TCurrentTest::AddTest(
+                    TestNames.back().c_str(),
+                    std::bind(std::bind(Split10Shards, i), std::placeholders::_1),
+                    /*forceFork*/ false
+                );
+            }
+        }
+    };
+    static TTestRegistrationSplit10Shards testRegistrationSplit10Shards;
 
     Y_UNIT_TEST(SplitShardsWithDecimalKey) {
         TTestBasicRuntime runtime;
@@ -491,8 +531,12 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitBySizeTest) {
         }
     }
 
-    Y_UNIT_TEST(AutoMergeInOne) {
-        TTestWithReboots t;
+    Y_UNIT_TEST_WITH_REBOOTS_BUCKETS(AutoMergeInOne, 2, 1, false) {
+        NDataShard::gDbStatsDataSizeResolution = 1;
+        NDataShard::gDbStatsRowCountResolution = 1;
+        t.EnvOpts.EnableBackgroundCompaction(false);
+        t.EnvOpts.DataShardStatsReportIntervalSeconds(0);
+        t.EnvOpts.EnableRealSystemViewPaths(false);
         t.Run([&](TTestActorRuntime& runtime, bool& activeZone) {
             {
                 TInactiveZone inactive(activeZone);
@@ -508,6 +552,9 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitBySizeTest) {
 
                 TestDescribeResult(DescribePath(runtime, "/MyRoot/Table", true),
                                    {NLs::PartitionKeys({"A", ""})});
+
+                TControlBoard::SetValue(1, runtime.GetAppData().Icb->SchemeShardControls.MergeByLoadMinUptimeSec);
+                TControlBoard::SetValue(10, runtime.GetAppData().Icb->SchemeShardControls.MergeByLoadMinLowLoadDurationSec);
             }
 
             TVector<THolder<IEventHandle>> suppressed;
@@ -687,13 +734,16 @@ enum class ESendDuplicateTableStatsStrategy {
 // Assumed index configuration: 1 initial datashard, Uint64 key.
 //
 struct TLoadAndSplitSimulator {
-    std::map<ui32, NKikimrTabletBase::TMetrics> MetricsPatchByFollowerId;
+    std::map<ui32, NKikimrTabletBase::TMetrics> MetricsPatchByFollowerIdPeriodic;
+    std::map<ui32, NKikimrTabletBase::TMetrics> MetricsPatchByFollowerIdStats;
     NKikimrTableStats::THistogram KeyAccessHistogramPatch;
     ui64 TableLocalPathId;
     ui64 TableOwnerId;
     bool ShouldSendReadRequests;
     ESendDuplicateTableStatsStrategy SendDuplicateTableStats;
     std::map<ui64, std::unique_ptr<IEventHandle>> DuplicateTableStatsByDatashardId;
+    ui32 SplitProtocolVersion = 0;
+
     TTestActorRuntime* TestRuntime;
     TActorId SenderActorId;
 
@@ -726,7 +776,8 @@ struct TLoadAndSplitSimulator {
         ui64 initialDatashardId,
         bool shouldSendReadRequests,
         ESendDuplicateTableStatsStrategy sendDuplicateTableStats,
-        const std::map<ui32, ui32>& targetCpuLoadByFolowerId,
+        const std::map<ui32, i32>& targetCpuLoadByFollowerIdPeriodic,
+        const std::map<ui32, i32>& targetCpuLoadByFollowerIdStats,
         TTestActorRuntime& testRuntime
     ) : TableLocalPathId(tableLocalPathId)
         , TableOwnerId(tableOwnerId)
@@ -734,15 +785,25 @@ struct TLoadAndSplitSimulator {
         , SendDuplicateTableStats(sendDuplicateTableStats)
         , TestRuntime(&testRuntime)
     {
-        for (const auto& [followerId, targetCpuLoad] : targetCpuLoadByFolowerId) {
-            MetricsPatchByFollowerId[followerId].SetCPU(CpuLoadMicroseconds(targetCpuLoad));
+        for (const auto& [followerId, targetCpuLoad] : targetCpuLoadByFollowerIdPeriodic) {
+            MetricsPatchByFollowerIdPeriodic[followerId].SetCPU(CpuLoadMicroseconds(targetCpuLoad));
         }
 
-        //NOTE: histogram must have at least 3 buckets with different keys to be able to produce split key
-        // (see ydb/core/tx/schemeshard/schemeshard__table_stats_histogram.cpp, DoFindSplitKey() and ChooseSplitKeyByKeySample())
+        for (const auto& [followerId, targetCpuLoad] : targetCpuLoadByFollowerIdStats) {
+            if (targetCpuLoad >= 0) {
+                MetricsPatchByFollowerIdStats[followerId].SetCPU(CpuLoadMicroseconds(targetCpuLoad));
+            } else {
+                MetricsPatchByFollowerIdStats[followerId].ClearCPU();
+            }
+        }
+
+        // NOTE: histogram must have at least 3 buckets with different keys to be able to produce split key
+        // (see ydb/core/split/key_access.cpp, FindSplitKeyPrefix() and SelectShortestMedianKeyPrefix())
         HistogramAddBucket(KeyAccessHistogramPatch, 999998, 1000);
         HistogramAddBucket(KeyAccessHistogramPatch, 999999, 1000);
         HistogramAddBucket(KeyAccessHistogramPatch, 1000000, 1000);
+
+        SplitProtocolVersion = GetSplitProtocolVersion(testRuntime);
 
         DatashardsKeyRanges[initialDatashardId] = std::make_pair(0, 1000000);
 
@@ -752,12 +813,27 @@ struct TLoadAndSplitSimulator {
             SenderActorId = TestRuntime->Register(new TDummyActor());
         }
 
-        for (const auto& [followerId, targetCpuLoad] : targetCpuLoadByFolowerId) {
+        for (const auto& [followerId, targetCpuLoad] : targetCpuLoadByFollowerIdPeriodic) {
             Cerr << "TEST TLoadAndSplitSimulator for table id " << TableLocalPathId
-                << ", target CPU load for followerId " << followerId
+                << ", target CPU load (EvPeriodicTableStats) for followerId " << followerId
                 << " is " << targetCpuLoad
                 << "%"
                 << Endl;
+        }
+
+        for (const auto& [followerId, targetCpuLoad] : targetCpuLoadByFollowerIdStats) {
+            if (targetCpuLoad >= 0) {
+                Cerr << "TEST TLoadAndSplitSimulator for table id " << TableLocalPathId
+                    << ", target CPU load (EvGetTableStatsResult) for followerId " << followerId
+                    << " is " << targetCpuLoad
+                    << "%"
+                    << Endl;
+            } else {
+                Cerr << "TEST TLoadAndSplitSimulator for table id " << TableLocalPathId
+                    << ", target CPU load (EvGetTableStatsResult) for followerId " << followerId
+                    << " is UNSET"
+                    << Endl;
+            }
         }
     }
 
@@ -863,9 +939,9 @@ struct TLoadAndSplitSimulator {
                         return;
                     }
 
-                    const auto itTargetCpuForFollower = MetricsPatchByFollowerId.find(msg->Record.GetFollowerId());
+                    const auto itTargetCpuForFollower = MetricsPatchByFollowerIdPeriodic.find(msg->Record.GetFollowerId());
 
-                    if (itTargetCpuForFollower != MetricsPatchByFollowerId.end()) {
+                    if (itTargetCpuForFollower != MetricsPatchByFollowerIdPeriodic.end()) {
                         const auto prevCPU = msg->Record.GetTabletMetrics().GetCPU();
                         msg->Record.MutableTabletMetrics()->MergeFrom(itTargetCpuForFollower->second);
                         const auto newCPU = msg->Record.GetTabletMetrics().GetCPU();
@@ -895,8 +971,9 @@ struct TLoadAndSplitSimulator {
                         return;
                     }
 
-                    // Cerr << "TEST TLoadAndSplitSimulator for table id " << TableLocalPathId
-                    //     << ", intercept EvGetTableStats" << Endl;
+                    Cerr << "TEST TLoadAndSplitSimulator for table id " << TableLocalPathId
+                         << ", intercept EvGetTableStats, collectKeySample " << msg->Record.GetCollectKeySample()
+                         << Endl;
 
                     if (msg->Record.GetCollectKeySample()) {
                         ++KeyAccessSampleReqCount;
@@ -927,24 +1004,87 @@ struct TLoadAndSplitSimulator {
                         break;
                     }
 
+                    const auto itTargetCpuForFollower = MetricsPatchByFollowerIdStats.find(msg->Record.GetFollowerId());
+
+                    if (itTargetCpuForFollower != MetricsPatchByFollowerIdStats.end()) {
+                        const auto prevCPU = msg->Record.GetTabletMetrics().GetCPU();
+
+                        if (itTargetCpuForFollower->second.HasCPU()) {
+                            msg->Record.MutableTabletMetrics()->MergeFrom(itTargetCpuForFollower->second);
+                            const auto newCPU = msg->Record.GetTabletMetrics().GetCPU();
+
+                            Cerr << "TEST TLoadAndSplitSimulator for table id " << TableLocalPathId
+                                << ", intercept EvGetTableStatsResult, from datashard " << msg->Record.GetDatashardId()
+                                << ", from followerId " << msg->Record.GetFollowerId()
+                                << ", patched CPU: " << prevCPU << "->" << newCPU
+                                << Endl;
+                        } else {
+                            msg->Record.MutableTabletMetrics()->ClearCPU();
+
+                            Cerr << "TEST TLoadAndSplitSimulator for table id " << TableLocalPathId
+                                << ", intercept EvGetTableStatsResult, from datashard " << msg->Record.GetDatashardId()
+                                << ", from followerId " << msg->Record.GetFollowerId()
+                                << ", patched CPU: " << prevCPU << "->UNSET"
+                                << Endl;
+                        }
+                    } else {
+                        Cerr << "TEST TLoadAndSplitSimulator for table id " << TableLocalPathId
+                            << ", intercept EvGetTableStatsResult, from datashard " << msg->Record.GetDatashardId()
+                            << ", from followerId " << msg->Record.GetFollowerId()
+                            << ", unpatched CPU: " << msg->Record.GetTabletMetrics().GetCPU()
+                            << Endl;
+                    }
+
                     msg->Record.MutableTableStats()->MutableKeyAccessSample()->CopyFrom(KeyAccessHistogramPatch);
 
                     auto [start, end] = DatashardsKeyRanges[msg->Record.GetDatashardId()];
-                    //NOTE: zero end means infinity -- this is a final shard
+                    // NOTE: zero end means infinity -- this is a final shard
                     if (end == 0) {
                         end = 1000000;
                     }
                     const ui64 splitPoint = (end + start) / 2;
-                    msg->Record.MutableTableStats()->MutableKeyAccessSample()->MutableBuckets(0)->SetKey(ToSerialized(splitPoint - 1));
-                    msg->Record.MutableTableStats()->MutableKeyAccessSample()->MutableBuckets(1)->SetKey(ToSerialized(splitPoint));
-                    msg->Record.MutableTableStats()->MutableKeyAccessSample()->MutableBuckets(2)->SetKey(ToSerialized(splitPoint + 1));
+
+                    // Emulate split protocol versions, see GetSplitBoundaryByLoad().
+                    switch (SplitProtocolVersion) {
+                        case 0: {  // unsorted array, no key
+                                msg->Record.MutableTableStats()->MutableKeyAccessSample()->MutableBuckets(0)->SetKey(ToSerialized(splitPoint + 1));
+                                msg->Record.MutableTableStats()->MutableKeyAccessSample()->MutableBuckets(1)->SetKey(ToSerialized(splitPoint - 1));
+                                msg->Record.MutableTableStats()->MutableKeyAccessSample()->MutableBuckets(2)->SetKey(ToSerialized(splitPoint));
+                            }
+                            break;
+                        case 1: {  // sorted array, no key
+                                msg->Record.MutableTableStats()->SetSplitProtocolVersion(SplitProtocolVersion);
+                                msg->Record.MutableTableStats()->MutableKeyAccessSample()->MutableBuckets(0)->SetKey(ToSerialized(splitPoint - 1));
+                                msg->Record.MutableTableStats()->MutableKeyAccessSample()->MutableBuckets(1)->SetKey(ToSerialized(splitPoint));
+                                msg->Record.MutableTableStats()->MutableKeyAccessSample()->MutableBuckets(2)->SetKey(ToSerialized(splitPoint + 1));
+                            }
+                            break;
+                        case 2: {  // sorted array, with key
+                                msg->Record.MutableTableStats()->SetSplitProtocolVersion(SplitProtocolVersion);
+                                msg->Record.MutableTableStats()->MutableKeyAccessSample()->MutableBuckets(0)->SetKey(ToSerialized(splitPoint - 1));
+                                msg->Record.MutableTableStats()->MutableKeyAccessSample()->MutableBuckets(1)->SetKey(ToSerialized(splitPoint));
+                                msg->Record.MutableTableStats()->MutableKeyAccessSample()->MutableBuckets(2)->SetKey(ToSerialized(splitPoint + 1));
+                                msg->Record.MutableTableStats()->SetSplitByLoadSuggestedKey(ToSerialized(splitPoint));
+                            }
+                            break;
+                        case 3: {  // no array, with key
+                                msg->Record.MutableTableStats()->SetSplitProtocolVersion(SplitProtocolVersion);
+                                msg->Record.MutableTableStats()->MutableKeyAccessSample()->Clear();
+                                msg->Record.MutableTableStats()->SetSplitByLoadSuggestedKey(ToSerialized(splitPoint));
+                            }
+                            break;
+                        default:
+                            UNIT_ASSERT_C(false, TStringBuilder() << "Unsupported protocol version " << SplitProtocolVersion << ". Consider to support it in a simulation?");
+                    };
 
                     Cerr << "TEST TLoadAndSplitSimulator for table id " << TableLocalPathId
                         << ", intercept EvGetTableStatsResult, from datashard " << msg->Record.GetDatashardId()
+                        << ", from followerId " << msg->Record.GetFollowerId()
                         << ", patch KeyAccessSample: split point " << splitPoint
                         << " (start=" << start
                         << ", end=" << end
                         << ")"
+                        << " " << msg->Record.GetTableStats().DebugString()
                         << Endl;
 
                     if (SendDuplicateTableStats != ESendDuplicateTableStatsStrategy::None) {
@@ -1094,8 +1234,7 @@ struct TLoadAndSplitSimulator {
     };
 };
 
-TTestEnv SetupEnv(TTestBasicRuntime &runtime) {
-    TTestEnvOptions opts;
+TTestEnv SetupEnv(TTestBasicRuntime &runtime, TTestEnvOptions& opts) {
     opts.EnableBackgroundCompaction(false);
     opts.DataShardStatsReportIntervalSeconds(0);
 
@@ -1123,6 +1262,10 @@ TTestEnv SetupEnv(TTestBasicRuntime &runtime) {
 
     return env;
 }
+TTestEnv SetupEnv(TTestBasicRuntime &runtime) {
+    TTestEnvOptions opts;
+    return SetupEnv(runtime, opts);
+}
 
 }  // anonymous namespace
 
@@ -1134,8 +1277,13 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitByLoad) {
      *
      * @param[in] runtime The test runtime
      * @param[in] tablePath The table to use for the test
-     * @param[in] targetCpuLoadByFolowerId The map from the follower ID (0 == leader)
-     *                                     to the corresponding induced CPU load (as percent)
+     * @param[in] targetCpuLoadByFollowerIdPeriodic The map from the follower ID (0 == leader)
+     *                                              to the corresponding induced CPU load (as percent)
+     *                                              (for EvPeriodicTableStats)
+     * @param[in] targetCpuLoadByFollowerIdStats The map from the follower ID (0 == leader)
+     *                                           to the corresponding induced CPU load (as percent)
+     *                                           (for EvGetTableStatsResult)
+     *                                           (any negative value == unset the CPU usage value)
      * @param[in] shouldSendReadRequests If true, send EvRead requests to all followers
      * @param[in] sendDuplicateTableStats Determines if/when to send duplicate EvGetTableStatsResult messages
      * @param[in] expectTableToBeSplitted If true, expect the table to be splitted
@@ -1143,7 +1291,8 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitByLoad) {
     void SplitByLoad(
         TTestActorRuntime& runtime,
         const TString& tablePath,
-        const std::map<ui32, ui32>& targetCpuLoadByFolowerId,
+        const std::map<ui32, i32>& targetCpuLoadByFollowerIdPeriodic,
+        const std::map<ui32, i32>& targetCpuLoadByFollowerIdStats,
         bool shouldSendReadRequests = false,
         ESendDuplicateTableStatsStrategy sendDuplicateTableStats = ESendDuplicateTableStatsStrategy::None,
         bool expectTableToBeSplitted = true
@@ -1161,7 +1310,8 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitByLoad) {
             initialDatashardId,
             shouldSendReadRequests,
             sendDuplicateTableStats,
-            targetCpuLoadByFolowerId,
+            targetCpuLoadByFollowerIdPeriodic,
+            targetCpuLoadByFollowerIdStats,
             runtime
         );
 
@@ -1173,7 +1323,7 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitByLoad) {
 
         if (expectTableToBeSplitted) {
             runtime.WaitFor(
-                "the table to be slitted",
+                "the table to be splitted",
                 [&simulator, &runtime]() -> bool {
                     auto now = runtime.GetCurrentTime();
                     return (simulator.SplitAckCount > 0) && ((now - simulator.LastSplitAckTime) > TDuration::Seconds(15));
@@ -1184,7 +1334,7 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitByLoad) {
             runtime.WaitFor(
                 "the confirmation that the table is not splitting",
                 [&simulator]() -> bool {
-                    return (simulator.PeriodicTableStatsCount > 10) && (simulator.KeyAccessSampleReqCount == 0);
+                    return (simulator.PeriodicTableStatsCount > 10) && (simulator.SplitReqCount == 0);
                 },
                 TDuration::Seconds(60)
             );
@@ -1213,6 +1363,7 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitByLoad) {
             false /* shouldSendReadRequests */,
             ESendDuplicateTableStatsStrategy::None,
             {{0, targetCpuLoadPercent}}, // Target CPU load for the leader only
+            {{0, targetCpuLoadPercent}}, // Target CPU load for the leader only
             runtime
         );
 
@@ -1238,9 +1389,19 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitByLoad) {
         // Cerr << "TEST SplitByLoad, SplitReq " << simulator.SplitReqCount << Endl;
     }
 
-    Y_UNIT_TEST(TableSplitsUpToMaxPartitionsCount) {
+    static void TableSplitsUpToMaxPartitionsCount(ui32 splitProtocolVersion) {
+        TTestEnvOptions opts;
+        if (splitProtocolVersion == 1) {
+            opts.EnableDataShardSplitHistogramSorting(true);
+        } else if (splitProtocolVersion == 2) {
+            opts.EnableDataShardSplitKeySelection(true);
+        } else if (splitProtocolVersion == 3) {
+            opts.EnableDataShardSplitHistogramOmission(true);
+        }
         TTestBasicRuntime runtime;
-        auto env = SetupEnv(runtime);
+        auto env = SetupEnv(runtime, opts);
+
+        UNIT_ASSERT_VALUES_EQUAL(splitProtocolVersion, GetSplitProtocolVersion(runtime));
 
         const ui32 expectedPartitionCount = 5;
         const ui32 cpuLoadThreshold = 1;    // percents
@@ -1278,6 +1439,7 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitByLoad) {
         SplitByLoad(
             runtime,
             "/MyRoot/Table",
+            {{0, cpuLoadSimulated}}, // Target CPU load for the leader only
             {{0, cpuLoadSimulated}} // Target CPU load for the leader only
         );
 
@@ -1285,6 +1447,24 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitByLoad) {
         Cerr << "TEST table final state:" << Endl << tableInfo.DebugString() << Endl;
         TestDescribeResult(tableInfo, {NLs::PartitionCount(expectedPartitionCount)});
     }
+    struct TTestRegistrationTableSplitsUpToMaxPartitionsCount {
+        TTestRegistrationTableSplitsUpToMaxPartitionsCount() {
+            static std::vector<TString> TestNames;
+
+            constexpr ui32 MAX_SPLIT_PROTOCOL_VERSION = 3;
+
+            for (const auto& i : xrange(MAX_SPLIT_PROTOCOL_VERSION + 1)) {
+                TestNames.emplace_back(TStringBuilder() << "TableSplitsUpToMaxPartitionsCount-protocol" << i);
+
+                TCurrentTest::AddTest(
+                    TestNames.back().c_str(),
+                    std::bind(std::bind(TableSplitsUpToMaxPartitionsCount, i), std::placeholders::_1),
+                    /*forceFork*/ false
+                );
+            }
+        }
+    };
+    static TTestRegistrationTableSplitsUpToMaxPartitionsCount testRegistrationTableSplitsUpToMaxPartitionsCount;
 
     Y_UNIT_TEST(IndexTableSplitsUpToMainTableCurrentPartitionCount) {
         TTestBasicRuntime runtime;
@@ -1338,6 +1518,7 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitByLoad) {
         SplitByLoad(
             runtime,
             "/MyRoot/Table/by-value/indexImplTable",
+            {{0, cpuLoadSimulated}}, // Target CPU load for the leader only
             {{0, cpuLoadSimulated}} // Target CPU load for the leader only
         );
 
@@ -1437,6 +1618,7 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitByLoad) {
             runtime,
             "/MyRoot/Table",
             {{0, cpuLoadSimulated}}, // Target CPU load for the leader only
+            {{0, cpuLoadSimulated}}, // Target CPU load for the leader only
             false /* shouldSendReadRequests */,
             ESendDuplicateTableStatsStrategy::Immediately // Trigger concurrent split transactions
         );
@@ -1489,6 +1671,7 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitByLoad) {
             runtime,
             "/MyRoot/Table",
             {{0, cpuLoadSimulated}}, // Target CPU load for the leader only
+            {{0, cpuLoadSimulated}}, // Target CPU load for the leader only
             false /* shouldSendReadRequests */,
             ESendDuplicateTableStatsStrategy::AfterSplitAck // Trigger duplicate split transactions
         );
@@ -1501,13 +1684,130 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitByLoad) {
     /**
      * Verify that a shard is split automatically, when some of the followers
      * become overloaded with requests.
-     *
-     * @todo Once splitting by the follower load is implemented,
-     *       this test should be adjusted to match the splitting logic.
-     *       For now this test is essentially reversed - it verifies that
-     *       no splitting is triggered, when one of the followers is overloaded.
      */
-    Y_UNIT_TEST(TableSplitsByFollowerLoad) {
+    Y_UNIT_TEST_FLAGS_N(TableSplitsByFollowerLoad, bool DataShardSplitHistogramSorting, bool DataShardSplitKeySelection, bool DataShardSplitHistogramOmission) {
+        TTestBasicRuntime runtime;
+        auto env = SetupEnv(runtime, TTestEnvOptions()
+            .EnableDataShardSplitHistogramSorting(DataShardSplitHistogramSorting)
+            .EnableDataShardSplitKeySelection(DataShardSplitKeySelection)
+            .EnableDataShardSplitHistogramOmission(DataShardSplitHistogramOmission)
+        );
+
+        const ui32 expectedPartitionCount = 5;
+        const ui64 cpuLoadSimulated = 100;  // percents
+
+        const auto tableScheme = Sprintf(
+            R"(
+                Name: "Table"
+                Columns { Name: "key"   Type: "Uint64"}
+                Columns { Name: "value" Type: "Uint64"}
+                KeyColumnNames: ["key"]
+                UniformPartitionsCount: 1
+                PartitionConfig {
+                    PartitioningPolicy {
+                        MaxPartitionsCount: %d  # replacement field for required number of partitions
+
+                        SplitByLoadSettings: {
+                            Enabled: true
+                            CpuPercentageThreshold: 1
+                        }
+                    }
+
+                    FollowerCount: 3
+                }
+            )",
+            expectedPartitionCount
+        );
+
+        ui64 txId = 100;
+        TestCreateTable(runtime, txId, "/MyRoot", tableScheme);
+        env.TestWaitNotification(runtime, txId);
+
+        SplitByLoad(
+            runtime,
+            "/MyRoot/Table",
+            {
+                // No simulated CPU load for the leader, only for one of the followers
+                {0, 0},
+                {1, 0},
+                {2, cpuLoadSimulated},
+                {3, 0},
+            },
+            {
+                // No simulated CPU load for the leader, only for one of the followers
+                {0, 0},
+                {1, 0},
+                {2, cpuLoadSimulated},
+                {3, 0},
+            },
+            true /* shouldSendReadRequests */
+        );
+
+        auto tableInfo = DescribePrivatePath(runtime, "/MyRoot/Table", true, true);
+        Cerr << "TEST table final state:" << Endl << tableInfo.DebugString() << Endl;
+        TestDescribeResult(tableInfo, {NLs::PartitionCount(expectedPartitionCount)});
+    }
+
+    /**
+     * Verify that a shard does not split, if the CPU load jumps to a high value,
+     * when the EvPeriodicTableStats message is generated, but drops to a low value,
+     * when the EvGetTableStats message is processed and the EvGetTableStatsResult
+     * response is generated. This is for the CPU load on the leader only.
+     */
+    Y_UNIT_TEST(NoSplitWithLeaderSpikeLoad) {
+        TTestBasicRuntime runtime;
+        auto env = SetupEnv(runtime);
+
+        const ui32 expectedPartitionCount = 5;
+        const ui64 cpuLoadSimulated = 100;  // percents
+
+        const auto tableScheme = Sprintf(
+            R"(
+                Name: "Table"
+                Columns { Name: "key"       Type: "Uint64"}
+                Columns { Name: "value"     Type: "Uint64"}
+                KeyColumnNames: ["key"]
+                UniformPartitionsCount: 1
+                PartitionConfig {
+                    PartitioningPolicy {
+                        MaxPartitionsCount: %d  # replacement field for required number of partitions
+
+                        SplitByLoadSettings: {
+                            Enabled: true
+                            CpuPercentageThreshold: 1
+                        }
+                    }
+                }
+            )",
+            expectedPartitionCount
+        );
+
+        ui64 txId = 100;
+        TestCreateTable(runtime, txId, "/MyRoot", tableScheme);
+        env.TestWaitNotification(runtime, txId);
+
+        SplitByLoad(
+            runtime,
+            "/MyRoot/Table",
+            {{0, cpuLoadSimulated}}, // Target CPU load for the leader only
+            {{0, 0}}, // The CPU load drops to 0% for EvGetTableStatsResult
+            false /* shouldSendReadRequests */,
+            ESendDuplicateTableStatsStrategy::None,
+            false /* expectTableToBeSplitted */
+        );
+
+        auto tableInfo = DescribePrivatePath(runtime, "/MyRoot/Table", true, true);
+        Cerr << "TEST table final state:" << Endl << tableInfo.DebugString() << Endl;
+        TestDescribeResult(tableInfo, {NLs::PartitionCount(1)});
+    }
+
+    /**
+     * Verify that a shard does not split, if the CPU load jumps to a high value,
+     * when the EvPeriodicTableStats message is generated, but drops to a low value,
+     * when the EvGetTableStats message is processed and the EvGetTableStatsResult
+     * response is generated. This is for the CPU load on the leader only.
+     */
+    Y_UNIT_TEST(NoSplitWithFollowerSpikeLoad) {
         TTestBasicRuntime runtime;
         auto env = SetupEnv(runtime);
 
@@ -1545,22 +1845,188 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitByLoad) {
             runtime,
             "/MyRoot/Table",
             {
-                // No simulated CPU load for the leader, only for the followers
-                {1, cpuLoadSimulated},
+                // No simulated CPU load for the leader, only for one of the followers
+                {0, 0},
+                {1, 0},
                 {2, cpuLoadSimulated},
-                {3, cpuLoadSimulated},
+                {3, 0},
+            },
+            {
+                // The CPU load drops to 0% for EvGetTableStatsResult
+                {0, 0},
+                {1, 0},
+                {2, 0},
+                {3, 0},
             },
             true /* shouldSendReadRequests */,
             ESendDuplicateTableStatsStrategy::None,
-            /// @todo Remove the time limit once splitting by the replica load is implemented
             false /* expectTableToBeSplitted */
         );
 
         auto tableInfo = DescribePrivatePath(runtime, "/MyRoot/Table", true, true);
         Cerr << "TEST table final state:" << Endl << tableInfo.DebugString() << Endl;
-
-        /// @todo Use expectedPartitionCount instead of 1 once splitting by the follower load is implemented
         TestDescribeResult(tableInfo, {NLs::PartitionCount(1)});
+    }
+
+    /**
+     * Verify that a shard splits correctly, even if the CPU usage value
+     * in the EvGetTableStatsResult response is not populated.
+     */
+    Y_UNIT_TEST(SplitWithoutCpuUsageInStatsResponse) {
+        TTestBasicRuntime runtime;
+        auto env = SetupEnv(runtime);
+
+        const ui32 expectedPartitionCount = 5;
+        const ui64 cpuLoadSimulated = 100;  // percents
+
+        const auto tableScheme = Sprintf(
+            R"(
+                Name: "Table"
+                Columns { Name: "key"       Type: "Uint64"}
+                Columns { Name: "value"     Type: "Uint64"}
+                KeyColumnNames: ["key"]
+                UniformPartitionsCount: 1
+                PartitionConfig {
+                    PartitioningPolicy {
+                        MaxPartitionsCount: %d  # replacement field for required number of partitions
+
+                        SplitByLoadSettings: {
+                            Enabled: true
+                            CpuPercentageThreshold: 1
+                        }
+                    }
+                }
+            )",
+            expectedPartitionCount
+        );
+
+        ui64 txId = 100;
+        TestCreateTable(runtime, txId, "/MyRoot", tableScheme);
+        env.TestWaitNotification(runtime, txId);
+
+        SplitByLoad(
+            runtime,
+            "/MyRoot/Table",
+            {{0, cpuLoadSimulated}}, // Target CPU load for the leader only
+            {{0, -100}} // Explicitly clear the CPU value from EvGetTableStatsResult
+        );
+
+        auto tableInfo = DescribePrivatePath(runtime, "/MyRoot/Table", true, true);
+        Cerr << "TEST table final state:" << Endl << tableInfo.DebugString() << Endl;
+        TestDescribeResult(tableInfo, {NLs::PartitionCount(expectedPartitionCount)});
+    }
+
+    /**
+     * Verify that the split-by-load logic uses the correct default value
+     * for the splitting threshold (50%) when the load is only on the leader.
+     */
+    Y_UNIT_TEST(CorrectSplitThresholdDefaultValueLeader) {
+        TTestBasicRuntime runtime;
+        auto env = SetupEnv(runtime);
+
+        const ui32 expectedPartitionCount = 5;
+        const ui64 cpuLoadSimulated = 51;  // percents
+
+        // NOTE: No split threshold settings here, use only the default value
+        //       (CpuPercentageThreshold = 50).
+        const auto tableScheme = Sprintf(
+            R"(
+                Name: "Table"
+                Columns { Name: "key"       Type: "Uint64"}
+                Columns { Name: "value"     Type: "Uint64"}
+                KeyColumnNames: ["key"]
+                UniformPartitionsCount: 1
+                PartitionConfig {
+                    PartitioningPolicy {
+                        MaxPartitionsCount: %d  # replacement field for required number of partitions
+
+                        SplitByLoadSettings: {
+                            Enabled: true
+                        }
+                    }
+                }
+            )",
+            expectedPartitionCount
+        );
+
+        ui64 txId = 100;
+        TestCreateTable(runtime, txId, "/MyRoot", tableScheme);
+        env.TestWaitNotification(runtime, txId);
+
+        SplitByLoad(
+            runtime,
+            "/MyRoot/Table",
+            {{0, cpuLoadSimulated}}, // Target CPU load for the leader only
+            {{0, cpuLoadSimulated}}  // Target CPU load for the leader only
+        );
+
+        auto tableInfo = DescribePrivatePath(runtime, "/MyRoot/Table", true, true);
+        Cerr << "TEST table final state:" << Endl << tableInfo.DebugString() << Endl;
+        TestDescribeResult(tableInfo, {NLs::PartitionCount(expectedPartitionCount)});
+    }
+
+    /**
+     * Verify that the split-by-load logic uses the correct default value
+     * for the splitting threshold (50%) when the load is only on the followers.
+     */
+    Y_UNIT_TEST(CorrectSplitThresholdDefaultValueFollower) {
+        TTestBasicRuntime runtime;
+        auto env = SetupEnv(runtime);
+
+        const ui32 expectedPartitionCount = 5;
+        const ui64 cpuLoadSimulated = 51;  // percents
+
+        // NOTE: No split threshold settings here, use only the default value
+        //       (CpuPercentageThreshold = 50).
+        const auto tableScheme = Sprintf(
+            R"(
+                Name: "Table"
+                Columns { Name: "key"       Type: "Uint64"}
+                Columns { Name: "value"     Type: "Uint64"}
+                KeyColumnNames: ["key"]
+                UniformPartitionsCount: 1
+                PartitionConfig {
+                    PartitioningPolicy {
+                        MaxPartitionsCount: %d  # replacement field for required number of partitions
+
+                        SplitByLoadSettings: {
+                            Enabled: true
+                        }
+                    }
+
+                    FollowerCount: 3
+                }
+            )",
+            expectedPartitionCount
+        );
+
+        ui64 txId = 100;
+        TestCreateTable(runtime, txId, "/MyRoot", tableScheme);
+        env.TestWaitNotification(runtime, txId);
+
+        SplitByLoad(
+            runtime,
+            "/MyRoot/Table",
+            {
+                // No simulated CPU load for the leader, only for one of the followers
+                {0, 0},
+                {1, 0},
+                {2, cpuLoadSimulated},
+                {3, 0},
+            },
+            {
+                // No simulated CPU load for the leader, only for one of the followers
+                {0, 0},
+                {1, 0},
+                {2, cpuLoadSimulated},
+                {3, 0},
+            },
+            true /* shouldSendReadRequests */
+        );
+
+        auto tableInfo = DescribePrivatePath(runtime, "/MyRoot/Table", true, true);
+        Cerr << "TEST table final state:" << Endl << tableInfo.DebugString() << Endl;
+        TestDescribeResult(tableInfo, {NLs::PartitionCount(expectedPartitionCount)});
     }
 }
 
@@ -1576,12 +2042,12 @@ Y_UNIT_TEST_SUITE(TSchemeShardMergeByLoad) {
      * @param[in] tablePath The table to use for the test
      * @param[in] maxPartitionCount The expected number of partitions (after splitting)
      * @param[in] finalPartitionCount The expected number of partitions (after merging)
-     * @param[in] splitCpuLoadByFolowerId The map from the follower ID (0 == leader)
-     *                                    to the corresponding induced CPU load (as percent),
-     *                                    which will be used for splitting the table
-     * @param[in] mergeCpuLoadByFolowerId The map from the follower ID (0 == leader)
-     *                                    to the corresponding induced CPU load (as percent),
-     *                                    which will be used for merging the table
+     * @param[in] splitCpuLoadByFollowerId The map from the follower ID (0 == leader)
+     *                                     to the corresponding induced CPU load (as percent),
+     *                                     which will be used for splitting the table
+     * @param[in] mergeCpuLoadByFollowerId The map from the follower ID (0 == leader)
+     *                                     to the corresponding induced CPU load (as percent),
+     *                                     which will be used for merging the table
      * @param[in] shouldSendReadRequests If true, send EvRead requests to all followers
      * @param[in] expectTableToBeMerged If true, expect the table to be merged
      */
@@ -1590,8 +2056,8 @@ Y_UNIT_TEST_SUITE(TSchemeShardMergeByLoad) {
         const TString& tablePath,
         ui32 maxPartitionCount,
         ui32 finalPartitionCount,
-        const std::map<ui32, ui32>& splitCpuLoadByFolowerId,
-        const std::map<ui32, ui32>& mergeCpuLoadByFolowerId,
+        const std::map<ui32, i32>& splitCpuLoadByFollowerId,
+        const std::map<ui32, i32>& mergeCpuLoadByFollowerId,
         bool shouldSendReadRequests,
         bool expectTableToBeMerged
     ) {
@@ -1610,7 +2076,8 @@ Y_UNIT_TEST_SUITE(TSchemeShardMergeByLoad) {
             initialDatashardId,
             shouldSendReadRequests,
             ESendDuplicateTableStatsStrategy::None,
-            splitCpuLoadByFolowerId,
+            splitCpuLoadByFollowerId,
+            splitCpuLoadByFollowerId,
             runtime
         );
 
@@ -1622,7 +2089,7 @@ Y_UNIT_TEST_SUITE(TSchemeShardMergeByLoad) {
 
         // Wait for the table to be fully splitted
         runtime.WaitFor(
-            "the table to be slitted",
+            "the table to be splitted",
             [&simulatorSplit, &runtime]() -> bool {
                 auto now = runtime.GetCurrentTime();
                 return (simulatorSplit.SplitAckCount > 0)
@@ -1646,7 +2113,8 @@ Y_UNIT_TEST_SUITE(TSchemeShardMergeByLoad) {
             initialDatashardId,
             shouldSendReadRequests,
             ESendDuplicateTableStatsStrategy::None,
-            mergeCpuLoadByFolowerId,
+            mergeCpuLoadByFollowerId,
+            mergeCpuLoadByFollowerId,
             runtime
         );
 
@@ -1847,11 +2315,6 @@ Y_UNIT_TEST_SUITE(TSchemeShardMergeByLoad) {
     /**
      * Verify that a shard does not merge partitions when there is CPU load
      * on the followers.
-     *
-     * @todo Once merging by the follower load is implemented,
-     *       this test should be adjusted to match the merging logic.
-     *       For now this test is essentially reversed - it verifies that
-     *       the merging is triggered, even if all followers are overloaded.
      */
     Y_UNIT_TEST(NoMergeWithFollowerLoad) {
         TTestBasicRuntime runtime;
@@ -1890,9 +2353,7 @@ Y_UNIT_TEST_SUITE(TSchemeShardMergeByLoad) {
             runtime,
             "/MyRoot/Table",
             maxPartitionCount,
-            /// @todo This limit should be adjusting once merging-by-load is changed
-            ///       to taking into account the CPU load on the followers
-            1 /* finalPartitionCount */,
+            5 /* finalPartitionCount */,
             {
                 // The initial CPU load only on the leaders to force the split
                 {0, 100},
@@ -1913,7 +2374,7 @@ Y_UNIT_TEST_SUITE(TSchemeShardMergeByLoad) {
                 {3, 60},
             },
             true /* shouldSendReadRequests */,
-            true /* expectTableToBeMerged */
+            false /* expectTableToBeMerged */
         );
     }
 }

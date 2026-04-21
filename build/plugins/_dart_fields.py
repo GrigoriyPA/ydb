@@ -11,7 +11,6 @@ import ymake
 import _common
 import lib.test_const as consts
 
-
 CANON_RESULT_FILE_NAME = 'result.json'
 CANON_DATA_DIR_NAME = 'canondata'
 CANON_OUTPUT_STORAGE = 'canondata_storage'
@@ -41,7 +40,7 @@ def create_dart_record(field_methods, *args) -> dict[str, str] | None:
             value = field_meth(*args)
             if not value:
                 if getattr(field_meth.__self__, 'required', False):
-                    raise DartValueError(f'dart field {field} must not be empty')
+                    raise DartValueError('dart field must not be empty')
             else:
                 if isinstance(value, dict):
                     # For TsResources field
@@ -52,7 +51,7 @@ def create_dart_record(field_methods, *args) -> dict[str, str] | None:
     except HaltDartConstruction:
         pass
     except DartValueError as e:
-        ymake.report_configure_error(f'Invalid dart field value {e!r}')
+        ymake.report_configure_error(f'Invalid dart field value {e!r}, field {field}')
     except Exception as e:
         ymake.report_configure_error(f'Unexpected error while creating dart record {e!r}, field {field}')
 
@@ -431,17 +430,23 @@ class EslintConfigPath:
 
 
 class ParallelTestsInSingleNode:
-    KEY = 'PARALLEL-TESTS-WITHIN-NODE-ON-YT'
+    KEY = 'PARALLEL-TESTS-WITHIN-NODE-WORKERS'
 
     @classmethod
     def value(cls, unit, flat_args, spec_args):
-        value = unit.get('PARALLEL_TESTS_ON_YT_WITHIN_NODE_WORKERS')
+        return cls.get_value(unit, "PARALLEL_TESTS_WITHIN_NODE_WORKERS")
+
+    @classmethod
+    def get_value(cls, unit, key):
+        value = unit.get(key)
 
         if value:
             value = value.lower()
-            if value != 'all' and not (value.isnumeric() and int(value) > 0):
+            if value == 'all':
+                value = 'auto'
+            if value != 'auto' and not (value.isnumeric() and int(value) > 0):
                 raise DartValueError(
-                    'Incorrect value of PARALLEL_TESTS_ON_YT_WITHIN_NODE. Expected either "all" or a positive integer value, got: {}'.format(
+                    'Incorrect value of PARALLEL_TESTS_WITHIN_NODE. Expected either "auto" or a positive integer value, got: {}'.format(
                         value,
                     ),
                 )
@@ -622,29 +627,34 @@ class LintConfigs:
         if not spec_args.get('CONFIG_TYPE') or not spec_args.get('CONFIG_TYPE')[0]:
             return
         linter_name = spec_args['NAME'][0]
-        config_type = spec_args.get('CONFIG_TYPE')[0]
-        if config_type not in consts.LINTER_CONFIG_TYPES[linter_name]:
+        config_types = tuple(spec_args.get('CONFIG_TYPE'))
+        if config_types not in consts.LINTER_CONFIG_TYPES[linter_name]:
             message = "Unknown {} linter config type: {}. Allowed types: {}".format(
-                linter_name, config_type, ', '.join(consts.LINTER_CONFIG_TYPES[linter_name])
+                linter_name, config_types, ', '.join(consts.LINTER_CONFIG_TYPES[linter_name])
             )
             raise DartValueError(message)
         if common_configs_dir := unit.get('MODULE_COMMON_CONFIGS_DIR'):
-            config = os.path.join(common_configs_dir, config_type)
-            path = unit.resolve(unit.resolve_arc_path(config))
-            if os.path.exists(path):
-                return config
-            message = "File not found: {}".format(path)
-            raise DartValueError(message)
+            configs = []
+            for config_type in config_types:
+                config = os.path.join(common_configs_dir, config_type)
+                path = unit.resolve(unit.resolve_arc_path(config))
+                if os.path.exists(path):
+                    configs.append(config)
+                    continue
+                message = "File not found: {}".format(path)
+                raise DartValueError(message)
+            return configs
         else:
             message = "Config type specifier is only allowed with autoincludes"
             raise DartValueError(message)
 
     @classmethod
     def python_configs(cls, unit, flat_args, spec_args):
-        if config := cls._from_config_type(unit, spec_args):
+        if configs := cls._from_config_type(unit, spec_args):
             # specified by config type, autoincludes scheme
-            unit.on_data_files(config)
-            return serialize_list([config])
+            for config in configs:
+                unit.on_data_files(config)
+            return serialize_list(configs)
 
         # default config
         linter_name = spec_args['NAME'][0]
@@ -663,10 +673,11 @@ class LintConfigs:
 
     @classmethod
     def cpp_configs(cls, unit, flat_args, spec_args):
-        if config := cls._from_config_type(unit, spec_args):
+        if configs := cls._from_config_type(unit, spec_args):
             # specified by config type, autoincludes scheme
-            unit.on_data_files(config)
-            return serialize_list([config])
+            for config in configs:
+                unit.on_data_files(config)
+            return serialize_list(configs)
 
         # default config
         linter_name = spec_args['NAME'][0]
@@ -682,6 +693,11 @@ class LintConfigs:
 
     @classmethod
     def custom_explicit_configs(cls, unit, flat_args, spec_args):
+        if configs := cls._from_config_type(unit, spec_args):
+            # specified by config type, autoincludes scheme
+            for config in configs:
+                unit.on_data_files(config)
+            return serialize_list(configs)
         linter_name = spec_args['NAME'][0]
         if not (default_configs_path := spec_args.get('DEFAULT_CONFIGS')):
             return
@@ -698,11 +714,11 @@ class LintConfigs:
 class LintExtraParams:
     KEY = 'LINT-EXTRA-PARAMS'
 
-    _CUSTOM_CLANG_FORMAT_ALLOWED_PATHS = ('ads', 'bigrt', 'grut', 'yabs', 'maps')
+    _CUSTOM_CLANG_FORMAT_ALLOWED_PATHS = ('ads', 'bigrt', 'grut', 'yabs', 'maps', 'yt')
     # HACK: Due to the mass usage of PY_NAMESPACE / TOP_LEVEL in these projects
     # it makes it difficult to run ruff checks in build root - it complains
     # about unsorted imports a lot. Let them run in source root instead.
-    _RUFF_RUN_IN_SOURCE_ROOT_ALLOWED_PATHS = ('fintech/uservices', 'taxi', 'electro')
+    _RUFF_RUN_IN_SOURCE_ROOT_ALLOWED_PATHS = ('fintech/uservices', 'taxi', 'electro', 'maps/tariffs')
 
     @classmethod
     def from_macro_args(cls, unit, flat_args, spec_args):
@@ -1137,6 +1153,23 @@ class TsStylelintConfig:
         return test_config
 
 
+class TsBiomeConfig:
+    KEY = 'TS_BIOME_CONFIG'
+
+    @classmethod
+    def value(cls, unit, flat_args, spec_args):
+        # config can be empty
+        test_config = unit.get('_TS_BIOME_CONFIG')
+        abs_test_config = unit.resolve(unit.resolve_arc_path(test_config))
+        if not abs_test_config:
+            ymake.report_configure_error(
+                f"Config for biome not found: {test_config}.\n"
+                "Set the correct value in `TS_BIOME(<config_filename>)` macro in the `ya.make` file."
+            )
+
+        return {cls.KEY: test_config}
+
+
 class TsTestDataDirs:
     KEY = 'TS-TEST-DATA-DIRS'
 
@@ -1160,6 +1193,15 @@ class TsTestForPath:
     @classmethod
     def value(cls, unit, flat_args, spec_args):
         return unit.get("TS_TEST_FOR_PATH")
+
+
+class TsCheckType:
+    KEY = 'TS-CHECK-TYPE'
+    required = True
+
+    @classmethod
+    def value(cls, unit, flat_args, spec_args):
+        return spec_args.get("TS_CHECK_TYPE", None)
 
 
 class TestedProjectFilename:
@@ -1257,9 +1299,6 @@ class TestFiles:
         'maps/b2bgeo/mvrp_solver/aws_docker',
     )
 
-    # XXX: this is a temporarty fence allowing only taxi to use STYLE_JSON and STYLE_YAML macro
-    _TAXI_PREFIX = 'taxi'
-
     @classmethod
     def value(cls, unit, flat_args, spec_args):
         data_re = re.compile(r"sbr:/?/?(\d+)=?.*")
@@ -1307,6 +1346,14 @@ class TestFiles:
         return value
 
     @classmethod
+    def ts_check_srcs(cls, unit, flat_args, spec_args):
+        test_files = get_values_list(unit, "_TS_GLOB_FILES")
+        rel_to = "TS_TEST_FOR_PATH" if unit.get("TS_TEST_FOR") else "MODDIR"
+        test_files = _resolve_module_files(unit, unit.get(rel_to), test_files)
+        value = serialize_list(test_files)
+        return value
+
+    @classmethod
     def ts_test_srcs(cls, unit, flat_args, spec_args):
         test_files = get_values_list(unit, "_TS_TEST_SRCS_VALUE")
         test_files = _resolve_module_files(unit, unit.get("MODDIR"), test_files)
@@ -1331,6 +1378,13 @@ class TestFiles:
     @classmethod
     def stylesheets(cls, unit, flat_args, spec_args):
         test_files = get_values_list(unit, "_TS_STYLELINT_FILES")
+        test_files = _resolve_module_files(unit, unit.get("MODDIR"), test_files)
+        value = serialize_list(test_files)
+        return value
+
+    @classmethod
+    def ts_biome_srcs(cls, unit, flat_args, spec_args):
+        test_files = get_values_list(unit, "_TS_BIOME_FILES")
         test_files = _resolve_module_files(unit, unit.get("MODDIR"), test_files)
         value = serialize_list(test_files)
         return value
@@ -1383,14 +1437,6 @@ class TestFiles:
         if not files:
             raise HaltDartConstruction()
         else:
-            upath = unit.path()[3:]
-            lint_name = spec_args['NAME'][0]
-
-            if not upath.startswith(cls._TAXI_PREFIX):
-                if lint_name == 'clang_format_json':
-                    raise DartValueError("Presently only projects in taxi/ are allowed with STYLE_JSON")
-                if lint_name == 'yamlfmt_format_yaml':
-                    raise DartValueError("Presently only projects in taxi/ are allowed with STYLE_YAML")
             resolved_files = []
             for path in files:
                 if path.endswith('ya.make'):

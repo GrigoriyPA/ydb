@@ -16,14 +16,12 @@ IF (PYTHON2)
         fetch_from_sandbox.py
         gen_java_codenav_entry.py
         gen_py3_reg.py
-        go_tool.py
         ios_wrapper.py
         mangle_typeinfo_names.py
         pack_ios.py
         pack_jcoverage_resources.py
         python_yndexer.py
         run_ios_simulator.py
-        run_msvc_wine.py
         symlink.py
         touch.py
         unpacking_jtest_runner.py
@@ -62,6 +60,7 @@ ELSEIF (PYTHON3)
         copy_to_dir.py
         cpp_flatc_wrapper.py
         decimal_md5.py
+        docs_manifest.py
         docs_proto_wrapper.py
         error.py
         extract_asrc.py
@@ -85,7 +84,9 @@ ELSEIF (PYTHON3)
         generate_mf.py
         generate_pom.py
         generate_win_vfs.py
+        go.py
         go_proto_wrapper.py
+        go_tool.py
         iwyu.py
         iwyu_arch.py
         java_command_file.py
@@ -124,6 +125,7 @@ ELSEIF (PYTHON3)
         run_junit.py
         run_llvm_dsymutil.py
         run_tool.py
+        run_msvc_wine.py
         setup_java_tmpdir.py
         sky.py
         stderr2stdout.py

@@ -54,10 +54,10 @@ class SimpleColorizedStreamHandler(logging.StreamHandler):
     terminator = '\n'  # py2 compat
 
     def _colorize(self, msg):
-        msg = self.RE_KW(msg)
-        msg = self.RE_HTTP(msg)
-        msg = self.RE_JSON(msg)
-        msg = self.RE_YSON(msg)
+        msg = SimpleColorizedStreamHandler.RE_KW(msg)
+        msg = SimpleColorizedStreamHandler.RE_HTTP(msg)
+        msg = SimpleColorizedStreamHandler.RE_JSON(msg)
+        msg = SimpleColorizedStreamHandler.RE_YSON(msg)
         return msg
 
     def emit(self, record):
@@ -82,7 +82,7 @@ def set_formatter(new_formatter):
         handler.setFormatter(new_formatter)
 
 
-logging.getLogger("yt.packages.requests.packages.urllib3").setLevel(logging.WARNING)
+logging.getLogger("yt.packages.urllib3").setLevel(logging.WARNING)
 
 LOGGER = logging.getLogger("Yt")
 

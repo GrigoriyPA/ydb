@@ -8,18 +8,25 @@ namespace NYdb::inline Dev {
 
 bool IsTokenCorrect(const std::string& in) {
     for (char c : in) {
-        if (!(IsAsciiAlnum(c) || IsAsciiPunct(c) || c == ' '))
+        if (!(IsAsciiAlnum(c) || IsAsciiPunct(c) || c == ' ')) {
             return false;
+        }
     }
     return true;
 }
 
 std::string GetAuthInfo(TDbDriverStatePtr p) {
-    auto token = p->CredentialsProvider->GetAuthInfo();
-    if (!IsTokenCorrect(token)) {
-        throw TContractViolation("token is incorrect, illegal characters found");
+    try {
+        auto token = p->CredentialsProvider->GetAuthInfo();
+        if (!IsTokenCorrect(token)) {
+            throw TAuthenticationError("token is incorrect, illegal characters found");
+        }
+        return token;
+    } catch (const TAuthenticationError& e) {
+        throw e;
+    } catch (const std::exception& e) {
+        throw TAuthenticationError(TStringBuilder() << "Can't get Authentication info from CredentialsProvider. " << e.what());
     }
-    return token;
 }
 
 void SetDatabaseHeader(TCallMeta& meta, const std::string& database) {
@@ -29,6 +36,16 @@ void SetDatabaseHeader(TCallMeta& meta, const std::string& database) {
 
 std::string CreateSDKBuildInfo() {
     return std::string("ydb-cpp-sdk/") + GetSdkSemver();
+}
+
+std::string BuildFullBuildInfo(const IConnectionsParams& params) {
+    auto result = CreateSDKBuildInfo();
+    auto extra = params.GetBuildInfoExtra();
+    if (!extra.empty()) {
+        result += ';';
+        result += extra;
+    }
+    return result;
 }
 
 template<class TDerived>
@@ -150,16 +167,22 @@ TGRpcConnectionsImpl::TGRpcConnectionsImpl(std::shared_ptr<IConnectionsParams> p
     , BalancingSettings_(params->GetBalancingSettings())
     , GRpcKeepAliveTimeout_(TDeadline::SafeDurationCast(params->GetGRpcKeepAliveTimeout()))
     , GRpcKeepAlivePermitWithoutCalls_(params->GetGRpcKeepAlivePermitWithoutCalls())
+    , GRpcLoadBalancingPolicy_(params->GetGRpcLoadBalancingPolicy())
+    , GRpcCompressionAlgorithm_(params->GetGRpcCompressionAlgorithm())
     , MemoryQuota_(params->GetMemoryQuota())
     , MaxInboundMessageSize_(params->GetMaxInboundMessageSize())
     , MaxOutboundMessageSize_(params->GetMaxOutboundMessageSize())
     , MaxMessageSize_(params->GetMaxMessageSize())
     , QueuedRequests_(0)
     , TcpKeepAliveSettings_(params->GetTcpKeepAliveSettings())
+    , TcpNoDelay_(params->GetTcpNoDelay())
     , SocketIdleTimeout_(TDeadline::SafeDurationCast(params->GetSocketIdleTimeout()))
 #ifndef YDB_GRPC_BYPASS_CHANNEL_POOL
-    , ChannelPool_(TcpKeepAliveSettings_, params->GetSocketIdleTimeout())
+    , ChannelPool_(TcpKeepAliveSettings_, params->GetSocketIdleTimeout(), TcpNoDelay_)
 #endif
+    , MetricRegistry_(params->GetExternalMetricRegistry())
+    , TraceProvider_(params->GetTraceProvider())
+    , BuildInfo_(BuildFullBuildInfo(*params))
     , NetworkThreadsNum_(params->GetNetworkThreadsNum())
     , UsePerChannelTcpConnection_(params->GetUsePerChannelTcpConnection())
     , GRpcClientLow_(NetworkThreadsNum_)
@@ -219,34 +242,38 @@ void TGRpcConnectionsImpl::AddPeriodicTask(TPeriodicCb&& cb, TDeadline::Duration
     }
 }
 
-void TGRpcConnectionsImpl::ScheduleOneTimeTask(TSimpleCb&& fn, TDeadline::Duration timeout) {
-    auto cbLow = [this, fn = std::move(fn)](NYdb::NIssue::TIssues&&, EStatus status) mutable {
-        if (status != EStatus::SUCCESS) {
-            return false;
+void TGRpcConnectionsImpl::ScheduleDelayedTask(TSimpleCb&& fn, TDeadline deadline) {
+    auto cbLow = [this, fn = std::move(fn)](bool ok) mutable {
+        if (!ok) {
+            return;
         }
 
-        std::shared_ptr<IQueueClientContext> context;
-
-        if (!TryCreateContext(context)) {
-            // Shutting down, fn must handle it
-            fn();
-        } else {
-            // Enqueue to user pool
-            auto resp = new TSimpleCbResult(
-                std::move(fn),
-                this,
-                std::move(context));
-            EnqueueResponse(resp);
-        }
-
-        return false;
+        // Enqueue to user pool
+        auto resp = new TSimpleCbResult(std::move(fn));
+        EnqueueResponse(resp);
     };
 
-    if (timeout > TDeadline::Duration::zero()) {
-        AddPeriodicTask(std::move(cbLow), timeout);
-    } else {
-        cbLow(NYdb::NIssue::TIssues(), EStatus::SUCCESS);
+    std::shared_ptr<IQueueClientContext> context;
+    if (!TryCreateContext(context)) {
+        cbLow(false);
+        return;
     }
+
+    if (deadline <= TDeadline::Now()) {
+        cbLow(true);
+        return;
+    }
+
+    auto action = MakeIntrusive<TDelayedAction>(
+        std::move(cbLow),
+        this,
+        std::move(context),
+        deadline);
+    action->Start();
+}
+
+void TGRpcConnectionsImpl::ScheduleDelayedTask(TSimpleCb&& fn, TDeadline::Duration delay) {
+    ScheduleDelayedTask(std::move(fn), TDeadline::AfterDuration(delay));
 }
 
 NThreading::TFuture<bool> TGRpcConnectionsImpl::ScheduleFuture(
@@ -317,10 +344,24 @@ void TGRpcConnectionsImpl::Stop(bool wait) {
 
 void TGRpcConnectionsImpl::SetGrpcKeepAlive(NYdbGrpc::TGRpcClientConfig& config, const TDeadline::Duration& timeout, bool permitWithoutCalls) {
     std::uint64_t timeoutMs = std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count();
-    config.IntChannelParams[GRPC_ARG_KEEPALIVE_TIME_MS] = timeoutMs >> 3;
+    config.IntChannelParams[GRPC_ARG_KEEPALIVE_TIME_MS] = timeoutMs;
     config.IntChannelParams[GRPC_ARG_KEEPALIVE_TIMEOUT_MS] = timeoutMs;
     config.IntChannelParams[GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA] = 0;
     config.IntChannelParams[GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS] = permitWithoutCalls ? 1 : 0;
+}
+
+void TGRpcConnectionsImpl::SetGrpcCompressionAlgorithm(NYdbGrpc::TGRpcClientConfig& config, EGrpcCompressionAlgorithm algorithm) {
+    switch (algorithm) {
+        case EGrpcCompressionAlgorithm::None:
+            config.CompressionAlgorithm = GRPC_COMPRESS_NONE;
+            break;
+        case EGrpcCompressionAlgorithm::Deflate:
+            config.CompressionAlgorithm = GRPC_COMPRESS_DEFLATE;
+            break;
+        case EGrpcCompressionAlgorithm::Gzip:
+            config.CompressionAlgorithm = GRPC_COMPRESS_GZIP;
+            break;
+    }
 }
 
 TAsyncListEndpointsResult TGRpcConnectionsImpl::GetEndpoints(TDbDriverStatePtr dbState) {
@@ -358,21 +399,22 @@ TAsyncListEndpointsResult TGRpcConnectionsImpl::GetEndpoints(TDbDriverStatePtr d
         if (strong && result.DiscoveryStatus.IsTransportError()) {
             strong->StatCollector.IncDiscoveryFailDueTransportError();
         }
-        return NThreading::MakeFuture<TListEndpointsResult>(MutateDiscovery(std::move(result), *strong));
+        return NThreading::MakeFuture<TListEndpointsResult>(MutateDiscovery(std::move(result), strong.get()));
     });
 }
 
-TListEndpointsResult TGRpcConnectionsImpl::MutateDiscovery(TListEndpointsResult result, const TDbDriverState& dbDriverState) {
+TListEndpointsResult TGRpcConnectionsImpl::MutateDiscovery(TListEndpointsResult result, const TDbDriverState* dbDriverState) {
     std::lock_guard lock(ExtensionsLock_);
-    if (!DiscoveryMutatorCb)
+    if (!DiscoveryMutatorCb || !dbDriverState) {
         return result;
+    }
 
     auto endpoint = result.DiscoveryStatus.Endpoint;
     auto ydbStatus = NYdb::TStatus(std::move(result.DiscoveryStatus));
 
     auto aux = IDiscoveryMutatorApi::TAuxInfo {
-        .Database = dbDriverState.Database,
-        .DiscoveryEndpoint = dbDriverState.DiscoveryEndpoint
+        .Database = dbDriverState->Database,
+        .DiscoveryEndpoint = dbDriverState->DiscoveryEndpoint
     };
 
     ydbStatus = DiscoveryMutatorCb(&result.Result, std::move(ydbStatus), aux);
@@ -423,6 +465,14 @@ void TGRpcConnectionsImpl::RegisterExtensionApi(IExtensionApi* api) {
     ExtensionApis_.emplace_back(api);
 }
 
+std::shared_ptr<NMetrics::IMetricRegistry> TGRpcConnectionsImpl::GetExternalMetricRegistry() const {
+    return MetricRegistry_;
+}
+
+std::shared_ptr<NTrace::ITraceProvider> TGRpcConnectionsImpl::GetTraceProvider() const {
+    return TraceProvider_;
+}
+
 void TGRpcConnectionsImpl::SetDiscoveryMutator(IDiscoveryMutatorApi::TMutatorCb&& cb) {
     std::lock_guard lock(ExtensionsLock_);
     DiscoveryMutatorCb = std::move(cb);
@@ -436,6 +486,42 @@ void TGRpcConnectionsImpl::EnqueueResponse(IObjectInQueue* action) {
     ResponseQueue_->Post([action]() {
         action->Process(nullptr);
     });
+}
+
+TCallMeta TGRpcConnectionsImpl::MakeCallMeta(const TRpcRequestSettings& requestSettings, const TDbDriverStatePtr& dbState) const {
+    TCallMeta meta;
+    meta.Timeout = requestSettings.Deadline;
+#ifndef YDB_GRPC_UNSECURE_AUTH
+    meta.CallCredentials = dbState->CallCredentials;
+#else
+    if (requestSettings.UseAuth && dbState->CredentialsProvider && dbState->CredentialsProvider->IsValid()) {
+        meta.Aux.push_back({YDB_AUTH_TICKET_HEADER, GetAuthInfo(dbState)});
+    }
+#endif
+    if (!requestSettings.TraceId.empty()) {
+        meta.Aux.push_back({YDB_TRACE_ID_HEADER, requestSettings.TraceId});
+    }
+
+    if (!requestSettings.RequestType.empty()) {
+        meta.Aux.push_back({YDB_REQUEST_TYPE_HEADER, requestSettings.RequestType});
+    }
+
+    if (!requestSettings.TraceParent.empty()) {
+        meta.Aux.push_back({OTEL_TRACE_HEADER, requestSettings.TraceParent});
+    }
+
+    if (!dbState->Database.empty()) {
+        // See TDbDriverStateTracker::GetDriverState to find place where we do quote non ASCII characters
+        meta.Aux.push_back({YDB_DATABASE_HEADER, dbState->Database});
+    }
+
+    static const std::string clientPid = GetClientPIDHeaderValue();
+
+    meta.Aux.push_back({YDB_SDK_BUILD_INFO_HEADER, BuildInfo_});
+    meta.Aux.push_back({YDB_CLIENT_PID, clientPid});
+    meta.Aux.insert(meta.Aux.end(), requestSettings.Header.begin(), requestSettings.Header.end());
+
+    return meta;
 }
 
 } // namespace NYdb

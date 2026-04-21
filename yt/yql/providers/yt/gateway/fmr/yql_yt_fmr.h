@@ -6,11 +6,25 @@
 #include <yt/yql/providers/yt/fmr/yt_job_service/interface/yql_yt_job_service.h>
 #include <yt/yql/providers/yt/fmr/coordinator/yt_coordinator_service/interface/yql_yt_coordinator_service_interface.h>
 #include <yt/yql/providers/yt/fmr/job_launcher/yql_yt_job_launcher.h>
+#include <yt/yql/providers/yt/fmr/file/metadata/interface/yql_yt_file_metadata_interface.h>
+#include <yt/yql/providers/yt/fmr/file/upload/interface/yql_yt_file_upload_interface.h>
+#include <yt/yql/providers/yt/fmr/job_preparer/interface/yql_yt_job_preparer_interface.h>
 
 namespace NYql::NFmr {
 
+enum class ETablePresenceStatus {
+    Undefined,
+    OnlyInYt,
+    OnlyInFmr,
+    Both
+};
+
 struct TFmrServices: public TYtBaseServices {
     using TPtr = TIntrusivePtr<TFmrServices>;
+
+    TFmrServices() {
+        CheckSpecDoesntUseNativeYtTypes = false;
+    }
 
     TString CoordinatorServerUrl;
     TString TableDataServiceDiscoveryFilePath;
@@ -19,6 +33,10 @@ struct TFmrServices: public TYtBaseServices {
     TFmrUserJobLauncher::TPtr JobLauncher;
     bool DisableLocalFmrWorker = false;
     TString FmrOperationSpecFilePath;
+    IFileMetadataService::TPtr FileMetadataService;
+    IFileUploadService::TPtr FileUploadService;
+    IFmrJobPreparer::TPtr JobPreparer;
+    TMaybe<TFmrTvmGatewaySettings> TvmSettings;
 };
 
 struct TFmrYtGatewaySettings {

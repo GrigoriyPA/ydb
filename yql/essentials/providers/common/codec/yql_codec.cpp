@@ -23,8 +23,7 @@
 #include <util/string/cast.h>
 #include <util/generic/map.h>
 
-namespace NYql {
-namespace NCommon {
+namespace NYql::NCommon {
 
 using namespace NKikimr;
 using namespace NKikimr::NMiniKQL;
@@ -335,7 +334,7 @@ NYT::TNode DataValueToNode(const NKikimr::NUdf::TUnboxedValuePod& value, NKikimr
         case NUdf::TDataType<NUdf::TUuid>::Id:
             return NYT::TNode(TString(value.AsStringRef()));
         case NUdf::TDataType<NUdf::TYson>::Id:
-            return NYT::NodeFromYsonString(TString(value.AsStringRef()));
+            return NYT::NodeFromYsonString(value.AsStringRef());
         case NUdf::TDataType<NUdf::TDate>::Id:
             return NYT::TNode((ui64)value.Get<ui16>());
         case NUdf::TDataType<NUdf::TDatetime>::Id:
@@ -1245,7 +1244,7 @@ TMaybe<NUdf::TUnboxedValue> ParseYsonValue(const THolderFactory& holderFactory,
     try {
         class TReader: public IBlockReader {
         public:
-            TReader(const TStringBuf& yson)
+            explicit TReader(const TStringBuf& yson)
                 : Yson_(yson)
             {
             }
@@ -1382,7 +1381,8 @@ TExprNode::TPtr ValueToExprLiteral(const TTypeAnnotationNode* type, const NKikim
             auto payloadType = dictType->GetPayloadType();
             TExprNode::TListType items;
             items.emplace_back(ExpandType(pos, *type, ctx));
-            NUdf::TUnboxedValue keyValue, payloadValue;
+            NUdf::TUnboxedValue keyValue;
+            NUdf::TUnboxedValue payloadValue;
             for (auto iter = value.GetDictIterator(); iter.NextPair(keyValue, payloadValue);) {
                 auto pair = ctx.NewList(pos, {ValueToExprLiteral(keyType, keyValue, ctx, pos),
                                               ValueToExprLiteral(payloadType, payloadValue, ctx, pos)});
@@ -1446,5 +1446,4 @@ TExprNode::TPtr ValueToExprLiteral(const TTypeAnnotationNode* type, const NKikim
     YQL_ENSURE(false, "Unsupported type: " << type->GetKind());
 }
 
-} // namespace NCommon
-} // namespace NYql
+} // namespace NYql::NCommon

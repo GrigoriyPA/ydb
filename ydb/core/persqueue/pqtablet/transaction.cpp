@@ -1,6 +1,7 @@
 #include "transaction.h"
 #include <ydb/core/persqueue/public/utils.h>
 #include <ydb/core/persqueue/pqtablet/common/logging.h>
+#include <ydb/core/persqueue/pqtablet/common/event_helpers.h>
 
 #include <ydb/library/wilson_ids/wilson.h>
 
@@ -359,7 +360,7 @@ void TDistributedTransaction::OnReadSetAck(ui64 tabletId)
     }
 }
 
-void TDistributedTransaction::OnTxCommitDone(const TEvPQ::TEvTxCommitDone& event)
+void TDistributedTransaction::OnTxDone(const TEvPQ::TEvTxDone& event)
 {
     TX_ENSURE(Step == event.Step);
     TX_ENSURE(TxId == event.TxId);
@@ -367,6 +368,12 @@ void TDistributedTransaction::OnTxCommitDone(const TEvPQ::TEvTxCommitDone& event
     TX_ENSURE(Partitions.contains(event.Partition.OriginalPartitionId));
 
     ++PartitionRepliesCount;
+}
+
+void TDistributedTransaction::SendPlanStepAcksAfterCompletion(const TActorId& sender, std::unique_ptr<TEvTxProcessing::TEvPlanStep>&& event)
+{
+    PlanStepSender = sender;
+    PlanStepEvent = std::move(event);
 }
 
 auto TDistributedTransaction::GetDecision() const -> EDecision
@@ -405,7 +412,7 @@ void TDistributedTransaction::AddCmdWrite(NKikimrClient::TKeyValueRequest& reque
                                           EState state)
 {
     auto tx = Serialize(state);
-    PQ_LOG_TX_D("save tx " << tx.ShortDebugString());
+    PQ_LOG_TX_D("Save tx " << tx.ShortDebugString());
 
     TString value;
     TX_ENSURE(tx.SerializeToString(&value));
@@ -413,6 +420,7 @@ void TDistributedTransaction::AddCmdWrite(NKikimrClient::TKeyValueRequest& reque
     auto command = request.AddCmdWrite();
     command->SetKey(GetKey());
     command->SetValue(value);
+    command->SetStorageChannel(NKikimrClient::TKeyValueRequest::INLINE);
 }
 
 NKikimrPQ::TTransaction TDistributedTransaction::Serialize() {
@@ -517,6 +525,11 @@ const TVector<NKikimrTx::TEvReadSet>& TDistributedTransaction::GetBindedMsgs(ui6
     static TVector<NKikimrTx::TEvReadSet> empty;
 
     return empty;
+}
+
+bool TDistributedTransaction::GetSkipSrcIdInfo() const
+{
+    return AllExistingWritesSkipConflictCheck(Operations);
 }
 
 void TDistributedTransaction::SetExecuteSpan(NWilson::TSpan&& span)

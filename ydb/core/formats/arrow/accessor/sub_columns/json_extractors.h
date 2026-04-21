@@ -2,12 +2,7 @@
 #include "direct_builder.h"
 
 #include <contrib/libs/apache/arrow/cpp/src/arrow/array/builder_base.h>
-#include <contrib/libs/simdjson/include/simdjson/dom/array-inl.h>
-#include <contrib/libs/simdjson/include/simdjson/dom/document-inl.h>
-#include <contrib/libs/simdjson/include/simdjson/dom/element-inl.h>
-#include <contrib/libs/simdjson/include/simdjson/dom/object-inl.h>
-#include <contrib/libs/simdjson/include/simdjson/dom/parser-inl.h>
-#include <contrib/libs/simdjson/include/simdjson/ondemand.h>
+#include <contrib/libs/simdjson/include/simdjson.h>
 #include <yql/essentials/types/binary_json/read.h>
 
 namespace NKikimr::NArrow::NAccessor::NSubColumns {
@@ -24,7 +19,7 @@ protected:
     }
 
     [[nodiscard]] TConclusionStatus AddDataToBuilder(TDataBuilder& dataBuilder, std::deque<std::unique_ptr<IJsonObjectExtractor>>& iterators,
-        const TStringBuf key, NBinaryJson::TEntryCursor& value) const;
+        const TStringBuf key, const NBinaryJson::TEntryCursor& value) const;
 
 public:
     virtual ~IJsonObjectExtractor() = default;

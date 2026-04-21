@@ -11,6 +11,8 @@
 #include <util/string/builder.h>
 #include <util/string/split.h>
 
+#include <utility>
+
 namespace {
 
 using namespace NKikimr;
@@ -49,16 +51,16 @@ class TMutableFunctionRegistry: public IMutableFunctionRegistry {
         TUdfModuleLoader(
             TUdfModulesMap& modulesMap,
             THashSet<TString>* newModules,
-            const TString& libraryPath,
+            TString libraryPath,
             const TUdfModuleRemappings& remappings,
             ui32 abiVersion,
-            const TString& customUdfPrefix = {})
+            TString customUdfPrefix = {})
             : ModulesMap_(modulesMap)
             , NewModules_(newModules)
-            , LibraryPath_(libraryPath)
+            , LibraryPath_(std::move(libraryPath))
             , Remappings_(remappings)
             , AbiVersion_(NUdf::AbiVersionToStr(abiVersion))
-            , CustomUdfPrefix_(customUdfPrefix)
+            , CustomUdfPrefix_(std::move(customUdfPrefix))
         {
         }
 
@@ -109,20 +111,21 @@ class TMutableFunctionRegistry: public IMutableFunctionRegistry {
     };
 
 public:
-    TMutableFunctionRegistry(IBuiltinFunctionRegistry::TPtr builtins)
+    explicit TMutableFunctionRegistry(IBuiltinFunctionRegistry::TPtr builtins)
         : Builtins_(std::move(builtins))
     {
     }
 
     TMutableFunctionRegistry(const TMutableFunctionRegistry& rhs)
-        : Builtins_(rhs.Builtins_)
+        : IMutableFunctionRegistry(rhs)
+        , Builtins_(rhs.Builtins_)
         , LoadedLibraries_(rhs.LoadedLibraries_)
         , UdfModules_(rhs.UdfModules_)
         , SupportsSizedAllocators_(rhs.SupportsSizedAllocators_)
     {
     }
 
-    ~TMutableFunctionRegistry() {
+    ~TMutableFunctionRegistry() override {
     }
 
     void AllowUdfPatch() override {
@@ -250,7 +253,8 @@ public:
         const NUdf::ISecureParamsProvider* secureParamsProvider,
         const NUdf::ILogProvider* logProvider,
         TFunctionTypeInfo* funcInfo) const override {
-        TStringBuf moduleName, funcName;
+        TStringBuf moduleName;
+        TStringBuf funcName;
         if (name.TrySplit(MODULE_NAME_DELIMITER, moduleName, funcName)) {
             auto it = UdfModules_.find(moduleName);
             if (it != UdfModules_.end()) {
@@ -332,7 +336,7 @@ public:
             TFunctionsMap Functions;
             class TFuncDescriptor: public NUdf::IFunctionDescriptor {
             public:
-                TFuncDescriptor(TFunctionProperties& properties)
+                explicit TFuncDescriptor(TFunctionProperties& properties)
                     : Properties_(properties)
                 {
                 }
@@ -340,6 +344,10 @@ public:
             private:
                 void SetTypeAwareness() final {
                     Properties_.IsTypeAwareness = true;
+                }
+
+                void SetPolyArgs(const NUdf::TStringRef& config) final {
+                    Properties_.PolyArgs = config;
                 }
 
                 TFunctionProperties& Properties_;
@@ -397,7 +405,7 @@ private:
 //////////////////////////////////////////////////////////////////////////////
 class TBuiltinsWrapper: public IFunctionRegistry {
 public:
-    TBuiltinsWrapper(IBuiltinFunctionRegistry::TPtr&& builtins)
+    explicit TBuiltinsWrapper(IBuiltinFunctionRegistry::TPtr&& builtins)
         : Builtins_(std::move(builtins))
     {
     }
@@ -475,13 +483,12 @@ private:
 
 } // namespace
 
-namespace NKikimr {
-namespace NMiniKQL {
+namespace NKikimr::NMiniKQL {
 
 void FindUdfsInDir(const TString& dirPath, TVector<TString>* paths)
 {
-    static const TStringBuf libPrefix = TStringBuf(MKQL_UDF_LIB_PREFIX);
-    static const TStringBuf libSuffix = TStringBuf(MKQL_UDF_LIB_SUFFIX);
+    static const TStringBuf LibPrefix = TStringBuf(MKQL_UDF_LIB_PREFIX);
+    static const TStringBuf LibSuffix = TStringBuf(MKQL_UDF_LIB_SUFFIX);
 
     if (!dirPath.empty()) {
         std::vector<TString> dirs;
@@ -490,25 +497,25 @@ void FindUdfsInDir(const TString& dirPath, TVector<TString>* paths)
         for (auto d : dirs) {
             TDirIterator dir(d, TDirIterator::TOptions(FTS_LOGICAL).SetMaxLevel(10));
 
-            for (auto file = dir.begin(), end = dir.end(); file != end; ++file) {
+            for (const auto& file : dir) {
                 // skip entries with empty name, and all non-files
                 // all valid symlinks are already dereferenced, provided by FTS_LOGICAL
-                if (file->fts_pathlen == file->fts_namelen || file->fts_info != FTS_F) {
+                if (file.fts_pathlen == file.fts_namelen || file.fts_info != FTS_F) {
                     continue;
                 }
 
-                TString path(file->fts_path);
+                TString path(file.fts_path);
                 TString fileName = GetBaseName(path);
 
                 // skip non shared libraries
-                if (!fileName.StartsWith(libPrefix) ||
-                    !fileName.EndsWith(libSuffix))
+                if (!fileName.StartsWith(LibPrefix) ||
+                    !fileName.EndsWith(LibSuffix))
                 {
                     continue;
                 }
 
                 // skip test udfs when scanning dir
-                auto udfName = TStringBuf(fileName).Skip(libPrefix.length());
+                auto udfName = TStringBuf(fileName).Skip(LibPrefix.length());
                 if (udfName.StartsWith(TStringBuf("test_"))) {
                     continue;
                 }
@@ -571,5 +578,4 @@ void FillStaticModules(IMutableFunctionRegistry& registry) {
     }
 }
 
-} // namespace NMiniKQL
-} // namespace NKikimr
+} // namespace NKikimr::NMiniKQL

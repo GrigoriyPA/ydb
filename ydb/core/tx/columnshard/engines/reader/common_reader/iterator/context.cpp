@@ -5,6 +5,7 @@
 #include <ydb/core/tx/limiter/grouped_memory/usage/abstract.h>
 #include <ydb/core/tx/limiter/grouped_memory/usage/service.h>
 #include <ydb/core/tx/columnshard/engines/portions/written.h>
+#include <ydb/core/protos/config.pb.h>
 
 namespace NKikimr::NOlap::NReader::NCommon {
 
@@ -31,14 +32,23 @@ TSpecialReadContext::TSpecialReadContext(const std::shared_ptr<TReadContext>& co
         kffAccessors = 0.01;
     }
 
+    auto scanMemoryLimit = TGlobalLimits::ScanMemoryLimit;
+
+    if (HasAppData()) {
+        if (AppData()->ColumnShardConfig.HasScanMemoryLimit()) {
+            scanMemoryLimit = AppData()->ColumnShardConfig.GetScanMemoryLimit();
+        }
+    }
+
     std::vector<std::shared_ptr<NGroupedMemoryManager::TStageFeatures>> stages = {
         NGroupedMemoryManager::TScanMemoryLimiterOperator::BuildStageFeatures(
-            stagePrefix + "::ACCESSORS", kffAccessors * TGlobalLimits::ScanMemoryLimit),
+            stagePrefix + "::ACCESSORS", kffAccessors * scanMemoryLimit),
         NGroupedMemoryManager::TScanMemoryLimiterOperator::BuildStageFeatures(
-            stagePrefix + "::FILTER", kffFilter * TGlobalLimits::ScanMemoryLimit),
+            stagePrefix + "::FILTER", kffFilter * scanMemoryLimit),
         NGroupedMemoryManager::TScanMemoryLimiterOperator::BuildStageFeatures(
-            stagePrefix + "::FETCHING", kffFetching * TGlobalLimits::ScanMemoryLimit),
-        NGroupedMemoryManager::TScanMemoryLimiterOperator::BuildStageFeatures(stagePrefix + "::MERGE", kffMerge * TGlobalLimits::ScanMemoryLimit)
+            stagePrefix + "::FETCHING", kffFetching * scanMemoryLimit),
+        NGroupedMemoryManager::TScanMemoryLimiterOperator::BuildStageFeatures(
+            stagePrefix + "::MERGE", kffMerge * scanMemoryLimit)
     };
     ProcessMemoryGuard = NGroupedMemoryManager::TScanMemoryLimiterOperator::BuildProcessGuard(ReadMetadata->GetTxId(), stages);
     ProcessScopeGuard = ProcessMemoryGuard->BuildScopeGuard(GetCommonContext()->GetScanId());

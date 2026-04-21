@@ -13,6 +13,11 @@
 #endif
 #endif
 
+// C++ 26
+#if !defined(SIMDJSON_CPLUSPLUS26) && (SIMDJSON_CPLUSPLUS >= 202402L) // update when the standard is finalized
+#define SIMDJSON_CPLUSPLUS26 1
+#endif
+
 // C++ 23
 #if !defined(SIMDJSON_CPLUSPLUS23) && (SIMDJSON_CPLUSPLUS >= 202302L)
 #define SIMDJSON_CPLUSPLUS23 1
@@ -114,5 +119,4 @@
 #define SIMDJSON_CONSTEVAL 0
 #endif // defined(__cpp_consteval) && __cpp_consteval >= 201811L && defined(__cpp_lib_constexpr_string) && __cpp_lib_constexpr_string >= 201907L
 #endif // !defined(SIMDJSON_CONSTEVAL)
-
 #endif // SIMDJSON_COMPILER_CHECK_H

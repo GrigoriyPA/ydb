@@ -58,8 +58,6 @@ struct TEvPrivate {
         EvWritingPortionsAddDataToBuffer,
         EvWritingPortionsFlushBuffer,
 
-        EvExportWritingFinished,
-        EvExportWritingFailed,
         EvExportCursorSaved,
         EvExportSaveCursor,
 
@@ -81,9 +79,19 @@ struct TEvPrivate {
         EvRequestFilter,
         EvFilterRequestResourcesAllocated,
         EvFilterConstructionResult,
-        
+        EvBordersConstructionResult,
+        EvMergeBordersResult,
+
         EvReportScanDiagnostics,
         EvReportScanIteratorDiagnostics,
+
+        EvBackupExportRecordBatch,
+        EvBackupExportRecordBatchResult,
+        EvBackupExportState,
+        EvBackupExportError,
+        
+        EvBackupImportRecordBatch,
+        EvBackupImportRecordBatchResult,
 
         EvEnd
     };
@@ -146,7 +154,7 @@ struct TEvPrivate {
             {
             }
 
-            operator size_t() const {
+            explicit operator size_t() const {
                 ui64 h = 0;
                 h = CombineHashes(h, THash<NOlap::TPortionAddress>()(Portion));
                 h = CombineHashes(h, (size_t)Consumer);
@@ -191,16 +199,54 @@ struct TEvPrivate {
     private:
         TConclusion<std::shared_ptr<NOlap::NReader::IApplyAction>> Result;
         TCounterGuard ScanCounter;
+        ui64 SourceId = 0;
+        ui64 BlobBytes = 0;
+        ui64 RawBytes = 0;
+        ui32 FilteredRows = 0;
+        ui32 TotalRows = 0;
+        ui64 TotalReservedBytes = 0;
 
     public:
         TConclusion<std::shared_ptr<NOlap::NReader::IApplyAction>>& MutableResult() {
             return Result;
         }
 
+        ui64 GetSourceId() const {
+            return SourceId;
+        }
+
+        ui64 GetBlobBytes() const {
+            return BlobBytes;
+        }
+
+        ui64 GetRawBytes() const {
+            return RawBytes;
+        }
+
+        ui32 GetFilteredRows() const {
+            return FilteredRows;
+        }
+
+        ui32 GetTotalRows() const {
+            return TotalRows;
+        }
+
+        ui64 GetTotalReservedBytes() const {
+            return TotalReservedBytes;
+        }
+
         TEvTaskProcessedResult(
-            TConclusion<std::shared_ptr<NOlap::NReader::IApplyAction>>&& result, TCounterGuard&& scanCounters)
+            TConclusion<std::shared_ptr<NOlap::NReader::IApplyAction>>&& result, TCounterGuard&& scanCounters, ui64 sourceId = 0,
+            ui64 blobBytes = 0, ui64 rawBytes = 0, ui32 filteredRows = 0, ui32 totalRows = 0,
+            ui64 totalReservedBytes = 0)
             : Result(std::move(result))
-            , ScanCounter(std::move(scanCounters)) {
+            , ScanCounter(std::move(scanCounters))
+            , SourceId(sourceId)
+            , BlobBytes(blobBytes)
+            , RawBytes(rawBytes)
+            , FilteredRows(filteredRows)
+            , TotalRows(totalRows)
+            , TotalReservedBytes(totalReservedBytes) {
         }
     };
 
@@ -354,7 +400,7 @@ struct TEvPrivate {
             return WritesBuffer;
         }
     };
-    
+
     struct TEvReportScanDiagnostics: public TEventLocal<TEvReportScanDiagnostics, EvReportScanDiagnostics> {
         TEvReportScanDiagnostics(TString&& requestMessage, TString&& dotGraph, TString&& ssaProgram, TString&& pkRangesFilter, bool isPublicScan)
             : RequestMessage(std::move(requestMessage))
@@ -380,6 +426,68 @@ struct TEvPrivate {
 
         ui64 RequestId;
         TString ScanIteratorDiagnostics;
+    };
+
+    // *** Backup (Export) ***
+    /*
+    1. TEvBackupExportRecordBatch -> Uploader
+    2. TEvBackupExportRecordBatchResult | TEvBackupExportError <- Uploader
+    ----
+    3. TEvBackupExportState - internal message for iscan iface
+    */
+    struct TEvBackupExportRecordBatch: public TEventLocal<TEvBackupExportRecordBatch, EvBackupExportRecordBatch> {
+        explicit TEvBackupExportRecordBatch(const std::shared_ptr<arrow::RecordBatch>& data, bool isLast)
+            : Data(data)
+            , IsLast(isLast) {
+        }
+
+        std::shared_ptr<arrow::RecordBatch> Data;
+        bool IsLast;
+    };
+
+    struct TEvBackupExportRecordBatchResult: public TEventLocal<TEvBackupExportRecordBatchResult, EvBackupExportRecordBatchResult> {
+        explicit TEvBackupExportRecordBatchResult(bool isFinish)
+            : IsFinish(isFinish) {
+        }
+
+        bool IsFinish = false;
+    };
+
+    struct TEvBackupExportState: public TEventLocal<TEvBackupExportState, EvBackupExportState> {
+        explicit TEvBackupExportState(NTable::EScan state)
+            : State(state) {
+        }
+
+        NTable::EScan State;
+    };
+
+    struct TEvBackupExportError: public TEventLocal<TEvBackupExportError, EvBackupExportError> {
+        explicit TEvBackupExportError(const TString& errorMessage)
+            : ErrorMessage(errorMessage) {
+        }
+
+        TString ErrorMessage;
+    };
+    
+    // *** Backup (Import) ***
+    /*
+    1. TEvBackupImportRecordBatch <- Downloader
+    2. TEvBackupImportRecordBatchResult -> Downloader
+    */
+    
+    struct TEvBackupImportRecordBatch: public TEventLocal<TEvBackupImportRecordBatch, EvBackupImportRecordBatch> {
+        explicit TEvBackupImportRecordBatch(const std::shared_ptr<arrow::RecordBatch>& data, bool isLast)
+            : Data(data)
+            , IsLast(isLast) {
+        }
+
+        std::shared_ptr<arrow::RecordBatch> Data;
+        bool IsLast;
+        TString Error;
+    };
+
+    struct TEvBackupImportRecordBatchResult: public TEventLocal<TEvBackupImportRecordBatchResult, EvBackupImportRecordBatchResult> {
+        explicit TEvBackupImportRecordBatchResult() = default;
     };
 };
 

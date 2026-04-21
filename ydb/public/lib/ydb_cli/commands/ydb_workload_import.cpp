@@ -236,7 +236,7 @@ int TWorkloadCommandImport::TUploadCommand::DoRun(NYdbWorkload::IWorkloadQueryGe
         pool.Start(UploadParams.Threads);
         const auto start = Now();
         Cout << "Fill table " << dataGen->GetName() << "..."  << Endl;
-        Bar = MakeHolder<TProgressBar>(dataGen->GetSize());
+        Bar = MakeHolder<TProgressBar>(dataGen->GetSize(), 100);
         for (ui32 t = 0; t < UploadParams.Threads; ++t) {
             pool.SafeAddFunc([this, dataGen] () {
                 ProcessDataGenerator(dataGen);
@@ -250,6 +250,10 @@ int TWorkloadCommandImport::TUploadCommand::DoRun(NYdbWorkload::IWorkloadQueryGe
         if (wereErrors) {
             break;
         }
+    }
+
+    if (AtomicGet(ErrorsCount) == 0 && Initializer->PostImport() != EXIT_SUCCESS) {
+        AtomicIncrement(ErrorsCount);
     }
     return AtomicGet(ErrorsCount) ? EXIT_FAILURE : EXIT_SUCCESS;
 }

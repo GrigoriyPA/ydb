@@ -22,14 +22,9 @@ TLexers Lexers = {
     .RegexAnsi = MakeRegexLexerFactory(/* ansi = */ true),
 };
 
-auto PureAnsiLexer = MakeLexer(
-    Lexers, /* ansi = */ true, /* antlr4 = */ true, ELexerFlavor::Pure);
-
-auto DefaultLexer = MakeLexer(
-    Lexers, /* ansi = */ false, /* antlr4 = */ false, ELexerFlavor::Regex);
-
-auto AnsiLexer = MakeLexer(
-    Lexers, /* ansi = */ true, /* antlr4 = */ false, ELexerFlavor::Regex);
+auto PureAnsiLexer = MakeLexer(Lexers, /* ansi = */ true, ELexerFlavor::Pure);
+auto DefaultLexer = MakeLexer(Lexers, /* ansi = */ false, ELexerFlavor::Regex);
+auto AnsiLexer = MakeLexer(Lexers, /* ansi = */ true, ELexerFlavor::Regex);
 
 TString ToString(TParsedToken token) {
     TString& string = token.Name;
@@ -169,11 +164,11 @@ Y_UNIT_TEST(SinleLineString) {
     Check("\" \"", "STRING_VALUE(\" \") EOF");
     Check("\"test\"", "STRING_VALUE(\"test\") EOF");
 
-    Check("\"\\\"\"", "STRING_VALUE(\"\\\"\") EOF", /* ansi = */ false);
-    Check("\"\\\"\"", "[INVALID] STRING_VALUE(\"\\\") EOF", /* ansi = */ true);
+    Check(R"("\"")", R"(STRING_VALUE("\"") EOF)", /* ansi = */ false);
+    Check(R"("\"")", R"([INVALID] STRING_VALUE("\") EOF)", /* ansi = */ true);
 
-    Check("\"\"\"\"", "STRING_VALUE(\"\") STRING_VALUE(\"\") EOF", /* ansi = */ false);
-    Check("\"\"\"\"", "STRING_VALUE(\"\"\"\") EOF", /* ansi = */ true);
+    Check(R"("""")", R"(STRING_VALUE("") STRING_VALUE("") EOF)", /* ansi = */ false);
+    Check(R"("""")", R"(STRING_VALUE("""") EOF)", /* ansi = */ true);
 }
 
 Y_UNIT_TEST(MultiLineString) {
