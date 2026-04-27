@@ -5687,6 +5687,47 @@ TRuntimeNode TProgramBuilder::HoppingCore(TRuntimeNode list,
     return TRuntimeNode(callableBuilder.Build(), false);
 }
 
+TRuntimeNode TProgramBuilder::StreamingAggregation(TRuntimeNode flow,
+                                                   const TUnaryLambda& keyExtractor,
+                                                   const TUnaryLambda& init,
+                                                   const TBinaryLambda& update,
+                                                   const TBinaryLambda& finish,
+                                                   TRuntimeNode stateTablePath)
+{
+    auto flowType = AS_TYPE(TFlowType, flow);
+    auto itemType = flowType->GetItemType();
+
+    TRuntimeNode itemArg = Arg(itemType);
+    auto outKey = keyExtractor(itemArg);
+
+    auto keyType = outKey.GetStaticType();
+    TRuntimeNode keyArg = Arg(keyType);
+
+    auto outInit = init(itemArg);
+    auto stateType = outInit.GetStaticType();
+    TRuntimeNode stateArg = Arg(stateType);
+
+    auto outUpdate = update(stateArg, itemArg);
+    MKQL_ENSURE(outUpdate.GetStaticType()->IsSameType(*stateType),
+                "StreamingAggregation: update lambda must produce the same state type as init");
+
+    auto outFinish = finish(keyArg, stateArg);
+    auto resultType = TFlowType::Create(outFinish.GetStaticType(), Env_);
+
+    TCallableBuilder callableBuilder(Env_, "StreamingAggregation", resultType);
+    callableBuilder.Add(flow);
+    callableBuilder.Add(itemArg);
+    callableBuilder.Add(stateArg);
+    callableBuilder.Add(keyArg);
+    callableBuilder.Add(outKey);
+    callableBuilder.Add(outInit);
+    callableBuilder.Add(outUpdate);
+    callableBuilder.Add(outFinish);
+    callableBuilder.Add(stateTablePath);
+
+    return TRuntimeNode(callableBuilder.Build(), false);
+}
+
 TRuntimeNode TProgramBuilder::MultiHoppingCore(TRuntimeNode list,
                                                const TUnaryLambda& keyExtractor,
                                                const TUnaryLambda& timeExtractor,

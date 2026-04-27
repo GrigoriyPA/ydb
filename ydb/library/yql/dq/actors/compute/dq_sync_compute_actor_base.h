@@ -3,6 +3,7 @@
 #include "dq_compute_actor_impl.h"
 #include "dq_compute_actor_async_input_helper.h"
 #include <ydb/library/yql/dq/actors/spilling/spiller_factory.h>
+#include <ydb/library/yql/dq/actors/compute/dq_compute_actor_async_resume.h>
 
 namespace NYql::NDq {
 
@@ -274,6 +275,7 @@ protected:
         if (this->Task.GetEnableSpilling()) {
             TaskRunner->SetSpillerFactory(std::make_shared<TDqSpillerFactory>(execCtx.GetTxId(), NActors::TActivationContext::ActorSystem(), execCtx.GetWakeupCallback(), execCtx.GetErrorCallback()));
         }
+        TaskRunner->SetAsyncResume(std::make_shared<TDqComputeActorAsyncResume>(execCtx.GetWakeupCallback()));
 
         this->WatermarksTracker.SetNotifyHandler([this]() {
             // This code is called from TaskRunner (either directly or from input transform/helper code), which is owned by sync CA, so `*this` must be alive at that point

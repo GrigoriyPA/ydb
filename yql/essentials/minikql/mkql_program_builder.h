@@ -518,6 +518,12 @@ public:
                              const TBinaryLambda& merge,
                              const TBinaryLambda& finish,
                              TRuntimeNode hop, TRuntimeNode interval, TRuntimeNode delay);
+    TRuntimeNode StreamingAggregation(TRuntimeNode flow,
+                                      const TUnaryLambda& keyExtractor,
+                                      const TUnaryLambda& init,
+                                      const TBinaryLambda& update,
+                                      const TBinaryLambda& finish,
+                                      TRuntimeNode stateTablePath);
     TRuntimeNode MultiHoppingCore(TRuntimeNode list,
                                   const TUnaryLambda& keyExtractor,
                                   const TUnaryLambda& timeExtractor,

@@ -6,11 +6,14 @@
 #include <ydb/core/kqp/opt/physical/kqp_opt_phy_rules.h>
 #include <ydb/core/kqp/provider/yql_kikimr_provider_impl.h>
 
+#include <yql/essentials/core/yql_aggregate_expander.h>
 #include <yql/essentials/core/yql_opt_match_recognize.h>
 #include <yql/essentials/core/yql_opt_utils.h>
 #include <ydb/core/kqp/opt/cbo/solver/kqp_opt_join.h>
+#include <ydb/library/yql/dq/opt/dq_opt.h>
 #include <ydb/library/yql/dq/opt/dq_opt_log.h>
 #include <ydb/library/yql/dq/opt/dq_opt_hopping.h>
+#include <ydb/library/yql/dq/type_ann/dq_type_ann.h>
 #include <ydb/core/kqp/opt/cbo/solver/kqp_opt_join_cost_based.h>
 #include <yql/essentials/utils/log/log.h>
 #include <yql/essentials/providers/common/transform/yql_optimize.h>
@@ -154,7 +157,10 @@ protected:
         TMaybeNode<TExprBase> output;
         auto aggregate = node.Cast<TCoAggregateBase>();
         auto hopSetting = GetSetting(aggregate.Settings().Ref(), "hopping");
-        if (hopSetting) {
+        auto streamingSetting = GetSetting(aggregate.Settings().Ref(), "streaming");
+        if (streamingSetting) {
+            output = RewriteAsStreamingAggregation(aggregate, ctx, getParents);
+        } else if (hopSetting) {
             auto input = aggregate.Input().Maybe<TDqConnection>();
             if (!input) {
                 return node;
@@ -175,6 +181,100 @@ protected:
             DumpAppliedRule("RewriteAggregate", node.Ptr(), output.Cast().Ptr(), ctx);
         }
         return output;
+    }
+
+    TMaybeNode<TExprBase> RewriteAsStreamingAggregation(TCoAggregateBase aggregate, TExprContext& ctx, const TGetParents& getParents) {
+        auto maybeInput = aggregate.Input().Maybe<TDqConnection>();
+        if (!maybeInput) {
+            return aggregate;
+        }
+        auto input = maybeInput.Cast();
+
+        if (!IsSingleConsumerConnection(input, *getParents())) {
+            return aggregate;
+        }
+
+        const auto pos = aggregate.Pos();
+
+        TString stateTablePath;
+        if (auto streamingSetting = GetSetting(aggregate.Settings().Ref(), "streaming")) {
+            if (streamingSetting->ChildrenSize() > 1 && streamingSetting->Child(1)->IsAtom()) {
+                stateTablePath = TString(streamingSetting->Child(1)->Content());
+            }
+        }
+
+        auto outputColumnsSetting = GetSetting(aggregate.Settings().Ref(), "output_columns");
+        auto cleanedSettings = RemoveSetting(aggregate.Settings().Ref(), "streaming", ctx);
+        cleanedSettings = RemoveSetting(*cleanedSettings, "output_columns", ctx);
+
+        auto stateTablePathSetting = ctx.Builder(pos)
+            .List()
+                .Atom(0, "state_table_path")
+                .Atom(1, stateTablePath)
+            .Seal()
+            .Build();
+        TExprNodeList settingsItems(cleanedSettings->ChildrenList());
+        settingsItems.push_back(stateTablePathSetting);
+        cleanedSettings = ctx.NewList(pos, std::move(settingsItems));
+
+        TAggregateExpander aggExpander(false, false, aggregate.Ptr(), ctx, TypesCtx);
+        TExprNodeList expandedHandlers;
+        expandedHandlers.reserve(aggregate.Handlers().Size());
+        for (const auto& handler : aggregate.Handlers()) {
+            auto trait = handler.Trait().Ptr();
+            if (trait->IsCallable({"AggApply", "AggApplyState", "AggApplyManyState"})) {
+                trait = aggExpander.ExpandAggApply(trait);
+                if (!trait) {
+                    return aggregate;
+                }
+            }
+            expandedHandlers.push_back(ctx.ChangeChild(handler.Ref(), TCoAggregateTuple::idx_Trait, std::move(trait)));
+        }
+        auto expandedHandlersList = ctx.NewList(pos, std::move(expandedHandlers));
+
+        auto hashShuffle = Build<TDqCnHashShuffle>(ctx, pos)
+            .Output()
+                .Stage(input.Output().Stage())
+                .Index(input.Output().Index())
+                .Build()
+            .KeyColumns(aggregate.Keys())
+            .Done();
+
+        auto streamArg = Build<TCoArgument>(ctx, pos).Name("stream").Done();
+
+        auto streamingAggregation = Build<TCoStreamingAggregation>(ctx, pos)
+            .Input(streamArg)
+            .Keys(aggregate.Keys())
+            .Handlers(TCoAggregateTupleList(expandedHandlersList))
+            .Settings(std::move(cleanedSettings))
+            .Done();
+
+        auto stage = Build<TDqStage>(ctx, pos)
+            .Inputs()
+                .Add(hashShuffle)
+                .Build()
+            .Program()
+                .Args(streamArg)
+                .Body(streamingAggregation)
+                .Build()
+            .Settings(TDqStageSettings().BuildNode(ctx, pos))
+            .Done();
+
+        TExprBase result = Build<TDqCnUnionAll>(ctx, pos)
+            .Output()
+                .Stage(stage)
+                .Index().Build("0")
+                .Build()
+            .Done();
+
+        if (outputColumnsSetting) {
+            result = Build<TCoExtractMembers>(ctx, pos)
+                .Input(result)
+                .Members(outputColumnsSetting->ChildPtr(1))
+                .Done();
+        }
+
+        return result;
     }
 
     TMaybeNode<TExprBase> RewriteTakeSortToTopSort(TExprBase node, TExprContext& ctx, const TGetParents& getParents) {

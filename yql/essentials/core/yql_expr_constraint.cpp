@@ -233,6 +233,7 @@ public:
         Functions_["AggregateMergeFinalize"] = &TCallableConstraintTransformer::AggregateWrap<true>;
         Functions_["AggregateMergeManyFinalize"] = &TCallableConstraintTransformer::AggregateWrap<true>;
         Functions_["AggregateFinalize"] = &TCallableConstraintTransformer::AggregateWrap<true>;
+        Functions_["StreamingAggregation"] = &TCallableConstraintTransformer::AggregateWrap<true>;
         Functions_["AggregateCombine"] = &TCallableConstraintTransformer::AggregateWrap<false>;
         Functions_["AggregateCombineState"] = &TCallableConstraintTransformer::AggregateWrap<false>;
         Functions_["Fold"] = &TCallableConstraintTransformer::FoldWrap;

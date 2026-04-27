@@ -65,6 +65,7 @@ SET(ORIG_SOURCES
     mkql_hasitems.cpp
     mkql_heap.cpp
     mkql_hopping.cpp
+    mkql_streaming_aggregation.cpp
     mkql_if.cpp
     mkql_ifpresent.cpp
     mkql_invoke.cpp
@@ -174,6 +175,9 @@ PEERDIR(
     yql/essentials/parser/pg_wrapper/interface
     yql/essentials/utils
     yql/essentials/public/issue/protos
+    ydb/library/query_actor
+    ydb/library/actors/core
+    ydb/public/sdk/cpp/src/client/params
 )
 
 IF (ARCH_X86_64)

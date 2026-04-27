@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mkql_computation_node_list.h"
+#include "mkql_compute_actor_async_resume.h"
 #include "mkql_spiller_factory.h"
 
 #include <yql/essentials/minikql/defs.h>
@@ -123,6 +124,7 @@ struct TComputationContext: public TComputationContextLLVM {
     const TTypeEnvironment& TypeEnv;
     const TComputationMutables Mutables;
     std::shared_ptr<ISpillerFactory> SpillerFactory;
+    std::shared_ptr<IComputeActorAsyncResume> AsyncResume;
     const NUdf::ITypeInfoHelper::TPtr TypeInfoHelper;
     NUdf::ICountersProvider* const CountersProvider;
     const NUdf::ISecureParamsProvider* const SecureParamsProvider;

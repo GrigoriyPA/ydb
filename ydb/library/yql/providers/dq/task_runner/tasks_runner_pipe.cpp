@@ -1764,6 +1764,9 @@ public:
     void SetSpillerFactory(std::shared_ptr<ISpillerFactory>) override {
     }
 
+    void SetAsyncResume(std::shared_ptr<IComputeActorAsyncResume>) override {
+    }
+
     TString GetOutputDebugString() override {
         return "";
     }

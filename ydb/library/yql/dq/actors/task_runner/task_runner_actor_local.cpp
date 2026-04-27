@@ -20,6 +20,7 @@
 #include <util/generic/queue.h>
 
 #include <ydb/library/yql/dq/actors/spilling/spiller_factory.h>
+#include <ydb/library/yql/dq/actors/compute/dq_compute_actor_async_resume.h>
 #include <yql/essentials/minikql/mkql_watermark.h>
 
 #define LOG_E(stream) LOG_ERROR_S(*TlsActivationContext, NKikimrServices::DQ_TASK_RUNNER, "SelfId: " << SelfId() << ", TxId: " << TxId << ", task: " << TaskId << ". " << stream)
@@ -593,6 +594,7 @@ private:
             auto errorCallback = ev->Get()->ExecCtx->GetErrorCallback();
             TaskRunner->SetSpillerFactory(std::make_shared<TDqSpillerFactory>(TxId, NActors::TActivationContext::ActorSystem(), wakeUpCallback, errorCallback));
         }
+        TaskRunner->SetAsyncResume(std::make_shared<TDqComputeActorAsyncResume>(ev->Get()->ExecCtx->GetWakeupCallback()));
 
         TaskRunner->Prepare(settings, ev->Get()->MemoryLimits, *ev->Get()->ExecCtx);
 

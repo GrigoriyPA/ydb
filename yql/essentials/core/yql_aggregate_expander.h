@@ -39,13 +39,13 @@ public:
     }
 
     TExprNode::TPtr ExpandAggregate();
+    TExprNode::TPtr ExpandAggApply(const TExprNode::TPtr& node);
     static TExprNode::TPtr CountAggregateRewrite(const NNodes::TCoAggregate& node, TExprContext& ctx, bool useBlocks);
 
 private:
     using TIdxSet = std::set<ui32>;
 
     TExprNode::TPtr ExpandAggregateWithFullOutput();
-    TExprNode::TPtr ExpandAggApply(const TExprNode::TPtr& node);
     bool CollectTraits();
     TExprNode::TPtr RebuildAggregate();
     TExprNode::TPtr GetContextLambda();

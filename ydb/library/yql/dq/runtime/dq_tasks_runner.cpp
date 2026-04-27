@@ -335,6 +335,10 @@ public:
         SpillerFactory = spillerFactory;
     }
 
+    void SetAsyncResume(std::shared_ptr<IComputeActorAsyncResume> asyncResume) override {
+        AsyncResume = std::move(asyncResume);
+    }
+
     TString GetOutputDebugString() override {
         return AllocatedHolder->Output ? AllocatedHolder->Output->DebugString() : "";
     }
@@ -595,6 +599,7 @@ public:
             SpillerFactory->SetTaskCounters(SpillingTaskCounters);
         }
         AllocatedHolder->ProgramParsed.CompGraph->GetContext().SpillerFactory = std::move(SpillerFactory);
+        AllocatedHolder->ProgramParsed.CompGraph->GetContext().AsyncResume = std::move(AsyncResume);
 
         bool taskUsesWatermarks = false;
         for (ui32 i = 0; i < task.InputsSize(); ++i) {
@@ -1198,6 +1203,7 @@ private:
 
 private:
     std::shared_ptr<ISpillerFactory> SpillerFactory;
+    std::shared_ptr<IComputeActorAsyncResume> AsyncResume;
     TIntrusivePtr<TSpillingTaskCounters> SpillingTaskCounters;
     NUdf::TUniquePtr<NUdf::ILogProvider> ComputationLogProvider;
 

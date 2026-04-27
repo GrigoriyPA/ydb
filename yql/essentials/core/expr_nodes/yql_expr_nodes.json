@@ -757,6 +757,11 @@
             "Match": {"Type": "Callable", "Name": "AggregateFinalize"}
         },
         {
+            "Name": "TCoStreamingAggregation",
+            "Base": "TCoAggregateBase",
+            "Match": {"Type": "Callable", "Name": "StreamingAggregation"}
+        },
+        {
             "Name": "TCoFold",
             "Base": "TCoInputBase",
             "Match": {"Type": "Callable", "Name": "Fold"},

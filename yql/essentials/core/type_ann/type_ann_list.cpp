@@ -5992,8 +5992,11 @@ namespace {
 
     IGraphTransformer::TStatus AggregateWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TExtContext& ctx) {
         TStringBuf suffix = input->Content();
-        YQL_ENSURE(suffix.SkipPrefix("Aggregate"));
-        const bool isMany = suffix == "MergeManyFinalize";
+        const bool isStreaming = (suffix == "StreamingAggregation");
+        if (!isStreaming) {
+            YQL_ENSURE(suffix.SkipPrefix("Aggregate"));
+        }
+        const bool isMany = !isStreaming && suffix == "MergeManyFinalize";
         if (!EnsureMinArgsCount(*input, 3, ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
         }
@@ -6249,6 +6252,10 @@ namespace {
                     return IGraphTransformer::TStatus::Ok;
                 }
                 outputColumns = setting->ChildPtr(1);
+            } else if (settingName == "streaming" || settingName == "state_table_path") {
+                if (!EnsureTupleSize(*setting, 2, ctx.Expr)) {
+                    return IGraphTransformer::TStatus::Error;
+                }
             } else {
                 ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(setting->Head().Pos()),
                     TStringBuilder() << "Unexpected setting: " << settingName));
@@ -6346,7 +6353,7 @@ namespace {
                 }
             }
 
-            if (suffix.empty() || suffix.EndsWith("Finalize")) {
+            if (suffix.empty() || suffix.EndsWith("Finalize") || suffix == "StreamingAggregation") {
                 auto finishType = isAggApply ? child->Child(1)->GetTypeAnn() : child->Child(1)->Child(6)->GetTypeAnn();
                 bool isOptional = finishType->GetKind() == ETypeAnnotationKind::Optional;
                 if (child->Head().IsList()) {

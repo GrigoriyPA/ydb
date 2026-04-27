@@ -497,6 +497,7 @@ public:
     virtual const NKikimr::NMiniKQL::TWatermark& GetWatermark() const = 0;
 
     virtual void SetSpillerFactory(std::shared_ptr<NKikimr::NMiniKQL::ISpillerFactory> spillerFactory) = 0;
+    virtual void SetAsyncResume(std::shared_ptr<NKikimr::NMiniKQL::IComputeActorAsyncResume> asyncResume) = 0;
     virtual TString GetOutputDebugString() = 0;
     TInstant LastFetchTime;
     ERunStatus LastFetchStatus = ERunStatus::PendingInput;

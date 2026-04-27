@@ -16478,6 +16478,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         ExtFunctions["AggregateFinalize"] = &AggregateWrapper;
         ExtFunctions["AggregateMergeFinalize"] = &AggregateWrapper;
         ExtFunctions["AggregateMergeManyFinalize"] = &AggregateWrapper;
+        ExtFunctions["StreamingAggregation"] = &AggregateWrapper;
 
         ColumnOrderFunctions["PgSetItem"] = &OrderForPgSetItem;
         ColumnOrderFunctions["PgIterate"] = &OrderFromFirst;
