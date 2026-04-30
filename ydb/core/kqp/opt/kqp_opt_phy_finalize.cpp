@@ -355,6 +355,31 @@ NYql::IGraphTransformer::TStatus ReplicatePrecomputeRule(const TExprNode::TPtr& 
     return TStatus::Ok;
 }
 
+NYql::IGraphTransformer::TStatus ValidateStreamingConstraints(const TExprNode::TPtr& input, TExprNode::TPtr&, TExprContext& ctx) {
+    bool hasErrors = false;
+    bool hasStreamingConstraints = false;
+    VisitExpr(input, [&](const TExprNode::TPtr& node) {
+        const bool isStreamingConstraint = node->GetConstraint<TStreamingConstraintNode>();
+        hasStreamingConstraints = hasStreamingConstraints || isStreamingConstraint;
+        return !isStreamingConstraint && !hasErrors;
+    }, [&](const TExprNode::TPtr& node) {
+        if (!hasStreamingConstraints || !node->IsCallable() || node->GetConstraint<TStreamingConstraintNode>() || hasErrors) {
+            // Validate streaming constraints only for callables with streaming constraint in subgraph
+            return true;
+        }
+        for (const auto& child : node->Children()) {
+            if (child->GetConstraint<TStreamingConstraintNode>()) {
+                hasErrors = true;
+                YQL_CLOG(WARN, ProviderKqp) << "Found invalid streaming processing node: " << KqpExprToPrettyString(*node, ctx);
+                ctx.AddError(TIssue(ctx.GetPosition(node->Pos()), TStringBuilder() << "Unsupported callable for streaming processing: '" << node->Content() << "'"));
+                return false;
+            }
+        }
+        return true;
+    });
+    return hasErrors ? TStatus::Error : TStatus::Ok;
+}
+
 template <typename TFunctor>
 NYql::IGraphTransformer::TStatus PerformGlobalRule(const TString& ruleName, const NYql::TExprNode::TPtr& input,
     NYql::TExprNode::TPtr& output, NYql::TExprContext& ctx, TFunctor func)
@@ -411,6 +436,8 @@ TAutoPtr<IGraphTransformer> CreateKqpFinalizingOptTransformer(const TIntrusivePt
                 [] (const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) {
                     return KqpDuplicateResults(input, output, ctx);
                 });
+
+            PERFORM_GLOBAL_RULE("ValidateStreamingConstraints", input, output, ctx, ValidateStreamingConstraints);
 
             YQL_CLOG(TRACE, ProviderKqp) << "FinalizingOptimized KQL query: " << KqpExprToPrettyString(*input, ctx);
 

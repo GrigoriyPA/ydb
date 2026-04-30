@@ -81,8 +81,8 @@ public:
     {
         Functions_["FailMe"] = &TCallableConstraintTransformer::FailMeWrap;
         Functions_["Seq"] = &TCallableConstraintTransformer::SeqWrap;
-        Functions_["Unordered"] = &TCallableConstraintTransformer::FromFirst<TEmptyConstraintNode, TUniqueConstraintNode, TDistinctConstraintNode, TVarIndexConstraintNode, TMultiConstraintNode>;
-        Functions_["UnorderedSubquery"] = &TCallableConstraintTransformer::FromFirst<TEmptyConstraintNode, TUniqueConstraintNode, TDistinctConstraintNode, TVarIndexConstraintNode, TMultiConstraintNode>;
+        Functions_["Unordered"] = &TCallableConstraintTransformer::FromFirst<TEmptyConstraintNode, TUniqueConstraintNode, TDistinctConstraintNode, TVarIndexConstraintNode, TMultiConstraintNode, TStreamingConstraintNode>;
+        Functions_["UnorderedSubquery"] = &TCallableConstraintTransformer::FromFirst<TEmptyConstraintNode, TUniqueConstraintNode, TDistinctConstraintNode, TVarIndexConstraintNode, TMultiConstraintNode, TStreamingConstraintNode>;
         Functions_["Sort"] = &TCallableConstraintTransformer::SortWrap;
         Functions_["AssumeSorted"] = &TCallableConstraintTransformer::SortWrap;
         Functions_["AssumeUnique"] = &TCallableConstraintTransformer::AssumeUniqueWrap<false, true>;
@@ -115,10 +115,10 @@ public:
         Functions_["Collect"] = &TCallableConstraintTransformer::CopyAllFrom<0>;
         Functions_["PruneAdjacentKeys"] = &TCallableConstraintTransformer::PruneKeysWrap<true>;
         Functions_["PruneKeys"] = &TCallableConstraintTransformer::PruneKeysWrap<false>;
-        Functions_["FilterNullMembers"] = &TCallableConstraintTransformer::FromFirst<TSortedConstraintNode, TPartOfSortedConstraintNode, TChoppedConstraintNode, TPartOfChoppedConstraintNode, TEmptyConstraintNode, TUniqueConstraintNode, TPartOfUniqueConstraintNode, TDistinctConstraintNode, TPartOfDistinctConstraintNode, TVarIndexConstraintNode>;
-        Functions_["SkipNullMembers"] = &TCallableConstraintTransformer::FromFirst<TSortedConstraintNode, TPartOfSortedConstraintNode, TChoppedConstraintNode, TPartOfChoppedConstraintNode, TEmptyConstraintNode, TUniqueConstraintNode, TPartOfUniqueConstraintNode, TDistinctConstraintNode, TPartOfDistinctConstraintNode, TVarIndexConstraintNode>;
-        Functions_["FilterNullElements"] = &TCallableConstraintTransformer::FromFirst<TSortedConstraintNode, TPartOfSortedConstraintNode, TChoppedConstraintNode, TPartOfChoppedConstraintNode, TEmptyConstraintNode, TUniqueConstraintNode, TPartOfUniqueConstraintNode, TDistinctConstraintNode, TPartOfDistinctConstraintNode, TVarIndexConstraintNode>;
-        Functions_["SkipNullElements"] = &TCallableConstraintTransformer::FromFirst<TSortedConstraintNode, TPartOfSortedConstraintNode, TChoppedConstraintNode, TPartOfChoppedConstraintNode, TEmptyConstraintNode, TUniqueConstraintNode, TPartOfUniqueConstraintNode, TDistinctConstraintNode, TPartOfDistinctConstraintNode, TVarIndexConstraintNode>;
+        Functions_["FilterNullMembers"] = &TCallableConstraintTransformer::FromFirst<TSortedConstraintNode, TPartOfSortedConstraintNode, TChoppedConstraintNode, TPartOfChoppedConstraintNode, TEmptyConstraintNode, TUniqueConstraintNode, TPartOfUniqueConstraintNode, TDistinctConstraintNode, TPartOfDistinctConstraintNode, TVarIndexConstraintNode, TStreamingConstraintNode>;
+        Functions_["SkipNullMembers"] = &TCallableConstraintTransformer::FromFirst<TSortedConstraintNode, TPartOfSortedConstraintNode, TChoppedConstraintNode, TPartOfChoppedConstraintNode, TEmptyConstraintNode, TUniqueConstraintNode, TPartOfUniqueConstraintNode, TDistinctConstraintNode, TPartOfDistinctConstraintNode, TVarIndexConstraintNode, TStreamingConstraintNode>;
+        Functions_["FilterNullElements"] = &TCallableConstraintTransformer::FromFirst<TSortedConstraintNode, TPartOfSortedConstraintNode, TChoppedConstraintNode, TPartOfChoppedConstraintNode, TEmptyConstraintNode, TUniqueConstraintNode, TPartOfUniqueConstraintNode, TDistinctConstraintNode, TPartOfDistinctConstraintNode, TVarIndexConstraintNode, TStreamingConstraintNode>;
+        Functions_["SkipNullElements"] = &TCallableConstraintTransformer::FromFirst<TSortedConstraintNode, TPartOfSortedConstraintNode, TChoppedConstraintNode, TPartOfChoppedConstraintNode, TEmptyConstraintNode, TUniqueConstraintNode, TPartOfUniqueConstraintNode, TDistinctConstraintNode, TPartOfDistinctConstraintNode, TVarIndexConstraintNode, TStreamingConstraintNode>;
         Functions_["Right!"] = &TCallableConstraintTransformer::CopyAllFrom<0>;
         Functions_["Cons!"] = &TCallableConstraintTransformer::CopyAllFrom<1>;
         Functions_["ExtractMembers"] = &TCallableConstraintTransformer::ExtractMembersWrap;
@@ -253,6 +253,8 @@ public:
         Functions_["BlockMergeFinalizeHashed"] = &TCallableConstraintTransformer::AggregateWrap<true>;
         Functions_["BlockMergeManyFinalizeHashed"] = &TCallableConstraintTransformer::AggregateWrap<true>;
         Functions_["MultiHoppingCore"] = &TCallableConstraintTransformer::MultiHoppingCoreWrap;
+        Functions_["MatchRecognize"] = &TCallableConstraintTransformer::MatchRecognizeWrap;
+        Functions_["MatchRecognizeCore"] = &TCallableConstraintTransformer::MatchRecognizeWrap;
         Functions_["StablePickle"] = &TCallableConstraintTransformer::PickleWrap;
         Functions_["Unpickle"] = &TCallableConstraintTransformer::FromSecond<TUniqueConstraintNode, TPartOfUniqueConstraintNode, TDistinctConstraintNode, TPartOfDistinctConstraintNode, TPartOfChoppedConstraintNode, TVarIndexConstraintNode>;
         Functions_["Seq!"] = &TCallableConstraintTransformer::SeqExclamWrap;
@@ -541,7 +543,7 @@ private:
         }
 
         input->AddConstraint(constraint);
-        return FromFirst<TSortedConstraintNode, TChoppedConstraintNode, TUniqueConstraintNodeBase<!Distinct>, TEmptyConstraintNode, TVarIndexConstraintNode>(input, output, ctx);
+        return FromFirst<TSortedConstraintNode, TChoppedConstraintNode, TUniqueConstraintNodeBase<!Distinct>, TEmptyConstraintNode, TVarIndexConstraintNode, TStreamingConstraintNode>(input, output, ctx);
     }
 
     TStatus AssumeChoppedWrap(const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) const {
@@ -576,7 +578,7 @@ private:
         }
 
         input->AddConstraint(constraint);
-        return FromFirst<TSortedConstraintNode, TDistinctConstraintNode, TUniqueConstraintNode, TEmptyConstraintNode, TVarIndexConstraintNode>(input, output, ctx);
+        return FromFirst<TSortedConstraintNode, TDistinctConstraintNode, TUniqueConstraintNode, TEmptyConstraintNode, TVarIndexConstraintNode, TStreamingConstraintNode>(input, output, ctx);
     }
 
     template <bool UseSort>
@@ -796,7 +798,7 @@ private:
         FilterFromHead<TPartOfChoppedConstraintNode>(input, filter, ctx);
         FilterFromHead<TPartOfUniqueConstraintNode>(input, filter, ctx);
         FilterFromHead<TPartOfDistinctConstraintNode>(input, filter, ctx);
-        return FromFirst<TEmptyConstraintNode, TVarIndexConstraintNode>(input, output, ctx);
+        return FromFirst<TEmptyConstraintNode, TVarIndexConstraintNode, TStreamingConstraintNode>(input, output, ctx);
     }
 
     TStatus RemovePrefixMembersWrap(const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) const {
@@ -832,7 +834,7 @@ private:
             }
         }
 
-        return FromFirst<TEmptyConstraintNode, TVarIndexConstraintNode>(input, output, ctx);
+        return FromFirst<TEmptyConstraintNode, TVarIndexConstraintNode, TStreamingConstraintNode>(input, output, ctx);
     }
 
     // TODO: Empty for false condition
@@ -846,7 +848,7 @@ private:
             FromFirst<TSortedConstraintNode, TPartOfSortedConstraintNode, TChoppedConstraintNode, TPartOfChoppedConstraintNode>(input, output, ctx);
         }
 
-        return FromFirst<TEmptyConstraintNode, TUniqueConstraintNode, TPartOfUniqueConstraintNode, TDistinctConstraintNode, TPartOfDistinctConstraintNode, TVarIndexConstraintNode, TMultiConstraintNode>(input, output, ctx);
+        return FromFirst<TEmptyConstraintNode, TUniqueConstraintNode, TPartOfUniqueConstraintNode, TDistinctConstraintNode, TPartOfDistinctConstraintNode, TVarIndexConstraintNode, TMultiConstraintNode, TStreamingConstraintNode>(input, output, ctx);
     }
 
     template <bool Adjacent>
@@ -903,7 +905,7 @@ private:
             return TStatus::Ok;
         }
 
-        return FromFirst<TEmptyConstraintNode, TUniqueConstraintNode, TDistinctConstraintNode>(input, output, ctx);
+        return FromFirst<TEmptyConstraintNode, TUniqueConstraintNode, TDistinctConstraintNode, TStreamingConstraintNode>(input, output, ctx);
     }
 
     template<class TConstraint>
@@ -1192,7 +1194,7 @@ private:
             }
         }
 
-        return FromFirst<TEmptyConstraintNode>(input, output, ctx);
+        return FromFirst<TEmptyConstraintNode, TStreamingConstraintNode>(input, output, ctx);
     }
 
     template <bool Ordered>
@@ -1272,6 +1274,13 @@ private:
                 if (const auto part = input->Head().GetConstraint<TPartOfChoppedConstraintNode>()) {
                     input->AddConstraint(part);
                 }
+            }
+        }
+
+        for (size_t i = 0; i < input->ChildrenSize(); ++i) {
+            if (const auto streaming = input->Child(i)->GetConstraint<TStreamingConstraintNode>()) {
+                input->AddConstraint(streaming);
+                break;
             }
         }
 
@@ -2367,7 +2376,7 @@ private:
         };
     }
 
-    TStatus MapJoinCoreWrap(const TExprNode::TPtr& input, TExprNode::TPtr& /*output*/, TExprContext& ctx) const {
+    TStatus MapJoinCoreWrap(const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) const {
         const TCoMapJoinCore core(input);
         const auto& joinType = core.JoinKind().Ref();
         if (const auto empty = core.LeftInput().Ref().GetConstraint<TEmptyConstraintNode>()) {
@@ -2420,6 +2429,12 @@ private:
             if (const auto renamed = chopped->RenameFields(ctx, GetRenames(core.LeftRenames().Ref())))
                 input->AddConstraint(renamed);
 
+        if (core.RightDict().Ref().GetConstraint<TStreamingConstraintNode>()) {
+            ctx.AddError(TIssue(ctx.GetPosition(core.RightDict().Ref().Pos()), "Streaming right side of the map join is not allowed"));
+            return TStatus::Error;
+        }
+
+        FromFirst<TStreamingConstraintNode>(input, output, ctx);
         return TStatus::Ok;
     }
 
@@ -2843,7 +2858,7 @@ private:
         GetCommonFromBothLambdas<TPartOfChoppedConstraintNode, Wide>(input, ctx);
         GetCommonFromBothLambdas<TPartOfUniqueConstraintNode, Wide>(input, ctx);
         GetCommonFromBothLambdas<TPartOfDistinctConstraintNode, Wide>(input, ctx);
-        return FromFirst<TEmptyConstraintNode>(input, output, ctx);
+        return FromFirst<TEmptyConstraintNode, TStreamingConstraintNode>(input, output, ctx);
     }
 
     template<bool Distinct>
@@ -3123,7 +3138,7 @@ private:
         return TStatus::Ok;
     }
 
-    TStatus MultiHoppingCoreWrap(const TExprNode::TPtr& input, TExprNode::TPtr&, TExprContext& ctx) const {
+    TStatus MultiHoppingCoreWrap(const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) const {
         if (const auto status = UpdateAllChildLambdasConstraints(*input); status != TStatus::Ok) {
             return status;
         }
@@ -3144,11 +3159,14 @@ private:
             input->AddConstraint(ctx.MakeConstraint<TDistinctConstraintNode>(columns));
         }
 
-        if (auto c = input->Child(TCoMultiHoppingCore::idx_Input)->GetConstraint<TEmptyConstraintNode>()) {
-            input->AddConstraint(c);
-        }
+        return FromFirst<TEmptyConstraintNode, TStreamingConstraintNode>(input, output, ctx);
+    }
 
-        return TStatus::Ok;
+    TStatus MatchRecognizeWrap(const TExprNode::TPtr& input, TExprNode::TPtr& output, TExprContext& ctx) const {
+        if (const auto status = UpdateAllChildLambdasConstraints(*input); status != TStatus::Ok) {
+            return status;
+        }
+        return FromFirst<TEmptyConstraintNode, TStreamingConstraintNode>(input, output, ctx);
     }
 
 private:

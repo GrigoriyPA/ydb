@@ -6,6 +6,7 @@ SRCS(
     yql_pq_datasink_io_discovery.cpp
     yql_pq_datasink_type_ann.cpp
     yql_pq_datasource.cpp
+    yql_pq_datasource_constraints.cpp
     yql_pq_datasource_type_ann.cpp
     yql_pq_dq_integration.cpp
     yql_pq_io_discovery.cpp
