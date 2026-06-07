@@ -306,6 +306,7 @@ class RollingUpgradeAndDowngradeFixture:
             logger.info(f"upgrading {role} {node_id}")
             node.stop()
             node.binary_path = self.all_binary_paths[1]
+            node.set_log_file_prefix("logfile_upgraded_")
             node.start()
             self._wait_for_readiness()
             yield
@@ -315,6 +316,7 @@ class RollingUpgradeAndDowngradeFixture:
             logger.info(f"downgrading {role} {node_id}")
             node.stop()
             node.binary_path = self.all_binary_paths[0]
+            node.set_log_file_prefix("logfile_downgraded_")
             node.start()
             self._wait_for_readiness()
             yield

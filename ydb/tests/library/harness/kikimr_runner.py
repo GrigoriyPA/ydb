@@ -103,22 +103,25 @@ class KiKiMRNode(daemon.Daemon, kikimr_node_interface.NodeInterface):
         )
 
         if configurator.use_log_files:
-            # use NamedTemporaryFile only as a unique name generator
-            log_file = tempfile.NamedTemporaryFile(dir=self.__working_dir, prefix="logfile_", suffix=".log", delete=False)
-            self.__log_file_name = log_file.name
-            log_file.close()
+            self.__make_log_file_name("logfile_")
             kwargs = {
                 "stdout_file": os.path.join(self.__working_dir, "stdout"),
                 "stderr_file": os.path.join(self.__working_dir, "stderr"),
                 "aux_file": self.__log_file_name,
-                }
+            }
         else:
             self.__log_file_name = None
             kwargs = {
                 "stdout_file": "/dev/stdout",
                 "stderr_file": "/dev/stderr"
-                }
+            }
         daemon.Daemon.__init__(self, self.command, cwd=self.__working_dir, timeout=180, stderr_on_error_lines=240, **kwargs)
+
+    def __make_log_file_name(self, prefix):
+        # use NamedTemporaryFile only as a unique name generator
+        log_file = tempfile.NamedTemporaryFile(dir=self.__working_dir, prefix=prefix, suffix=".log", delete=False)
+        self.__log_file_name = log_file.name
+        log_file.close()
 
     def is_port_listening(self, port):
         """Check if the port is listening after node startup"""
@@ -398,6 +401,11 @@ class KiKiMRNode(daemon.Daemon, kikimr_node_interface.NodeInterface):
     def set_seed_nodes_file(self, seed_nodes_file):
         self.__seed_nodes_file = seed_nodes_file
         self.update_command(self.__make_run_command())
+
+    def set_log_file_prefix(self, prefix):
+        self.__make_log_file_name(prefix)
+        self.update_command(self.__make_run_command())
+        self.update_aux_file(self.__log_file_name)
 
     def make_config_dir(self, source_config_yaml_path, target_config_dir_path):
         if not os.path.exists(source_config_yaml_path):
