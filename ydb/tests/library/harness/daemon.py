@@ -5,6 +5,7 @@ import os
 import signal
 import sys
 import subprocess
+import time
 
 from yatest.common import process
 import six
@@ -194,14 +195,18 @@ class Daemon(object):
         if not self.__check_can_launch_stop("stop"):
             return
 
+        stop_start_at = time.time()
         self.__daemon.process.terminate()
-        wait_for(lambda: not self.is_alive(), self.__timeout)
+        wait_for(lambda: not self.is_alive(), self.__timeout, step_seconds=0.001, max_step_seconds=1)
 
         is_killed = False
         if self.is_alive():
+            self.logger.info("Force stop daemon, still alive after %s s" % self.__timeout)
             self.__daemon.process.send_signal(signal.SIGKILL)
             wait_for(lambda: not self.is_alive(), self.__timeout)
             is_killed = True
+
+        self.logger.info("Daemon stopped in %s s" % (time.time() - stop_start_at))
         self.__check_before_end_stop("stop")
         self.__close_output_files()
 

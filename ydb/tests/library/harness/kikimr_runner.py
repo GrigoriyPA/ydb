@@ -457,6 +457,7 @@ class KiKiMR(kikimr_cluster_interface.KiKiMRClusterInterface):
         return self.__server
 
     def _get_token(self, timeout=30, interval=2):
+        logger.info("Fetching token for cluster")
         start_time = time.time()
         last_exception = None
         while time.time() - start_time < timeout:
@@ -576,6 +577,8 @@ class KiKiMR(kikimr_cluster_interface.KiKiMRClusterInterface):
             self.__register_node()
 
     def _bootstrap_cluster(self, self_assembly_uuid="test-cluster", timeout=30, interval=2):
+        logger.info("Bootstrapping cluster with uuid: %s" % self_assembly_uuid)
+
         start_time = time.time()
         last_exception = None
         while time.time() - start_time < timeout:
@@ -899,6 +902,7 @@ class KiKiMR(kikimr_cluster_interface.KiKiMRClusterInterface):
             self.nodes[node_id].format_pdisk(**pdisk)
 
     def __add_bs_box(self):
+        logger.info("Adding bs box")
         request = bs.TConfigRequest()
 
         for node_id in self.__configurator.all_node_ids():
@@ -955,6 +959,7 @@ class KiKiMR(kikimr_cluster_interface.KiKiMRClusterInterface):
                     raise
 
     def add_storage_pool(self, name=None, kind="rot", pdisk_user_kind=0, erasure=None, num_groups=None):
+        logger.info("Adding storage pool with kind %s" % kind)
         if erasure is None:
             erasure = self.__configurator.static_erasure
         if num_groups is None:
@@ -986,6 +991,7 @@ class KiKiMR(kikimr_cluster_interface.KiKiMRClusterInterface):
         return name
 
     def __wait_for_bs_controller_to_start(self, timeout_seconds=240, token=None):
+        logger.info("Waiting for bs controller up")
         monitors = [
             KikimrMonitor(
                 node.host,
@@ -997,10 +1003,11 @@ class KiKiMR(kikimr_cluster_interface.KiKiMRClusterInterface):
         ]
 
         def predicate():
+            logger.debug("Run bs controller check, amount nodes %s" % len(monitors))
             return blobstorage_controller_has_started_on_some_node(monitors)
 
         bs_controller_started = wait_for(
-            predicate=predicate, timeout_seconds=timeout_seconds, step_seconds=1.0, multiply=1.3
+            predicate=predicate, timeout_seconds=timeout_seconds, step_seconds=0.001, multiply=2, max_step_seconds=1
         )
         assert bs_controller_started
 
