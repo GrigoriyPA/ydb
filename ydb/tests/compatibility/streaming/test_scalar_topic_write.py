@@ -22,13 +22,13 @@ class ScalarTopicWriteTestBase:
             pytest.skip("Only available since 26-1")
 
         yield from super().setup_cluster(
-            extra_feature_flags={
-                "enable_external_data_sources": True,
-                "enable_topics_sql_io_operations": True,
-            },
+            extra_feature_flags=[
+                "enable_external_data_sources",
+                "enable_topics_sql_io_operations",
+            ],
             additional_log_configs={
                 'KQP_PROXY': LogLevels.DEBUG,
-                'KQP_EXECUTOR': LogLevels.DEBUG},
+                'KQP_EXECUTER': LogLevels.DEBUG},
         )
 
     def create_topics(self, with_external_data_source: bool):
@@ -118,4 +118,5 @@ class TestScalarTopicWriteRollingUpgradeAndDowngrade(ScalarTopicWriteTestBase, R
 
         for i, _ in enumerate(self.roll()):
             self.do_test_part(suffix=str(i))
+            logger.info(f"Roll {i} completed, waiting for next roll")
             time.sleep(0.5)
