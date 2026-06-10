@@ -55,11 +55,12 @@ def ensure_path_exists(path):
 
 
 class KiKiMRNode(daemon.Daemon, kikimr_node_interface.NodeInterface):
-    def __init__(self, node_id, config_path, port_allocator, cluster_name, configurator,
+    def __init__(self, server, node_id, config_path, port_allocator, cluster_name, configurator,
                  udfs_dir=None, role='node', node_broker_port=None, tenant_affiliation=None, encryption_key=None,
                  binary_path=None, data_center=None, use_config_store=False, seed_nodes_file=None):
 
         super(kikimr_node_interface.NodeInterface, self).__init__()
+        self.server = server
         self.node_id = node_id
         self.data_center = data_center
         self.__config_path = config_path
@@ -318,13 +319,20 @@ class KiKiMRNode(daemon.Daemon, kikimr_node_interface.NodeInterface):
         logger.info("Final command: %s", ' '.join(command).replace(self.__config_path, '$CFG_DIR_PATH'))
         return command
 
+    def __prepare_to_shutdown(self):
+        self.server.reset_clients() # Prevent gRPC channels slow shutdown
+
     def stop(self):
+        self.__prepare_to_shutdown()
+
         try:
             super(KiKiMRNode, self).stop()
         finally:
             logger.info("Stopped node %s", self)
 
     def kill(self):
+        self.__prepare_to_shutdown()
+
         try:
             super(KiKiMRNode, self).kill()
             self.start()
@@ -332,6 +340,7 @@ class KiKiMRNode(daemon.Daemon, kikimr_node_interface.NodeInterface):
             logger.info("Killed node %s", self)
 
     def send_signal(self, signal):
+        self.__prepare_to_shutdown()
         self.daemon.process.send_signal(signal)
 
     @property
@@ -685,6 +694,7 @@ class KiKiMR(kikimr_cluster_interface.KiKiMRClusterInterface):
             if node_index in configurator.dc_mapping:
                 data_center = configurator.dc_mapping[node_index]
         self._nodes[node_index] = KiKiMRNode(
+            server=self,
             node_id=node_index,
             config_path=node_config_path,
             port_allocator=self.__port_allocator.get_node_port_allocator(node_index),
@@ -732,6 +742,7 @@ class KiKiMR(kikimr_cluster_interface.KiKiMRClusterInterface):
             encryption_key = self.write_encryption_key(slug)
 
         self._slots[slot_index] = KiKiMRNode(
+            server=self,
             node_id=slot_index,
             config_path=self.config_path,
             port_allocator=self.__port_allocator.get_slot_port_allocator(slot_index),
