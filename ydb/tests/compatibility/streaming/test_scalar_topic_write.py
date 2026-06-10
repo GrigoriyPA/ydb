@@ -28,6 +28,8 @@ class ScalarTopicWriteTestBase:
             ],
             additional_log_configs={
                 'KQP_PROXY': LogLevels.DEBUG,
+                'KQP_COMPUTE': LogLevels.TRACE,
+                'YDB_SDK': LogLevels.TRACE,
                 'KQP_EXECUTER': LogLevels.DEBUG},
         )
 
@@ -60,14 +62,24 @@ class ScalarTopicWriteTestBase:
             session_pool.execute_with_retries(query)
 
     def do_test_part(self, suffix: str = ""):
-        logger.debug("write data to stream")
+        logger.debug("Write data to stream")
         with ydb.QuerySessionPool(self.driver) as session_pool:
             query = f"""
                 INSERT INTO {self.output_object} SELECT "my_data{suffix}";
             """
-            session_pool.execute_with_retries(query)
 
-        logger.debug("read data from stream")
+            for _ in range(0, 5):
+                try:
+                    started_at = time.time()
+                    session_pool.execute_with_retries(query, retry_settings=ydb.RetrySettings(max_retries=50, get_session_client_timeout=30))
+                    logger.debug(f"Write request finished in {time.time() - started_at} s")
+                except ydb.DeadlineExceed as e:
+                    logger.warning(f"Failed to write to topic, deadline exceeded: {e}")
+                    continue
+                else:
+                    break
+
+        logger.debug("Read data from stream")
         read_data = read_stream(
             path=self.output_topic,
             messages_count=1,
