@@ -1368,7 +1368,7 @@ public:
             throw TInitializationException("YDB-CFG13") << errors.front();
         }
 
-        Logger.Out() << "configured" << Endl;
+        Logger.Out() << "Configured YDB server" << Endl;
     }
 
     void FillData(const NConfig::TCommonAppOptions& cf) {
