@@ -31,6 +31,7 @@ class SolomonExternalSourceWriteTestBase:
         cleanup_solomon(self.SOLOMON_PROJECT, self.SOLOMON_CLUSTER, self.SOLOMON_SERVICE)
 
         yield from super().setup_cluster(
+            disabled_feature_flags=["enable_drain_on_shutdown"],
             extra_feature_flags=["enable_external_data_sources"],
             query_service_config={
                 "available_external_data_sources": ["Solomon"],

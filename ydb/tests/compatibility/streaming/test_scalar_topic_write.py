@@ -22,6 +22,7 @@ class ScalarTopicWriteTestBase:
             pytest.skip("Only available since 26-1")
 
         yield from super().setup_cluster(
+            disabled_feature_flags=["enable_drain_on_shutdown"],
             extra_feature_flags=[
                 "enable_external_data_sources",
                 "enable_topics_sql_io_operations",
