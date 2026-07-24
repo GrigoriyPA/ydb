@@ -2928,11 +2928,7 @@ private:
         CHECK_STATUS_RET(watermarkLateEventsPolicy, validator.ExtractOptional(EName::WatermarkLateEventsPolicy, &TPropertyValidator::ValidateEnum<NYql::NHoppingWindow::EPolicy>));
 
         const auto queryTextValue = queryText.DetachResult();
-        if (queryTextValue && force.GetResult() != "true") {
-            return TStatus::Fail(Ydb::StatusIds::PRECONDITION_FAILED, "Changing the query text will result in the loss of the checkpoint. Please use FORCE=true to change the request text");
-        }
-
-        const auto streamingDispositionValue = streamingDisposition.DetachResult();
+        auto streamingDispositionValue = streamingDisposition.DetachResult();
         auto queryTestRevision = previousSettings.QueryTextRevision;
         if (queryTextValue) {
             queryTestRevision++;
@@ -2943,6 +2939,21 @@ private:
         } else if (watermarkLateEventsPolicy.GetResult()
             && *watermarkLateEventsPolicy.GetResult() != (previousSettings.WatermarkLateEventsPolicy ? previousSettings.WatermarkLateEventsPolicy : "drop")) {
             queryTestRevision++;
+        }
+
+        if (const auto isForce = force.GetResult() == "true"; queryTestRevision != previousSettings.QueryTextRevision && !isForce) {
+            if (!AppData()->FeatureFlags.GetEnableStreamingQueryStateRecompute()) {
+                return TStatus::Fail(Ydb::StatusIds::PRECONDITION_FAILED, "Can not recover streaming query state after change");
+            }
+
+            if (!streamingDispositionValue) {
+                NYql::NPq::NProto::StreamingDisposition result;
+                result.mutable_from_last_checkpoint()->set_force(isForce);
+                streamingDispositionValue = result.SerializeAsString();
+                YDB_LOG_INFO("[StreamingQueries] Recompute streaming query state after change", {"logPrefix", LogPrefix()});
+            } else {
+                YDB_LOG_INFO("[StreamingQueries] Recompute streaming query state with manual streaming disposition", {"logPrefix", LogPrefix()});
+            }
         }
 
         CHECK_STATUS(validator.Save(ESqlSettings::QUERY_TEXT_FEATURE, queryTextValue.value_or(previousSettings.QueryText)));
