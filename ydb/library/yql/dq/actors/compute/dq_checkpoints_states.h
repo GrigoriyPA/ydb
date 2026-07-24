@@ -1,16 +1,21 @@
 #pragma once
 
-#include <list>
+#include <util/generic/fwd.h>
+#include <util/generic/maybe.h>
+#include <util/system/types.h>
 #include <util/ysaveload.h>
+
+#include <list>
 
 namespace NYql::NDq {
 
 struct TStateData {
-    TStateData() {}
+    TStateData() = default;
 
     TStateData(const TString& blob, ui64 version)
-    : Blob(blob)
-    , Version(version) {}
+        : Blob(blob)
+        , Version(version)
+    {}
 
     TString Blob;
     ui64 Version{0};
@@ -62,17 +67,10 @@ struct TComputeActorState {
         Sinks.clear();
     }
 
-    bool ParseFromString(const TString& in) {
-        TStringStream str(in);
-        Load(&str);
-        return true;
-    }
-    bool SerializeToString(TString* out) const { 
-        TStringStream result;
-        Save(&result);
-        *out = result.Str();
-        return true;
-    }
+    bool ParseFromString(const TString& in);
+
+    bool SerializeToString(TString* out) const;
+
     size_t ByteSizeLong() const {return MiniKqlProgram ? MiniKqlProgram->Data.Blob.size() : 0; }
 
     Y_SAVELOAD_DEFINE(MiniKqlProgram, Sources, Sinks);

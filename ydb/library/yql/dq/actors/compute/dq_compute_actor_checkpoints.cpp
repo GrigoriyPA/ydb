@@ -54,6 +54,7 @@ TString MakeStringForLog(const NDqProto::TCheckpoint& checkpoint) {
 
 std::vector<ui64> TaskIdsFromLoadPlan(const NDqProto::NDqStateLoadPlan::TTaskPlan& plan) {
     std::vector<ui64> taskIds;
+
     for (const auto& sourcePlan : plan.GetSources()) {
         if (sourcePlan.GetStateType() == NDqProto::NDqStateLoadPlan::STATE_TYPE_FOREIGN) {
             for (const auto& foreignTaskSource : sourcePlan.GetForeignTasksSources()) {
@@ -61,6 +62,7 @@ std::vector<ui64> TaskIdsFromLoadPlan(const NDqProto::NDqStateLoadPlan::TTaskPla
             }
         }
     }
+
     std::sort(taskIds.begin(), taskIds.end());
     taskIds.erase(std::unique(taskIds.begin(), taskIds.end()), taskIds.end());
     return taskIds;
@@ -69,18 +71,20 @@ std::vector<ui64> TaskIdsFromLoadPlan(const NDqProto::NDqStateLoadPlan::TTaskPla
 const TSourceState& FindSourceState(
     const NDqProto::NDqStateLoadPlan::TSourcePlan::TForeignTaskSource& foreignTaskSource,
     const std::vector<TComputeActorState>& states,
-    const std::vector<ui64>& taskIds)
+    const std::vector<ui64>& foreignTaskIds)
 {
     // Find state index
-    const auto stateIndexIt = std::lower_bound(taskIds.begin(), taskIds.end(), foreignTaskSource.GetTaskId());
-    YQL_ENSURE(stateIndexIt != taskIds.end(), "Task id was not found in plan");
-    const size_t stateIndex = std::distance(taskIds.begin(), stateIndexIt);
+    const auto stateIndexIt = std::lower_bound(foreignTaskIds.begin(), foreignTaskIds.end(), foreignTaskSource.GetTaskId());
+    YQL_ENSURE(stateIndexIt != foreignTaskIds.end(), "Task id was not found in plan");
+    const size_t stateIndex = std::distance(foreignTaskIds.begin(), stateIndexIt);
     const TComputeActorState& state = states[stateIndex];
+
     for (const TSourceState& sourceState : state.Sources) {
         if (sourceState.InputIndex == foreignTaskSource.GetInputIndex()) {
             return sourceState;
         }
     }
+
     YQL_ENSURE(false, "Source input index " << foreignTaskSource.GetInputIndex() << " was not found in state");
     // Make compiler happy
     return state.Sources.front();
@@ -89,33 +93,38 @@ const TSourceState& FindSourceState(
 TComputeActorState CombineForeignState(
     const NDqProto::NDqStateLoadPlan::TTaskPlan& plan,
     const std::vector<TComputeActorState>& states,
-    const std::vector<ui64>& taskIds)
+    const std::vector<ui64>& foreignTaskIds)
 {
     TComputeActorState state;
     state.MiniKqlProgram.ConstructInPlace().Data.Version = TDqComputeActorCheckpoints::ComputeActorCurrentStateVersion;
     YQL_ENSURE(plan.GetProgram().GetStateType() == NDqProto::NDqStateLoadPlan::STATE_TYPE_EMPTY, "Unsupported program state type. Plan: " << plan);
+
     for (const auto& sinkPlan : plan.GetSinks()) {
         YQL_ENSURE(sinkPlan.GetStateType() == NDqProto::NDqStateLoadPlan::STATE_TYPE_EMPTY, "Unsupported sink state type. Plan: " << sinkPlan);
     }
+
     for (const auto& sourcePlan : plan.GetSources()) {
         YQL_ENSURE(sourcePlan.GetStateType() == NDqProto::NDqStateLoadPlan::STATE_TYPE_EMPTY || sourcePlan.GetStateType() == NDqProto::NDqStateLoadPlan::STATE_TYPE_FOREIGN, "Unsupported sink state type. Plan: " << sourcePlan);
         if (sourcePlan.GetStateType() == NDqProto::NDqStateLoadPlan::STATE_TYPE_FOREIGN) {
             state.Sources.push_back({});
             auto& sourceState = state.Sources.back();
             sourceState.InputIndex = sourcePlan.GetInputIndex();
+
             for (const auto& foreignTaskSource : sourcePlan.GetForeignTasksSources()) {
-                const TSourceState& srcSourceState = FindSourceState(foreignTaskSource, states, taskIds);
+                const TSourceState& srcSourceState = FindSourceState(foreignTaskSource, states, foreignTaskIds);
                 for (const TStateData& data : srcSourceState.Data) {
                     sourceState.Data.emplace_back(data);
                 }
             }
+
             YQL_ENSURE(sourceState.DataSize(), "No data was loaded to source " << sourcePlan.GetInputIndex());
         }
     }
+
     return state;
 }
 
-} // namespace
+} // anonymous namespace
 
 TDqComputeActorCheckpoints::TDqComputeActorCheckpoints(const NActors::TActorId& owner, const TTxId& txId, TDqTaskSettings task, ICallbacks* computeActor)
     : TActor(&TDqComputeActorCheckpoints::StateFunc)
@@ -310,11 +319,12 @@ void TDqComputeActorCheckpoints::Handle(TEvDqCompute::TEvGetTaskStateResult::TPt
     }
 
     auto& checkpoint = ev->Get()->Checkpoint;
-    std::vector<ui64> taskIds;
+    std::vector<ui64> foreignTaskIds;
     size_t taskIdsSize = 1;
+
     if (StateLoadPlan.GetStateType() == NDqProto::NDqStateLoadPlan::STATE_TYPE_FOREIGN) {
-        taskIds = TaskIdsFromLoadPlan(StateLoadPlan);
-        taskIdsSize = taskIds.size();
+        foreignTaskIds = TaskIdsFromLoadPlan(StateLoadPlan);
+        taskIdsSize = foreignTaskIds.size();
     }
 
     if (!ev->Get()->Issues.Empty()) {
@@ -324,7 +334,6 @@ void TDqComputeActorCheckpoints::Handle(TEvDqCompute::TEvGetTaskStateResult::TPt
     }
 
     if (ev->Get()->States.size() != taskIdsSize) {
-
         auto message = TStringBuilder() << "TEvGetTaskStateResult unexpected states count: " << ev->Get()->States.size() << ", expected: " << taskIdsSize;
         LOG_CP_E(checkpoint, message);
         NYql::TIssues issues;
@@ -336,10 +345,11 @@ void TDqComputeActorCheckpoints::Handle(TEvDqCompute::TEvGetTaskStateResult::TPt
     LOG_CP_D(checkpoint, "TEvGetTaskStateResult: restoring state");
     RestoringTaskRunnerForCheckpoint = checkpoint;
     RestoringTaskRunnerForEvent = ev->Cookie;
+
     if (StateLoadPlan.GetStateType() == NDqProto::NDqStateLoadPlan::STATE_TYPE_OWN) {
         ComputeActor->LoadState(std::move(ev->Get()->States[0]));
     } else if (StateLoadPlan.GetStateType() == NDqProto::NDqStateLoadPlan::STATE_TYPE_FOREIGN) {
-        TComputeActorState state = CombineForeignState(StateLoadPlan, ev->Get()->States, taskIds);
+        TComputeActorState state = CombineForeignState(StateLoadPlan, ev->Get()->States, foreignTaskIds);
         ComputeActor->LoadState(std::move(state));
     } else {
         Y_ABORT("Unprocessed state type %s (%d)",
