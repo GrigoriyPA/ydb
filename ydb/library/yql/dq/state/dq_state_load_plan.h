@@ -1,14 +1,22 @@
 #pragma once
-#include <yql/essentials/public/issue/yql_issue.h>
 
-#include <ydb/library/yql/dq/proto/dq_state_load_plan.pb.h>
-#include <ydb/library/yql/dq/proto/dq_tasks.pb.h>
+#include <ydb/library/actors/core/actorsystem_fwd.h>
 
-#include <util/generic/hash.h>
+#include <google/protobuf/message.h>
 
-namespace NYql::NDq {
+namespace NYql {
+
+namespace NDqProto {
+
+class TDqTask;
+
+} // namespace NDqProto
+
+namespace NDq {
 
 // Make plan for loading streaming offsets from an old graph.
-bool MakeContinueFromStreamingOffsetsPlan(const google::protobuf::RepeatedPtrField<NYql::NDqProto::TDqTask>& src, const google::protobuf::RepeatedPtrField<NYql::NDqProto::TDqTask>& dst, bool force, THashMap<ui64, NDqProto::NDqStateLoadPlan::TTaskPlan>& plan, TIssues& issues);
+NActors::IActor* CreateStateLoadPlanResolver(const google::protobuf::RepeatedPtrField<NYql::NDqProto::TDqTask>& src, const google::protobuf::RepeatedPtrField<NYql::NDqProto::TDqTask>& dst, bool force);
 
-} // namespace NYql::NDq
+} // namespace NDq
+
+} // namespace NYql

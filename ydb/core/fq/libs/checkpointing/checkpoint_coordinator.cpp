@@ -8,6 +8,7 @@
 #include <ydb/library/actors/core/hfunc.h>
 #include <ydb/library/yql/dq/actors/dq.h>
 #include <ydb/library/yql/dq/state/dq_state_load_plan.h>
+#include <ydb/library/yverify_stream/yverify_stream.h>
 
 #include <util/string/builder.h>
 #include <util/system/env.h>
@@ -258,20 +259,28 @@ void TCheckpointCoordinator::TryToRestoreOffsetsFromForeignCheckpoint(const TChe
         return;
     }
 
-    NYql::TIssues issues;
-    THashMap<ui64, NYql::NDqProto::NDqStateLoadPlan::TTaskPlan> plan;
-    const bool result = NYql::NDq::MakeContinueFromStreamingOffsetsPlan(
+    PendingPrepareStateLoadPlanCheckpoint = checkpoint;
+
+    const auto& resolverId = Register(NYql::NDq::CreateStateLoadPlanResolver(
         checkpoint.Graph->GetTasks(),
         GraphParams.GetTasks(),
-        StreamingDisposition.from_last_checkpoint().force(),
-        plan,
-        issues);
+        StreamingDisposition.from_last_checkpoint().force()));
+    YDB_LOG_DEBUG("Registered state load plan resolver",
+        {"coordinatorId", CoordinatorId},
+        {"checkpointId", checkpoint.CheckpointId},
+        {"resolverId", resolverId});
+}
 
-    if (issues) {
-        YDB_LOG_INFO("Issues while building continue-from-streaming-offsets restore plan",
-            {"coordinatorId", CoordinatorId},
-            {"issues", issues.ToOneLineString()});
-    }
+void TCheckpointCoordinator::Handle(const NYql::NDq::TEvDqCompute::TEvPrepareStateLoadPlanResult::TPtr& ev) {
+    Y_VALIDATE(PendingPrepareStateLoadPlanCheckpoint, "Unexpected prepare state load plan result");
+
+    const auto result = ev->Get()->Result;
+    const auto& issues = ev->Get()->Issues;
+    YDB_LOG_INFO("Got prepare state load plan result",
+        {"coordinatorId", CoordinatorId},
+        {"sender", ev->Sender},
+        {"result", result},
+        {"issues", issues.ToOneLineString()});
 
     if (!result) {
         OnError(NYql::NDqProto::StatusIds::BAD_REQUEST, "Can't restore from plan given", issues);
@@ -280,13 +289,16 @@ void TCheckpointCoordinator::TryToRestoreOffsetsFromForeignCheckpoint(const TChe
         Send(RunActorId, new NFq::TEvCheckpointCoordinator::TEvRaiseTransientIssues(std::move(issues)));
     }
 
+    const auto& checkpointId = PendingPrepareStateLoadPlanCheckpoint->CheckpointId;
+    const auto& plan = ev->Get()->Plan;
     YDB_LOG_INFO("Going to restore offsets from foreign checkpoint for tasks",
         {"coordinatorId", CoordinatorId},
-        {"checkpointId", checkpoint.CheckpointId},
+        {"checkpointId", checkpointId},
         {"planSize", plan.size()});
 
-    PendingRestoreCheckpoint = TPendingRestoreCheckpoint(checkpoint.CheckpointId, false, ActorsToWaitForSet);
+    PendingRestoreCheckpoint = TPendingRestoreCheckpoint(checkpointId, false, ActorsToWaitForSet);
     ++*Metrics.RestoredStreamingOffsetsFromCheckpoint;
+
     for (const auto& [taskId, taskPlan] : plan) {
         const auto actorIdIt = TaskIdToActor.find(taskId);
         if (actorIdIt == TaskIdToActor.end()) {
@@ -301,16 +313,18 @@ void TCheckpointCoordinator::TryToRestoreOffsetsFromForeignCheckpoint(const TChe
         if (transportIt != ActorsToWaitFor.end()) {
             YDB_LOG_DEBUG("Restore offsets from foreign checkpoint for task",
                 {"coordinatorId", CoordinatorId},
-                {"checkpointId", checkpoint.CheckpointId},
+                {"checkpointId", checkpointId},
                 {"taskId", taskId});
             transportIt->second->EventsQueue.Send(
                 new NYql::NDq::TEvDqCompute::TEvRestoreFromCheckpoint(
-                    checkpoint.CheckpointId.SeqNo,
-                    checkpoint.CheckpointId.CoordinatorGeneration,
+                    checkpointId.SeqNo,
+                    checkpointId.CoordinatorGeneration,
                     CoordinatorId.Generation,
                     taskPlan));
         }
     }
+
+    PendingPrepareStateLoadPlanCheckpoint.Clear();
 }
 
 void TCheckpointCoordinator::Handle(const NYql::NDq::TEvDqCompute::TEvRestoreFromCheckpointResult::TPtr& ev) {

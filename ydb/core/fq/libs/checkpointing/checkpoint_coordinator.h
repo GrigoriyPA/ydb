@@ -49,6 +49,7 @@ public:
     void Handle(const TEvCheckpointStorage::TEvRegisterCoordinatorResponse::TPtr&);
     void Handle(const NYql::NDq::TEvDqCompute::TEvNewCheckpointCoordinatorAck::TPtr&);
     void Handle(const TEvCheckpointStorage::TEvGetCheckpointsMetadataResponse::TPtr&);
+    void Handle(const NYql::NDq::TEvDqCompute::TEvPrepareStateLoadPlanResult::TPtr& ev);
     void Handle(const NYql::NDq::TEvDqCompute::TEvRestoreFromCheckpointResult::TPtr&);
     void Handle(const TEvCheckpointCoordinator::TEvScheduleCheckpointing::TPtr&);
     void Handle(const TEvCheckpointStorage::TEvCreateCheckpointResponse::TPtr&);
@@ -80,6 +81,7 @@ public:
         hFunc(TEvCheckpointStorage::TEvAbortCheckpointResponse, Handle)
     
         hFunc(NYql::NDq::TEvDqCompute::TEvNewCheckpointCoordinatorAck, Handle)
+        hFunc(NYql::NDq::TEvDqCompute::TEvPrepareStateLoadPlanResult, Handle)
         hFunc(NYql::NDq::TEvDqCompute::TEvRestoreFromCheckpointResult, Handle)
         hFunc(NYql::NDq::TEvDqCompute::TEvSaveTaskStateResult, Handle)
         hFunc(NYql::NDq::TEvDqCompute::TEvStateCommitted, Handle)
@@ -205,6 +207,7 @@ private:
     THashMap<TCheckpointId, TPendingCheckpoint, TCheckpointIdHash> PendingCommitCheckpoints;
     TMaybe<TPendingRestoreCheckpoint> PendingRestoreCheckpoint;
     std::unique_ptr<TPendingInitCoordinator> PendingInit;
+    TMaybe<TCheckpointMetadata> PendingPrepareStateLoadPlanCheckpoint;
     bool GraphIsRunning = false;
     bool InitingZeroCheckpoint = false;
     bool FailedZeroCheckpoint = false;

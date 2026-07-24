@@ -152,6 +152,18 @@ namespace TEvDqCompute {
         }
     };
 
+    struct TEvPrepareStateLoadPlanResult : public NActors::TEventLocal<TEvPrepareStateLoadPlanResult, TDqComputeEvents::EvPrepareStateLoadPlanResult> {
+        TEvPrepareStateLoadPlanResult(const bool result, THashMap<ui64, NYql::NDqProto::NDqStateLoadPlan::TTaskPlan> plan, NYql::TIssues issues)
+            : Result(result)
+            , Plan(std::move(plan))
+            , Issues(std::move(issues))
+        {}
+
+        const bool Result = false;
+        const THashMap<ui64, NYql::NDqProto::NDqStateLoadPlan::TTaskPlan> Plan;
+        const NYql::TIssues Issues;
+    };
+
     struct TEvRestoreFromCheckpointResult : public NActors::TEventPB<TEvRestoreFromCheckpointResult,
         NDqProto::TEvRestoreFromCheckpointResult, TDqComputeEvents::EvRestoreFromCheckpointResult> {
         using TBaseEventPB = NActors::TEventPB<TEvRestoreFromCheckpointResult, NDqProto::TEvRestoreFromCheckpointResult, TDqComputeEvents::EvRestoreFromCheckpointResult>;

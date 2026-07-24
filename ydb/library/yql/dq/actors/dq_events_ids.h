@@ -59,6 +59,7 @@ struct TDqComputeEvents {
         EvChannelUpdateV2,
 
         EvNodeState,
+        EvPrepareStateLoadPlanResult,
 
         // place all new events here
 
