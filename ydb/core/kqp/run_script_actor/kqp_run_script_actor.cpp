@@ -420,9 +420,9 @@ private:
 
             const auto cancelledByUser = !CancelRequests.empty();
             if (FinishInfo.IsFailed() && cancelledByUser) {
-                NYql::TIssue cancelIssue("Request was canceled by user");
-                cancelIssue.SetCode(NYql::DEFAULT_ERROR, NYql::TSeverityIds::S_INFO);
-                FinishInfo.Issues.AddIssue(cancelIssue);
+                auto cancelIssue = AddRootIssue("Request was canceled by user", FinishInfo.Issues);
+                cancelIssue.back().SetCode(NYql::DEFAULT_ERROR, NYql::TSeverityIds::S_INFO);
+                FinishInfo.Issues = cancelIssue;
                 FinishInfo.Status = Ydb::StatusIds::CANCELLED;
             }
 
