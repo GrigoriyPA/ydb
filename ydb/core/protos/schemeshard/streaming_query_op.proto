@@ -1,0 +1,46 @@
+package NKikimrStreamingQueryOp;
+option java_package = "ru.yandex.kikimr.proto";
+
+// Payloads for the SchemeShard-driven long-running CREATE/ALTER/DROP STREAMING QUERY operation.
+// The declarative modification (NKikimrSchemeOp.TModifyScheme) and the NACLibProto.TUserToken are
+// carried as already-serialized bytes to keep this proto free of heavy cross-package imports.
+
+// KQP manager -> SchemeShard: start (or find, if already running) the durable operation.
+message TEvCreateOperationRequest {
+    optional bytes SchemeOperation = 1;   // serialized NKikimrSchemeOp.TModifyScheme (its OperationType selects the kind)
+    optional string Database = 2;
+    optional bytes UserToken = 3;         // serialized NACLibProto.TUserToken
+    optional string PeerName = 4;
+}
+
+// SchemeShard -> KQP manager: terminal result / acknowledgement of the create request. The manager
+// registers as a subscriber and receives this once, when the operation reaches a terminal state
+// (or immediately, with Accepted=false, if the request was rejected, e.g. concurrent operation).
+message TEvCreateOperationResponse {
+    optional string Path = 1;
+    optional bool Accepted = 2;           // false => rejected up-front (Status/Error explain why)
+    optional bool Success = 3;            // terminal outcome (valid when Accepted=true)
+    optional uint32 Status = 4;           // NKikimrScheme.EStatus
+    optional string Error = 5;
+}
+
+// SchemeShard -> KQP runner service: (re)launch the runner for an operation. Fencing token = {Path, Round}.
+message TEvRunOperationRequest {
+    optional string Path = 1;
+    optional uint64 Round = 2;
+    optional uint32 Kind = 3;             // TStreamingQueryOperationInfo::EKind
+    optional bytes SchemeOperation = 4;   // serialized NKikimrSchemeOp.TModifyScheme
+    optional string Database = 5;
+    optional bytes UserToken = 6;         // serialized NACLibProto.TUserToken
+    optional uint64 SchemeShardId = 7;    // tablet id to report the result to
+    optional string PeerName = 8;
+}
+
+// KQP runner -> SchemeShard: terminal result of an operation attempt (fenced by {Path, Round}).
+message TEvOperationResult {
+    optional string Path = 1;
+    optional uint64 Round = 2;
+    optional bool Success = 3;
+    optional string Error = 4;
+    optional bytes RuntimeState = 5;      // serialized NKikimrKqp.TStreamingQueryState (on-object mirror; P3)
+}

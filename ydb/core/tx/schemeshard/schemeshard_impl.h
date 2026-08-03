@@ -12,6 +12,7 @@
 #include "schemeshard_export.h"
 #include "schemeshard_forced_compaction.h"
 #include "schemeshard_import.h"
+#include "schemeshard_streaming_query_op.h"
 #include "schemeshard_info_types.h"
 #include "schemeshard_path.h"
 #include "schemeshard_path_element.h"
@@ -1088,6 +1089,7 @@ public:
         TVector<TPathId> RestoreTablesToUnmark;
         TVector<ui64> IncrementalBackupIds;
         TVector<ui64> FullBackupIds;
+        TVector<ui64> StreamingQueryOperationIds;
     };
 
     void SubscribeToTempTableOwners();
@@ -1666,6 +1668,40 @@ public:
 
     void ResumeExports(const TVector<ui64>& exportIds, const TActorContext& ctx);
     // } // NExport
+
+    // namespace NStreamingQueryOp {
+    // SchemeShard-driven long-running operation for CREATE/ALTER/DROP STREAMING QUERY.
+    // Holds durable operation state and (re)launches an external KQP-layer runner; the runner performs
+    // the actual sub-operations and reports back. See schemeshard_streaming_query_op*.
+    // Keyed by absolute query path: this map IS the per-path single-execution guard.
+    THashMap<TString, TStreamingQueryOperationInfo::TPtr> StreamingQueryOperations;
+    // Kept in-memory to poison all running runners on SchemeShard death.
+    THashSet<TActorId> RunningStreamingQueryRunners;
+
+    void AddStreamingQueryOperation(const TStreamingQueryOperationInfo::TPtr& opInfo);
+    TStreamingQueryOperationInfo::TPtr FindStreamingQueryOperation(const TString& path) const;
+
+    static void PersistStreamingQueryOperation(NIceDb::TNiceDb& db, const TStreamingQueryOperationInfo& opInfo);
+    static void PersistStreamingQueryOperationState(NIceDb::TNiceDb& db, const TStreamingQueryOperationInfo& opInfo);
+    void PersistRemoveStreamingQueryOperation(NIceDb::TNiceDb& db, const TStreamingQueryOperationInfo& opInfo);
+
+    void LaunchStreamingQueryRunner(const TStreamingQueryOperationInfo::TPtr& opInfo, const TActorContext& ctx);
+
+    struct TStreamingQueryOp {
+        struct TTxCreate;
+        struct TTxProgress;
+        struct TTxForget;
+    };
+
+    NTabletFlatExecutor::ITransaction* CreateTxCreateStreamingQueryOp(TEvStreamingQuery::TEvCreateOperationRequest::TPtr& ev);
+    NTabletFlatExecutor::ITransaction* CreateTxProgressStreamingQueryOp(const TString& path);
+    NTabletFlatExecutor::ITransaction* CreateTxProgressStreamingQueryOp(TEvStreamingQuery::TEvOperationResult::TPtr& ev);
+
+    void Handle(TEvStreamingQuery::TEvCreateOperationRequest::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvStreamingQuery::TEvOperationResult::TPtr& ev, const TActorContext& ctx);
+
+    void ResumeStreamingQueryOperations(const TVector<TString>& paths, const TActorContext& ctx);
+    // } // NStreamingQueryOp
 
     // namespace NImport {
     THashMap<ui64, TImportInfo::TPtr> Imports;

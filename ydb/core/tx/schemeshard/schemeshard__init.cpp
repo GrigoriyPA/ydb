@@ -33,6 +33,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
     TVector<TPathId> RestoreTablesToUnmark;
     TVector<ui64> IncrementalBackupsToResume;
     TVector<ui64> FullBackupsToResume;
+    TVector<ui64> StreamingQueryOperationsToResume;
     bool Broken = false;
 
     explicit TTxInit(TSelf *self)
@@ -2181,6 +2182,43 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                 streamingQuery->AlterVersion = rowset.GetValue<Schema::StreamingQueryState::AlterVersion>();
                 Y_PROTOBUF_SUPPRESS_NODISCARD streamingQuery->Properties.ParseFromString(rowset.GetValue<Schema::StreamingQueryState::Properties>());
                 Self->IncrementPathDbRefCount(pathId);
+
+                if (!rowset.Next()) {
+                    return false;
+                }
+            }
+        }
+
+        // Read streaming query operations (SchemeShard-driven long-running create/alter/drop)
+        {
+            auto rowset = db.Table<Schema::StreamingQueryOperations>().Range().Select();
+            if (!rowset.IsReady()) {
+                return false;
+            }
+
+            while (!rowset.EndOfSet()) {
+                const ui64 id = rowset.GetValue<Schema::StreamingQueryOperations::Id>();
+                const TOwnerId ownerPathId = rowset.GetValue<Schema::StreamingQueryOperations::OwnerPathId>();
+                const TLocalPathId localPathId = rowset.GetValue<Schema::StreamingQueryOperations::LocalPathId>();
+
+                auto opInfo = MakeIntrusive<TStreamingQueryOperationInfo>(
+                    id,
+                    TPathId(ownerPathId, localPathId),
+                    static_cast<TStreamingQueryOperationInfo::EKind>(rowset.GetValue<Schema::StreamingQueryOperations::Kind>()));
+                opInfo->State = static_cast<TStreamingQueryOperationInfo::EState>(rowset.GetValue<Schema::StreamingQueryOperations::State>());
+                opInfo->Round = rowset.GetValue<Schema::StreamingQueryOperations::Round>();
+                Y_PROTOBUF_SUPPRESS_NODISCARD opInfo->Request.ParseFromString(rowset.GetValue<Schema::StreamingQueryOperations::Request>());
+                opInfo->Issue = rowset.GetValue<Schema::StreamingQueryOperations::Issue>();
+                opInfo->StartTime = TInstant::Seconds(rowset.GetValue<Schema::StreamingQueryOperations::StartTime>());
+                opInfo->EndTime = TInstant::Seconds(rowset.GetValue<Schema::StreamingQueryOperations::EndTime>());
+                opInfo->Database = rowset.GetValue<Schema::StreamingQueryOperations::Database>();
+                opInfo->UserToken = rowset.GetValue<Schema::StreamingQueryOperations::UserToken>();
+                opInfo->PeerName = rowset.GetValue<Schema::StreamingQueryOperations::PeerName>();
+
+                Self->AddStreamingQueryOperation(opInfo);
+                if (opInfo->IsInProgress()) {
+                    StreamingQueryOperationsToResume.push_back(id);
+                }
 
                 if (!rowset.Next()) {
                     return false;
@@ -6743,6 +6781,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
             .RestoreTablesToUnmark = std::move(RestoreTablesToUnmark),
             .IncrementalBackupIds = std::move(IncrementalBackupsToResume),
             .FullBackupIds = std::move(FullBackupsToResume),
+            .StreamingQueryOperationIds = std::move(StreamingQueryOperationsToResume),
         });
 
         Self->ScheduleForcedCompactionProgress(ctx);

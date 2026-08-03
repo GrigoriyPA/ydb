@@ -11,6 +11,7 @@ ENDIF()
 
 SRCS(
     operations.proto
+    streaming_query_op.proto
 )
 
 EXCLUDE_TAGS(GO_PROTO)

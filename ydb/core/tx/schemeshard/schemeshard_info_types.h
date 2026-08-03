@@ -4508,6 +4508,62 @@ struct TStreamingQueryInfo : TSimpleRefCount<TStreamingQueryInfo> {
     NKikimrSchemeOp::TStreamingQueryProperties Properties;
 };
 
+// Durable state of an in-flight CREATE/ALTER/DROP STREAMING QUERY modification.
+// Mirrors the export/import long-running-operation pattern, but the sub-operations (declarative
+// modify + script-execution start/stop) run on the KQP layer via an external "runner" actor.
+// SchemeShard only holds the state, (re)launches the runner on restart, enforces per-path
+// single-execution, and fences stale runners via {Id, Round, tablet Generation}.
+struct TStreamingQueryOperationInfo : TSimpleRefCount<TStreamingQueryOperationInfo> {
+    using TPtr = TIntrusivePtr<TStreamingQueryOperationInfo>;
+
+    enum class EState : ui8 {
+        Invalid = 0,
+        Running = 1,    // runner (re)launched, awaiting TEvOperationResult
+        Done = 200,     // terminal: success
+        Failed = 201,   // terminal: failure
+        Cancelled = 202,
+    };
+
+    enum class EKind : ui8 {
+        Create = 0,
+        Alter = 1,
+        Drop = 2,
+    };
+
+    TString Path;                                  // absolute query path — the operation identity / mutex key
+    TString Database;
+    TPathId TargetPathId;                          // resolved target path (empty until materialized, e.g. mid-CREATE)
+    EKind Kind = EKind::Create;
+    EState State = EState::Invalid;
+    ui64 Round = 0;                                // fencing token, bumped on each (re)launch
+    NKikimrSchemeOp::TModifyScheme Request;        // the requested declarative modification
+    TString UserToken;                             // serialized NACLibProto::TUserToken
+    TString PeerName;
+    TString Issue;
+    TInstant StartTime;
+    TInstant EndTime;
+
+    // volatile (in-memory only), re-established on resume
+    TActorId Runner;
+    TSet<TActorId> Subscribers;
+
+    TStreamingQueryOperationInfo() = default;
+
+    TStreamingQueryOperationInfo(const TString& path, const TString& database, EKind kind)
+        : Path(path)
+        , Database(database)
+        , Kind(kind)
+    {}
+
+    bool IsInProgress() const {
+        return State == EState::Running;
+    }
+
+    bool IsFinished() const {
+        return State == EState::Done || State == EState::Failed || State == EState::Cancelled;
+    }
+};
+
 struct TTestShardSetInfo : public TSimpleRefCount<TTestShardSetInfo> {
     using TPtr = TIntrusivePtr<TTestShardSetInfo>;
 

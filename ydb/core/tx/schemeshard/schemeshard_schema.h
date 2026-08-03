@@ -2691,6 +2691,44 @@ struct Schema : NIceDb::Schema {
         using TColumns = TableColumns<PathId, AlterVersion, TestShards, CmdInitialize>;
     };
 
+    // Durable record of an in-flight CREATE/ALTER/DROP STREAMING QUERY modification.
+    // The operation is driven by SchemeShard (survives restart, single-execution) while the actual
+    // sub-operations run on the KQP layer (the runner actor). See schemeshard_streaming_query_op.*.
+    // Keyed by the absolute query path (unique within a SchemeShard) so that CREATE (whose target
+    // PathId does not exist yet) and ALTER/DROP share one identity and one per-path mutual-exclusion slot.
+    struct StreamingQueryOperations : Table<141> {
+        struct Path : Column<1, NScheme::NTypeIds::Utf8> {};                                       // absolute query path
+        struct Database : Column<2, NScheme::NTypeIds::Utf8> {};
+        struct OwnerPathId : Column<3, NScheme::NTypeIds::Uint64> { using Type = TOwnerId; };      // resolved target (0 if not yet materialized)
+        struct LocalPathId : Column<4, NScheme::NTypeIds::Uint64> { using Type = TLocalPathId; };
+        struct Kind : Column<5, NScheme::NTypeIds::Byte> {};                                        // EKind: Create/Alter/Drop
+        struct State : Column<6, NScheme::NTypeIds::Byte> {};                                        // EState
+        struct Round : Column<7, NScheme::NTypeIds::Uint64> {};                                      // runner fencing token
+        struct Request : Column<8, NScheme::NTypeIds::String> {};                                    // serialized NKikimrSchemeOp::TModifyScheme
+        struct Issue : Column<9, NScheme::NTypeIds::Utf8> {};
+        struct StartTime : Column<10, NScheme::NTypeIds::Uint64> {};
+        struct EndTime : Column<11, NScheme::NTypeIds::Uint64> {};
+        struct UserToken : Column<12, NScheme::NTypeIds::String> {};                                // serialized NACLibProto::TUserToken
+        struct PeerName : Column<13, NScheme::NTypeIds::Utf8> {};
+
+        using TKey = TableKey<Path>;
+        using TColumns = TableColumns<
+            Path,
+            Database,
+            OwnerPathId,
+            LocalPathId,
+            Kind,
+            State,
+            Round,
+            Request,
+            Issue,
+            StartTime,
+            EndTime,
+            UserToken,
+            PeerName
+        >;
+    };
+
     using TTables = SchemaTables<
         Paths,
         TxInFlight,
@@ -2829,7 +2867,8 @@ struct Schema : NIceDb::Schema {
         FullBackupItems,
         SetColumnConstraint,
         SetColumnConstraintShardStatus,
-        TestShardSet
+        TestShardSet,
+        StreamingQueryOperations
     >;
 
     static constexpr ui64 SysParam_NextPathId = 1;

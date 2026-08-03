@@ -386,6 +386,7 @@ void TSchemeShard::ActivateAfterInitialization(const TActorContext& ctx, TActiva
     ResumeCdcStreamScans(opts.CdcStreamScans, ctx);
     ResumeIncrementalBackups(opts.IncrementalBackupIds, ctx);
     ResumeFullBackups(opts.FullBackupIds, ctx);
+    ResumeStreamingQueryOperations(opts.StreamingQueryOperationIds, ctx);
 
     ParentDomainLink.SendSync(ctx);
 

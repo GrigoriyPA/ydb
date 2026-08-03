@@ -285,6 +285,7 @@ SRCS(
     schemeshard_export__list.cpp
     schemeshard_export_helpers.cpp
     schemeshard_export_flow_proposals.cpp
+    schemeshard_streaming_query_op.cpp
     schemeshard_identificators.cpp
     schemeshard_impl.cpp
     schemeshard_impl.h
