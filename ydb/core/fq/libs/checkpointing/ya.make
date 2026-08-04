@@ -10,6 +10,7 @@ SRCS(
 )
 
 PEERDIR(
+    ydb/core/base
     ydb/core/fq/libs/checkpointing_common
     ydb/core/fq/libs/checkpoint_storage/events
     ydb/core/fq/libs/config/protos

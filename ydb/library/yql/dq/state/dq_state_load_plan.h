@@ -14,8 +14,13 @@ class TDqTask;
 
 namespace NDq {
 
+struct TStateLoadPlanResolverSettings {
+    bool Force = false;
+    bool StrictStateRecovery = false; // In not-force mode enforce to recover all states including operators and sinks
+};
+
 // Make plan for loading streaming offsets from an old graph.
-NActors::IActor* CreateStateLoadPlanResolver(const google::protobuf::RepeatedPtrField<NYql::NDqProto::TDqTask>& src, const google::protobuf::RepeatedPtrField<NYql::NDqProto::TDqTask>& dst, bool force);
+NActors::IActor* CreateStateLoadPlanResolver(google::protobuf::RepeatedPtrField<NYql::NDqProto::TDqTask> src, google::protobuf::RepeatedPtrField<NYql::NDqProto::TDqTask> dst, TStateLoadPlanResolverSettings settings);
 
 } // namespace NDq
 

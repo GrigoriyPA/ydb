@@ -1,4 +1,5 @@
 #include "dq_state_load_plan.h"
+#include "dq_stage_state_recovery_info.h"
 
 #include <ydb/library/actors/core/actor_bootstrapped.h>
 #include <ydb/library/actors/core/log.h>
@@ -12,6 +13,8 @@
 
 #include <yql/essentials/public/issue/protos/issue_id.pb.h>
 #include <yql/essentials/public/issue/yql_issue.h>
+
+#include <google/protobuf/util/time_util.h>
 
 #include <util/digest/multi.h>
 #include <util/generic/hash.h>
@@ -67,23 +70,26 @@ class TStateLoadPlanResolverActor final : public TActorBootstrapped<TStateLoadPl
     };
 
     using TBase = TActorBootstrapped<TStateLoadPlanResolverActor>;
-    using TDqTasks = google::protobuf::RepeatedPtrField<NYql::NDqProto::TDqTask>;
+    using TDqTasks = google::protobuf::RepeatedPtrField<NDqProto::TDqTask>;
     using TTopicsMapping = THashMap<TTopic, TTopicMappingInfo, TTopic::THash>;
 
 public:
-    TStateLoadPlanResolverActor(const TDqTasks& src, const TDqTasks& dst, const bool force)
-        : Src(src)
-        , Dst(dst)
-        , Force(force)
+    TStateLoadPlanResolverActor(TDqTasks src, TDqTasks dst, TStateLoadPlanResolverSettings settings)
+        : Src(std::move(src))
+        , Dst(std::move(dst))
+        , Settings(std::move(settings))
     {}
 
     static constexpr char ActorName[] = "DQ_CHECKPOINT_STATE_LOAD_PLAN_RESOLVER";
 
     void Bootstrap() {
-        YDB_LOG_INFO("Bootstrap.",
+        YDB_LOG_INFO("Bootstrap, calculating basic reading offsets.",
             {"logPrefix", LogPrefix()});
-
         MakeContinueFromStreamingOffsetsPlan();
+
+        YDB_LOG_INFO("Bootstrap, calculating timestamps for state recovery.",
+            {"logPrefix", LogPrefix()});
+        CalculateStateRecoveryTimestamp();
 
         Finish();
     }
@@ -99,8 +105,8 @@ private:
         return true;
     }
 
-    static bool IsTopicInput(const NYql::NDqProto::TTaskInput& taskInput) {
-        return taskInput.GetTypeCase() == NYql::NDqProto::TTaskInput::kSource && taskInput.GetSource().GetType() == "PqSource";
+    static bool IsTopicInput(const NDqProto::TTaskInput& taskInput) {
+        return taskInput.GetTypeCase() == NDqProto::TTaskInput::kSource && taskInput.GetSource().GetType() == "PqSource";
     }
 
     static NDqProto::NDqStateLoadPlan::TSourcePlan& FindSourcePlan(NDqProto::NDqStateLoadPlan::TTaskPlan& taskPlan, const ui64 inputIndex) {
@@ -112,13 +118,13 @@ private:
         Y_VALIDATE(false, "Source plan for input index " << inputIndex << " was not found");
     }
 
-    static void InitForeignPlan(const NYql::NDqProto::TDqTask& task, NDqProto::NDqStateLoadPlan::TTaskPlan& taskPlan) {
+    static void InitForeignPlan(const NDqProto::TDqTask& task, NDqProto::NDqStateLoadPlan::TTaskPlan& taskPlan) {
         taskPlan.SetStateType(NDqProto::NDqStateLoadPlan::STATE_TYPE_FOREIGN);
         taskPlan.MutableProgram()->SetStateType(NDqProto::NDqStateLoadPlan::STATE_TYPE_EMPTY);
 
         for (ui64 inputIndex = 0; inputIndex < task.InputsSize(); ++inputIndex) {
             const auto& taskInput = task.GetInputs(inputIndex);
-            if (taskInput.GetTypeCase() == NYql::NDqProto::TTaskInput::kSource) {
+            if (taskInput.GetTypeCase() == NDqProto::TTaskInput::kSource) {
                 auto& sourcePlan = *taskPlan.AddSources();
                 sourcePlan.SetStateType(NDqProto::NDqStateLoadPlan::STATE_TYPE_EMPTY);
                 sourcePlan.SetInputIndex(inputIndex);
@@ -127,7 +133,7 @@ private:
 
         for (ui64 outputIndex = 0; outputIndex < task.OutputsSize(); ++outputIndex) {
             const auto& taskOutput = task.GetOutputs(outputIndex);
-            if (taskOutput.GetTypeCase() == NYql::NDqProto::TTaskOutput::kSink) {
+            if (taskOutput.GetTypeCase() == NDqProto::TTaskOutput::kSink) {
                 auto& sinkPlan = *taskPlan.AddSinks();
                 sinkPlan.SetStateType(NDqProto::NDqStateLoadPlan::STATE_TYPE_EMPTY);
                 sinkPlan.SetOutputIndex(outputIndex);
@@ -136,7 +142,7 @@ private:
     }
 
     static void AddToMapping(
-        const NYql::NPq::NProto::TDqPqTopicSource& srcDesc,
+        const NPq::NProto::TDqPqTopicSource& srcDesc,
         const std::vector<NPq::TTopicPartitionsSet>& partitionsSets,
         const ui64 taskId,
         const ui64 inputIndex,
@@ -146,24 +152,24 @@ private:
         for (const auto& partitionsSet : partitionsSets) {
             ui64 currentPartition = partitionsSet.EachTopicPartitionGroupId;
             do {
-                info.PartitionsMapping.emplace(currentPartition, TTaskSource{taskId, inputIndex});
+                info.PartitionsMapping.emplace(currentPartition, TTaskSource{.TaskId = taskId, .InputIndex = inputIndex});
                 currentPartition += partitionsSet.DqPartitionsCount;
             } while (currentPartition < partitionsSet.TopicPartitionsCount);
         }
     }
 
     bool ParseTopicInput(
-        const NYql::NDqProto::TDqTask& task,
-        const NYql::NDqProto::TTaskInput& taskInput,
+        const NDqProto::TDqTask& task,
+        const NDqProto::TTaskInput& taskInput,
         const ui64 inputIndex,
         const bool isSourceGraph,
-        NYql::NPq::NProto::TDqPqTopicSource& srcDesc,
+        NPq::NProto::TDqPqTopicSource& srcDesc,
         std::vector<NPq::TTopicPartitionsSet>& partitionsSets)
     {
         const char* queryKindStr = isSourceGraph ? "source" : "destination";
 
         const auto& settingsAny = taskInput.GetSource().GetSettings();
-        if (!settingsAny.Is<NYql::NPq::NProto::TDqPqTopicSource>()) {
+        if (!settingsAny.Is<NPq::NProto::TDqPqTopicSource>()) {
             RaiseIssue(TStringBuilder() << "Can't read " << queryKindStr << " query params: input " << inputIndex << " of task " << task.GetId() << " has incorrect type");
             return false;
         }
@@ -185,14 +191,25 @@ private:
     void MakeContinueFromStreamingOffsetsPlan() {
         // Build src mapping
         TTopicsMapping srcMapping;
-        for (const auto& task : Src) {
+        for (ui64 i = 0; i < static_cast<ui64>(Src.size()); ++i) {
+            const auto& task = Src[i];
+            bool savedToIndexMap = false;
+
             for (ui64 inputIndex = 0; inputIndex < task.InputsSize(); ++inputIndex) {
                 const auto& taskInput = task.GetInputs(inputIndex);
-                if (IsTopicInput(taskInput)) {
-                    NYql::NPq::NProto::TDqPqTopicSource srcDesc;
-                    std::vector<NPq::TTopicPartitionsSet> partitionsSets;
-                    if (ParseTopicInput(task, taskInput, inputIndex, /* isSourceGraph */ true, srcDesc, partitionsSets)) {
-                        AddToMapping(srcDesc, partitionsSets, task.GetId(), inputIndex, srcMapping);
+                if (!IsTopicInput(taskInput)) {
+                    continue;
+                }
+
+                NPq::NProto::TDqPqTopicSource srcDesc;
+                std::vector<NPq::TTopicPartitionsSet> partitionsSets;
+                if (ParseTopicInput(task, taskInput, inputIndex, /* isSourceGraph */ true, srcDesc, partitionsSets)) {
+                    const auto taskId = task.GetId();
+                    AddToMapping(srcDesc, partitionsSets, taskId, inputIndex, srcMapping);
+
+                    if (!savedToIndexMap) {
+                        savedToIndexMap = true;
+                        Y_VALIDATE(SrcTaskIndices.emplace(taskId, i).second, "Found ambiguous task ID: " << taskId);
                     }
                 }
             }
@@ -207,7 +224,7 @@ private:
             for (ui64 inputIndex = 0; inputIndex < task.InputsSize(); ++inputIndex) {
                 const auto& taskInput = task.GetInputs(inputIndex);
                 if (IsTopicInput(taskInput)) {
-                    NYql::NPq::NProto::TDqPqTopicSource srcDesc;
+                    NPq::NProto::TDqPqTopicSource srcDesc;
                     std::vector<NPq::TTopicPartitionsSet> partitionsSets;
                     if (!ParseTopicInput(task, taskInput, inputIndex, /* isSourceGraph */ false, srcDesc, partitionsSets)) {
                         continue;
@@ -268,10 +285,49 @@ private:
         }
     }
 
-    void RaiseIssue(const TString& message, const TString& forceMessage = {}) {
-        TIssue issue(TStringBuilder() << message << ". " << (Force && forceMessage ? forceMessage : "Use force mode to ignore this issue."));
+    const TStageStateRecoveryInfo& GetTaskRecoveryInfo(const ui64 taskId) {
+        const auto taskIdxIt = SrcTaskIndices.find(taskId);
+        Y_VALIDATE(taskIdxIt != SrcTaskIndices.end(), "Task " << taskId << " is not found in previous query");
 
-        if (Force) {
+        if (const auto recoveryInfoIt = StageStateRecoveryInfo.find(Src[taskIdxIt->second].GetStageId()); recoveryInfoIt != StageStateRecoveryInfo.end()) {
+            return recoveryInfoIt->second;
+        }
+    }
+
+    // TODO: validate sources + watermark generator
+    // TODO: validate sinks
+    void CalculateStateRecoveryTimestamp() {
+        for (auto& [taskId, taskPlan] : Plan) {
+            for (auto& sourcePlan : *taskPlan.MutableSources()) {
+                std::optional<TInstant> recoveryTimestamp;
+
+                for (const auto& foreignTaskSource : sourcePlan.GetForeignTasksSources()) {
+                    if (const auto recoveryInfo = GetTaskRecoveryInfo(foreignTaskSource.GetTaskId()).Recovery) {
+                        if (!recoveryTimestamp) {
+                            recoveryTimestamp = recoveryInfo->Timestamp;
+                        } else if (*recoveryTimestamp != recoveryInfo->Timestamp) {
+                            // TODO: produce common timestamp
+                            RaiseIssue(TStringBuilder() << "Input " << sourcePlan.GetInputIndex() << " of task " << taskId << " has ambiguous state recovery timestamp in previous query checkpoint", "Query will use minimum timestamp to avoid skipping data");
+                            recoveryTimestamp = std::min(*recoveryTimestamp, recoveryInfo->Timestamp);
+                        }
+                    }
+                }
+
+                if (recoveryTimestamp) {
+                    if (recoveryTimestamp->MicroSeconds() <= static_cast<ui64>(google::protobuf::util::TimeUtil::kTimestampMinSeconds * 1000000)) {
+                        *sourcePlan.MutableForeignTasksRecoveryTimestamp() = google::protobuf::util::TimeUtil::MicrosecondsToTimestamp(recoveryTimestamp->MicroSeconds());
+                    } else {
+                        RaiseIssue(TStringBuilder() << "Input " << sourcePlan.GetInputIndex() << " of task " << taskId << " has too large recovery timestamp in previous query checkpoint", "Query will read data from fresh offsets");
+                    }
+                }
+            }
+        }
+    }
+
+    void RaiseIssue(const TString& message, const TString& forceMessage = {}) {
+        TIssue issue(TStringBuilder() << message << ". " << (Settings.Force && forceMessage ? forceMessage : "Use force mode to ignore this issue."));
+
+        if (Settings.Force) {
             issue.SetCode(TIssuesIds::WARNING, TSeverityIds::S_WARNING);
         } else {
             Result = false;
@@ -281,7 +337,7 @@ private:
     }
 
     void Finish(const TString& message) {
-        Finish({NYql::TIssue(message)});
+        Finish({TIssue(message)});
     }
 
     void Finish(const TIssues& issues = {}) {
@@ -308,17 +364,19 @@ private:
 
     const TDqTasks Src;
     const TDqTasks Dst;
-    const bool Force = false;
+    const TStateLoadPlanResolverSettings Settings;
     TActorId Owner;
-    THashMap<ui64, NDqProto::NDqStateLoadPlan::TTaskPlan> Plan;
+    THashMap<ui64, ui64> SrcTaskIndices; // Src task ID -> Index
+    THashMap<ui64, TStageStateRecoveryInfo> StageStateRecoveryInfo; // Src stage ID -> Info
+    THashMap<ui64, NDqProto::NDqStateLoadPlan::TTaskPlan> Plan; // Dst task ID -> Plan
     TIssues Issues;
     bool Result = true;
 };
 
 } // anonymous namespace
 
-IActor* CreateStateLoadPlanResolver(const google::protobuf::RepeatedPtrField<NYql::NDqProto::TDqTask>& src, const google::protobuf::RepeatedPtrField<NYql::NDqProto::TDqTask>& dst, bool force) {
-    return new TStateLoadPlanResolverActor(src, dst, force);
+IActor* CreateStateLoadPlanResolver(google::protobuf::RepeatedPtrField<NDqProto::TDqTask> src, google::protobuf::RepeatedPtrField<NDqProto::TDqTask> dst, TStateLoadPlanResolverSettings settings) {
+    return new TStateLoadPlanResolverActor(std::move(src), std::move(dst), std::move(settings));
 }
 
 } // namespace NYql::NDq

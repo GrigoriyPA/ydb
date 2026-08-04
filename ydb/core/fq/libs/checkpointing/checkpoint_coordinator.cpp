@@ -1,9 +1,10 @@
 
 #include "checkpoint_coordinator.h"
 
+#include <ydb/core/base/appdata_fwd.h>
+#include <ydb/core/base/feature_flags.h>
 #include <ydb/core/fq/libs/checkpointing/events/events.h>
 #include <ydb/core/fq/libs/config/protos/checkpoint_coordinator.pb.h>
-
 #include <ydb/library/actors/core/log.h>
 #include <ydb/library/actors/core/hfunc.h>
 #include <ydb/library/yql/dq/actors/dq.h>
@@ -261,10 +262,10 @@ void TCheckpointCoordinator::TryToRestoreOffsetsFromForeignCheckpoint(const TChe
 
     PendingPrepareStateLoadPlanCheckpoint = checkpoint;
 
-    const auto& resolverId = Register(NYql::NDq::CreateStateLoadPlanResolver(
-        checkpoint.Graph->GetTasks(),
-        GraphParams.GetTasks(),
-        StreamingDisposition.from_last_checkpoint().force()));
+    const auto& resolverId = Register(NYql::NDq::CreateStateLoadPlanResolver(checkpoint.Graph->GetTasks(), GraphParams.GetTasks(), {
+        .Force = StreamingDisposition.from_last_checkpoint().force(),
+        .StrictStateRecovery = NKikimr::AppData()->FeatureFlags.GetEnableStreamingQueryStateRecompute(),
+    }));
     YDB_LOG_DEBUG("Registered state load plan resolver",
         {"coordinatorId", CoordinatorId},
         {"checkpointId", checkpoint.CheckpointId},
