@@ -219,8 +219,8 @@ public:
 
 private:
     TStatus ValidateWriteSetting(const TExprNode::TPtr& input, const size_t idx, TExprContext& ctx) const {
-        std::unordered_set<TStringBuf> usedSettings;
-        std::unordered_set<TStringBuf> settingsToRemove;
+        THashSet<TStringBuf> usedSettings;
+        THashSet<TStringBuf> settingsToRemove;
         const auto validator = [state = State_, &usedSettings, &settingsToRemove](TStringBuf name, TExprNode& setting, TExprContext& ctx) {
             if (!usedSettings.emplace(name).second) {
                 ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()), TStringBuilder() << "Duplicate setting \"" << name << "\""));
