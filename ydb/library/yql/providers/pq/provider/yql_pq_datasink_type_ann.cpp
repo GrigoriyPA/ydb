@@ -223,7 +223,7 @@ private:
         THashSet<TStringBuf> settingsToRemove;
         const auto validator = [state = State_, &usedSettings, &settingsToRemove](TStringBuf name, TExprNode& setting, TExprContext& ctx) {
             if (!usedSettings.emplace(name).second) {
-                ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()), TStringBuilder() << "Duplicate setting \"" << name << "\""));
+                ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()), TStringBuilder() << "Duplicate setting '" << name << "'"));
                 return false;
             }
 
@@ -240,8 +240,8 @@ private:
 
                 if (!IsIn({TDeliveryGuaranteeSetting::ExactlyOnceValue, TDeliveryGuaranteeSetting::AtLeastOnceValue}, settingValue->Content())) {
                     ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()), TStringBuilder()
-                        << "`" << TDeliveryGuaranteeSetting::PrettyName << "` must be \"" << TDeliveryGuaranteeSetting::ExactlyOnceValue
-                        << "\" or \"" << TDeliveryGuaranteeSetting::AtLeastOnceValue << "\""
+                        << "`" << TDeliveryGuaranteeSetting::PrettyName << "` must be '" << TDeliveryGuaranteeSetting::ExactlyOnceValue
+                        << "' or '" << TDeliveryGuaranteeSetting::AtLeastOnceValue << "'"
                     ));
                     return false;
                 }
@@ -249,8 +249,8 @@ private:
                 if (settingValue->Content() == TDeliveryGuaranteeSetting::ExactlyOnceValue) {
                     if (state->Configuration->EnableDeduplication.Get().GetOrElse(false)) {
                         ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()), TStringBuilder()
-                            << "`" << TDeliveryGuaranteeSetting::PrettyName << "` = \"" << TDeliveryGuaranteeSetting::ExactlyOnceValue
-                            << "\" is not supported with enabled deduplication"
+                            << "`" << TDeliveryGuaranteeSetting::PrettyName << "` = '" << TDeliveryGuaranteeSetting::ExactlyOnceValue
+                            << "' is not supported with enabled deduplication"
                         ));
                         return false;
                     }
@@ -262,8 +262,8 @@ private:
 
                     if (!state->DeferredPublicationExtIdPrefix) {
                         TIssue issue(ctx.GetPosition(setting.Pos()), TStringBuilder()
-                            << "`" << TDeliveryGuaranteeSetting::PrettyName << "` = \"" << TDeliveryGuaranteeSetting::ExactlyOnceValue
-                            << "\" can not be used in current query context, falling back to default \"" << TDeliveryGuaranteeSetting::AtLeastOnceValue << "\""
+                            << "`" << TDeliveryGuaranteeSetting::PrettyName << "` = '" << TDeliveryGuaranteeSetting::ExactlyOnceValue
+                            << "' can not be used in current query context, falling back to default '" << TDeliveryGuaranteeSetting::AtLeastOnceValue << "'"
                         );
                         issue.Severity = TSeverityIds::S_WARNING;
                         ctx.AddWarning(issue);
