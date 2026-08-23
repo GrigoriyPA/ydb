@@ -255,6 +255,11 @@ private:
                         return false;
                     }
 
+                    if (!state->EnableExactlyOnceDeliveryGuaranty) {
+                        ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()), "Exactly once delivery guarantee is disabled. Please contact your system administrator to enable it."));
+                        return false;
+                    }
+
                     if (!state->DeferredPublicationExtIdPrefix) {
                         TIssue issue(ctx.GetPosition(setting.Pos()), TStringBuilder()
                             << "`" << TDeliveryGuaranteeSetting::PrettyName << "` = \"" << TDeliveryGuaranteeSetting::ExactlyOnceValue
