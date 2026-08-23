@@ -164,7 +164,7 @@ public:
         }
 
         if (!EnsureValidSettings(*input->Child(TDqPqTopicSink::idx_Settings), {
-            TDeliveryGuaranteeSetting::Name, EndpointSetting, UseSslSetting, AddBearerToTokenSetting
+            NDeliveryGuaranteeSetting::Name, EndpointSetting, UseSslSetting, AddBearerToTokenSetting
         }, [](TStringBuf, TExprNode& setting, TExprContext& ctx) {
             if (setting.ChildrenSize() != 2) {
                 ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()), "Expected single value for topic sink settings."));
@@ -221,10 +221,14 @@ public:
 
 private:
     bool ValidateWriteSetting(TExprNode& settings, TExprContext& ctx) const {
+        if (!State_->EnableSettingsValidation) {
+            return true;
+        }
+
         const auto validator = [state = State_](TStringBuf name, TExprNode& setting, TExprContext& ctx) {
-            if (name == TDeliveryGuaranteeSetting::Name) {
+            if (name == NDeliveryGuaranteeSetting::Name) {
                 if (setting.ChildrenSize() != 2) {
-                    ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()), TStringBuilder() << "Expected `" << TDeliveryGuaranteeSetting::PrettyName << "` = value"));
+                    ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()), TStringBuilder() << "Expected `" << NDeliveryGuaranteeSetting::PrettyName << "` = value"));
                     return false;
                 }
 
@@ -233,18 +237,18 @@ private:
                     return false;
                 }
 
-                if (!IsIn({TDeliveryGuaranteeSetting::ExactlyOnceValue, TDeliveryGuaranteeSetting::AtLeastOnceValue}, settingValue->Content())) {
+                if (!IsIn({NDeliveryGuaranteeSetting::ExactlyOnceValue, NDeliveryGuaranteeSetting::AtLeastOnceValue}, settingValue->Content())) {
                     ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()), TStringBuilder()
-                        << "`" << TDeliveryGuaranteeSetting::PrettyName << "` must be '" << TDeliveryGuaranteeSetting::ExactlyOnceValue
-                        << "' or '" << TDeliveryGuaranteeSetting::AtLeastOnceValue << "'"
+                        << "`" << NDeliveryGuaranteeSetting::PrettyName << "` must be '" << NDeliveryGuaranteeSetting::ExactlyOnceValue
+                        << "' or '" << NDeliveryGuaranteeSetting::AtLeastOnceValue << "'"
                     ));
                     return false;
                 }
 
-                if (settingValue->Content() == TDeliveryGuaranteeSetting::ExactlyOnceValue) {
+                if (settingValue->Content() == NDeliveryGuaranteeSetting::ExactlyOnceValue) {
                     if (state->Configuration->EnableDeduplication.Get().GetOrElse(false)) {
                         ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()), TStringBuilder()
-                            << "`" << TDeliveryGuaranteeSetting::PrettyName << "` = '" << TDeliveryGuaranteeSetting::ExactlyOnceValue
+                            << "`" << NDeliveryGuaranteeSetting::PrettyName << "` = '" << NDeliveryGuaranteeSetting::ExactlyOnceValue
                             << "' is not supported with enabled deduplication"
                         ));
                         return false;
@@ -262,7 +266,7 @@ private:
             return false;
         };
 
-        return EnsureValidSettings(settings, {TDeliveryGuaranteeSetting::Name}, validator, ctx);
+        return EnsureValidSettings(settings, {NDeliveryGuaranteeSetting::Name}, validator, ctx);
     }
 
     TPqState::TPtr State_;

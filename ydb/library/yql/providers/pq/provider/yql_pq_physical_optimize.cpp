@@ -381,10 +381,10 @@ public:
                 const auto pos = setting.Ref().Pos();
                 const TStringBuf name = setting.Name();
                 const TStringBuf value = setting.Value().Cast<TCoAtom>();
-                if (name == TDeliveryGuaranteeSetting::Name && value == TDeliveryGuaranteeSetting::ExactlyOnceValue && !State_->DeferredPublicationExtIdPrefix) {
+                if (name == NDeliveryGuaranteeSetting::Name && value == NDeliveryGuaranteeSetting::ExactlyOnceValue && !State_->DeferredPublicationExtIdPrefix) {
                     TIssue issue(ctx.GetPosition(setting.Pos()), TStringBuilder()
-                        << "`" << TDeliveryGuaranteeSetting::PrettyName << "` = '" << TDeliveryGuaranteeSetting::ExactlyOnceValue
-                        << "' can not be used in current query context, falling back to default '" << TDeliveryGuaranteeSetting::AtLeastOnceValue << "'"
+                        << "`" << NDeliveryGuaranteeSetting::PrettyName << "` = '" << NDeliveryGuaranteeSetting::ExactlyOnceValue
+                        << "' can not be used in current query context, falling back to default '" << NDeliveryGuaranteeSetting::AtLeastOnceValue << "'"
                     );
                     issue.Severity = TSeverityIds::S_WARNING;
                     ctx.AddWarning(issue);
