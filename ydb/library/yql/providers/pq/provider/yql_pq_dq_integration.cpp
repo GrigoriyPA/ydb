@@ -370,6 +370,7 @@ public:
             .DataSink(write.DataSink())
             .Topic(write.Topic())
             .Input(write.Input())
+            .Settings(write.Settings())
             .Done().Ptr();
     }
 

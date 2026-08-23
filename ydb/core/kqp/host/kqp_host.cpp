@@ -2042,6 +2042,7 @@ private:
         state->EnableWatermarks = Config->GetEnableWatermarks();
         state->EnableWatermarksAdvanced = Config->GetEnableWatermarksAdvanced();
         state->EnableStreamingPartitionBalancing = Config->GetEnableStreamingPartitionBalancing();
+        state->EnableExactlyOnceDeliveryGuaranty = Config->FeatureFlags.GetEnableExactlyOnceTopicsWriting();
         state->Types = TypesCtx.Get();
         state->DbResolver = FederatedQuerySetup->DatabaseAsyncResolver;
         state->FunctionRegistry = FuncRegistry;
@@ -2055,7 +2056,6 @@ private:
                 state->StreamingTopicsReadByDefault = true;
 
                 if (Config->FeatureFlags.GetEnableExactlyOnceTopicsWriting()) {
-                    state->EnableExactlyOnceDeliveryGuaranty = true;
                     state->DeferredPublicationExtIdPrefix = TStringBuilder() << "__ydb_streaming:" << requestContext->StreamingQueryPath << ":" << requestContext->CurrentExecutionId;
                 }
             }

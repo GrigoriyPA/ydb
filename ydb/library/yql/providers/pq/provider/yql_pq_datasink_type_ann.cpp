@@ -128,8 +128,8 @@ public:
             return TStatus::Error;
         }
 
-        if (const auto status = ValidateWriteSetting(input, TPqWriteTopic::idx_Settings, ctx); status != TStatus::Ok) {
-            return status;
+        if (!ValidateWriteSetting(*input->Child(TPqWriteTopic::idx_Settings), ctx)) {
+            return TStatus::Error;
         }
 
         input->SetTypeAnn(writeWorld->GetTypeAnn());
@@ -163,7 +163,9 @@ public:
             return TStatus::Error;
         }
 
-        if (!EnsureValidSettings(*input->Child(TDqPqTopicSink::idx_Settings), {TDeliveryGuaranteeSetting::Name}, [](TStringBuf, TExprNode& setting, TExprContext& ctx) {
+        if (!EnsureValidSettings(*input->Child(TDqPqTopicSink::idx_Settings), {
+            TDeliveryGuaranteeSetting::Name, EndpointSetting, UseSslSetting, AddBearerToTokenSetting
+        }, [](TStringBuf, TExprNode& setting, TExprContext& ctx) {
             if (setting.ChildrenSize() != 2) {
                 ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()), "Expected single value for topic sink settings."));
                 return false;
@@ -206,8 +208,8 @@ public:
             return TStatus::Error;
         }
 
-        if (const auto status = ValidateWriteSetting(input, TPqInsert::idx_Settings, ctx); status != TStatus::Ok) {
-            return status;
+        if (!ValidateWriteSetting(*input->Child(TPqInsert::idx_Settings), ctx)) {
+            return TStatus::Error;
         }
 
         const auto* outputColumnType = insertInput->GetTypeAnn()->Cast<TListExprType>()->GetItemType()->Cast<TStructExprType>()->GetItems()[0];
@@ -218,15 +220,8 @@ public:
     }
 
 private:
-    TStatus ValidateWriteSetting(const TExprNode::TPtr& input, const size_t idx, TExprContext& ctx) const {
-        THashSet<TStringBuf> usedSettings;
-        THashSet<TStringBuf> settingsToRemove;
-        const auto validator = [state = State_, &usedSettings, &settingsToRemove](TStringBuf name, TExprNode& setting, TExprContext& ctx) {
-            if (!usedSettings.emplace(name).second) {
-                ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()), TStringBuilder() << "Duplicate setting '" << name << "'"));
-                return false;
-            }
-
+    bool ValidateWriteSetting(TExprNode& settings, TExprContext& ctx) const {
+        const auto validator = [state = State_](TStringBuf name, TExprNode& setting, TExprContext& ctx) {
             if (name == TDeliveryGuaranteeSetting::Name) {
                 if (setting.ChildrenSize() != 2) {
                     ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()), TStringBuilder() << "Expected `" << TDeliveryGuaranteeSetting::PrettyName << "` = value"));
@@ -259,16 +254,6 @@ private:
                         ctx.AddError(TIssue(ctx.GetPosition(setting.Pos()), "Exactly once delivery guarantee is disabled. Please contact your system administrator to enable it."));
                         return false;
                     }
-
-                    if (!state->DeferredPublicationExtIdPrefix) {
-                        TIssue issue(ctx.GetPosition(setting.Pos()), TStringBuilder()
-                            << "`" << TDeliveryGuaranteeSetting::PrettyName << "` = '" << TDeliveryGuaranteeSetting::ExactlyOnceValue
-                            << "' can not be used in current query context, falling back to default '" << TDeliveryGuaranteeSetting::AtLeastOnceValue << "'"
-                        );
-                        issue.Severity = TSeverityIds::S_WARNING;
-                        ctx.AddWarning(issue);
-                        settingsToRemove.emplace(TDeliveryGuaranteeSetting::Name);
-                    }
                 }
 
                 return true;
@@ -277,26 +262,7 @@ private:
             return false;
         };
 
-        const auto settingsNode = input->Child(idx);
-        if (!EnsureValidSettings(*settingsNode, {TDeliveryGuaranteeSetting::Name}, validator, ctx)) {
-            return TStatus::Error;
-        }
-
-        if (!settingsToRemove.empty()) {
-            TVector<TCoNameValueTuple> newSettings;
-            for (const auto& setting : TCoNameValueTupleList(settingsNode)) {
-                if (!settingsToRemove.contains(setting.Name().Value())) {
-                    newSettings.push_back(setting);
-                }
-            }
-
-            input->ChildRef(idx) = Build<TCoNameValueTupleList>(ctx, settingsNode->Pos())
-                .Add(std::move(newSettings))
-                .Done().Ptr();
-            return TStatus::Repeat;
-        }
-
-        return TStatus::Ok;
+        return EnsureValidSettings(settings, {TDeliveryGuaranteeSetting::Name}, validator, ctx);
     }
 
     TPqState::TPtr State_;

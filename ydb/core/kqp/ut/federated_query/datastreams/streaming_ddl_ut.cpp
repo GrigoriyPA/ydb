@@ -4949,19 +4949,6 @@ Y_UNIT_TEST_SUITE(KqpStreamingQueriesDdl) {
             CREATE STREAMING QUERY streamingQuery AS
             DO BEGIN
                 INSERT INTO `{pq_source}`.`{output_topic}` WITH (
-                    DELIVERY_GUARANTEE = "exactly_once",
-                    DELIVERY_GUARANTEE = "at_least_once"
-                ) SELECT * FROM `{pq_source}`.`{input_topic}`
-            END DO;)",
-            "pq_source"_a = pqSourceName,
-            "input_topic"_a = inputTopicName,
-            "output_topic"_a = outputTopicName
-        ), EStatus::GENERIC_ERROR, "Duplicate setting 'deliveryguarantee'");
-
-        ExecQuery(fmt::format(R"(
-            CREATE STREAMING QUERY streamingQuery AS
-            DO BEGIN
-                INSERT INTO `{pq_source}`.`{output_topic}` WITH (
                     DELIVERY_GUARANTEE
                 ) SELECT * FROM `{pq_source}`.`{input_topic}`
             END DO;)",
@@ -4969,19 +4956,6 @@ Y_UNIT_TEST_SUITE(KqpStreamingQueriesDdl) {
             "input_topic"_a = inputTopicName,
             "output_topic"_a = outputTopicName
         ), EStatus::GENERIC_ERROR, "Expected `DELIVERY_GUARANTEE` = value");
-
-        ExecQuery(fmt::format(R"(
-            CREATE STREAMING QUERY streamingQuery AS
-            DO BEGIN
-                $value = EvaluateExpr("exactly_once");
-                INSERT INTO `{pq_source}`.`{output_topic}` WITH (
-                    DELIVERY_GUARANTEE = $value
-                ) SELECT * FROM `{pq_source}`.`{input_topic}`
-            END DO;)",
-            "pq_source"_a = pqSourceName,
-            "input_topic"_a = inputTopicName,
-            "output_topic"_a = outputTopicName
-        ), EStatus::GENERIC_ERROR, "Expected atom, but got: String");
 
         ExecQuery(fmt::format(R"(
             CREATE STREAMING QUERY streamingQuery AS
