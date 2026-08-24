@@ -1949,6 +1949,10 @@ void TKqpTasksGraph::SerializeTaskToProto(const TTask& task, NYql::NDqProto::TDq
         (*result->MutableTaskParams())[taskParam] = actorIdProto.SerializeAsString();
     }
 
+    if (const auto executionGeneration = GetMeta().UserRequestContext->CurrentExecutionGeneration) {
+        (*result->MutableTaskParams())["current_execution_generation"] = ToString(executionGeneration);
+    }
+
     SerializeCtxToMap(*GetMeta().UserRequestContext, *result->MutableRequestContext());
 
     result->SetDisableMetering(!enableMetering);

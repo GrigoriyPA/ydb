@@ -32,6 +32,7 @@ std::pair<IDqComputeActorAsyncOutput*, NActors::IActor*> CreateDqPqWriteActor(
     IPqStaticGateway::TPtr pqGateway,
     bool enableStreamingQueriesCounters,
     i64 freeSpace = DqPqDefaultFreeSpace,
+    i64 currentExecutionGeneration = 0,
     bool enableStreamingQueriesPqSinkDeduplicationFeatureFlag = true);
 
 void RegisterDqPqWriteActorFactory(
