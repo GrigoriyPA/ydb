@@ -1247,7 +1247,22 @@ private:
         NFq::NProto::TGraphParams graphParams;
         if (Request.QueryPhysicalGraph) {
             for (const auto& task : Request.QueryPhysicalGraph->GetTasks()) {
-                *graphParams.AddTasks() = task.GetDqTask();
+                auto& checkpointTask = *graphParams.AddTasks();
+                checkpointTask = task.GetDqTask();
+                // Physical graphs omit credentials and may belong to an earlier
+                // execution. Save the current writer identity and credentials for
+                // publication cleanup when this checkpoint graph is deleted.
+                (*checkpointTask.MutableTaskParams())["current_execution_generation"] = ToString(context->CurrentExecutionGeneration);
+                for (const auto& output : checkpointTask.GetOutputs()) {
+                    NYql::NPq::NProto::TDqPqTopicSink sink;
+                    if (output.GetSink().GetSettings().UnpackTo(&sink) && sink.GetDeferredPublicationExtIdPrefix()) {
+                        const auto& secureParams = TasksGraph.GetTask(checkpointTask.GetId()).Meta.SecureParams;
+                        const auto& tokenName = sink.GetToken().GetName();
+                        if (const auto it = secureParams.find(tokenName); it != secureParams.end()) {
+                            (*checkpointTask.MutableSecureParams())[tokenName] = it->second;
+                        }
+                    }
+                }
             }
         }
 

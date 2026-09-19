@@ -1,6 +1,7 @@
 #pragma once
 
 #include "storage_settings.h"
+#include "graph_cleanup.h"
 
 #include <ydb/core/fq/libs/shared_resources/shared_resources.h>
 #include <ydb/library/actors/core/actor.h>
@@ -15,6 +16,7 @@ std::unique_ptr<NActors::IActor> NewStorageProxy(
     const TString& idsPrefix,
     const NKikimr::TYdbCredentialsProviderFactory& credentialsProviderFactory,
     NYdb::TDriver driver,
-    const ::NMonitoring::TDynamicCounterPtr& counters);
+    const ::NMonitoring::TDynamicCounterPtr& counters,
+    TCheckpointGraphCleanup graphCleanup = {});
 
 } // namespace NFq

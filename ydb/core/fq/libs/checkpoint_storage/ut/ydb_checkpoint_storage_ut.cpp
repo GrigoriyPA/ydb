@@ -29,6 +29,10 @@ template<bool UseYdbSdk>
 class TFixture : public NUnitTest::TBaseFixture/*, public NActors::TTestActorRuntime*/ {
 public:
     TCheckpointStoragePtr Storage;
+    IYdbConnection::TPtr Connection;
+    TVector<TString> CleanedGraphs;
+    NYql::TIssues CleanupIssues;
+    bool ThrowDuringCleanup = false;
 
 public:
     void SetUp(NUnitTest::TTestContext& /* context */) override {
@@ -45,11 +49,65 @@ public:
 
         auto credFactory = NKikimr::CreateYdbCredentialsProviderFactory;
         NYdb::TDriver driver(NYdb::TDriverConfig{});
-        auto ydbConnectionPtr = CreateSdkYdbConnection(checkpointStorageConfig, credFactory, driver);
-        Storage = NewYdbCheckpointStorage(checkpointStorageConfig, entityIdGenerator, ydbConnectionPtr);
+        Connection = CreateSdkYdbConnection(checkpointStorageConfig, credFactory, driver);
+        Storage = NewYdbCheckpointStorage(checkpointStorageConfig, entityIdGenerator, Connection,
+            [this](const NProto::TCheckpointGraphDescription& graph) {
+                CleanedGraphs.push_back(graph.GetGraph().GetGraphId());
+                if (ThrowDuringCleanup) {
+                    ythrow yexception() << "Test cleanup exception";
+                }
+                return NThreading::MakeFuture(CleanupIssues);
+            });
 
         auto issues = Storage->Init({}).GetValueSync();
         UNIT_ASSERT_C(issues.Empty(), issues.ToString());
+    }
+
+    ui64 CountGraphDescriptions() {
+        ui64 count = 0;
+        auto status = Connection->GetTableClient()->RetryOperation([&](ISession::TPtr session) {
+            return session->ExecuteDataQuery(
+                TStringBuilder() << "PRAGMA TablePathPrefix(\"" << Connection->GetTablePathPrefix() << "\"); SELECT COUNT(*) FROM checkpoints_graphs_description;",
+                ISession::TTxControl::BeginAndCommitTx(), {}).Apply([&](const auto& future) {
+                    const auto& result = future.GetValue();
+                    if (result.IsSuccess()) {
+                        auto parser = result.GetResultSetParser(0);
+                        UNIT_ASSERT(parser.TryNextRow());
+                        count = parser.ColumnParser(0).GetUint64();
+                    }
+                    return NYdb::TStatus(result);
+                });
+        }).GetValueSync();
+        UNIT_ASSERT_C(status.IsSuccess(), status.GetIssues().ToString());
+        return count;
+    }
+
+    void CheckCleanupFailure(bool gc) {
+        CreateSome();
+        if (gc) {
+            const auto issues = Storage->MarkCheckpointsGC("graph1", CheckpointId4).GetValueSync();
+            UNIT_ASSERT_C(issues.Empty(), issues.ToString());
+        }
+        auto deleteGraphs = [&] {
+            return gc ? Storage->DeleteMarkedCheckpoints("graph1", CheckpointId4).GetValueSync()
+                      : Storage->DeleteGraph("graph1").GetValueSync();
+        };
+        CleanupIssues.AddIssue("Test cleanup failure");
+        UNIT_ASSERT(deleteGraphs());
+        UNIT_ASSERT_VALUES_EQUAL(CountGraphDescriptions(), 3);
+        UNIT_ASSERT_VALUES_EQUAL(Storage->GetCheckpoints("graph1").GetValueSync().first.size(), 4);
+
+        CleanupIssues.Clear();
+        ThrowDuringCleanup = true;
+        UNIT_ASSERT(deleteGraphs());
+        UNIT_ASSERT_VALUES_EQUAL(CountGraphDescriptions(), 3);
+        UNIT_ASSERT_VALUES_EQUAL(Storage->GetCheckpoints("graph1").GetValueSync().first.size(), 4);
+
+        ThrowDuringCleanup = false;
+        const auto issues = deleteGraphs();
+        UNIT_ASSERT_C(issues.Empty(), issues.ToString());
+        UNIT_ASSERT_VALUES_EQUAL(CountGraphDescriptions(), gc ? 2 : 1);
+        UNIT_ASSERT_VALUES_EQUAL(Storage->GetCheckpoints("graph1").GetValueSync().first.size(), gc ? 1 : 0);
     }
 
     void CreateSome() {
@@ -264,6 +322,45 @@ Y_UNIT_TEST_SUITE(TCheckpointStorageTest) {
 
         const auto& graph2Checkpoint1 = getResult.first.front();
         UNIT_ASSERT_VALUES_EQUAL(graph2Checkpoint1.Status, ECheckpointStatus::Pending);
+    }
+
+    Y_UNIT_TEST_F(ShouldCleanupGraphsOnExplicitDeletion, TSdkCheckpoints) {
+        CreateSome();
+        UNIT_ASSERT_VALUES_EQUAL(CountGraphDescriptions(), 3);
+        auto issues = Storage->DeleteGraph("graph1").GetValueSync();
+        UNIT_ASSERT_C(issues.Empty(), issues.ToString());
+        UNIT_ASSERT_VALUES_EQUAL(CleanedGraphs, (TVector<TString>{"graph1", "graph1"}));
+        UNIT_ASSERT_VALUES_EQUAL(CountGraphDescriptions(), 1);
+
+        issues = Storage->DeleteGraph("graph1").GetValueSync();
+        UNIT_ASSERT_C(issues.Empty(), issues.ToString());
+        UNIT_ASSERT_VALUES_EQUAL(CleanedGraphs.size(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(Storage->GetCheckpoints("graph2").GetValueSync().first.size(), 1);
+    }
+
+    Y_UNIT_TEST_F(ShouldCleanupGraphsOnlyAfterLastCheckpointDeletion, TSdkCheckpoints) {
+        CreateSome();
+        auto issues = Storage->MarkCheckpointsGC("graph1", CheckpointId3).GetValueSync();
+        UNIT_ASSERT_C(issues.Empty(), issues.ToString());
+        issues = Storage->DeleteMarkedCheckpoints("graph1", CheckpointId3).GetValueSync();
+        UNIT_ASSERT_C(issues.Empty(), issues.ToString());
+        UNIT_ASSERT(CleanedGraphs.empty());
+        UNIT_ASSERT_VALUES_EQUAL(CountGraphDescriptions(), 3);
+
+        issues = Storage->MarkCheckpointsGC("graph1", CheckpointId4).GetValueSync();
+        UNIT_ASSERT_C(issues.Empty(), issues.ToString());
+        issues = Storage->DeleteMarkedCheckpoints("graph1", CheckpointId4).GetValueSync();
+        UNIT_ASSERT_C(issues.Empty(), issues.ToString());
+        UNIT_ASSERT_VALUES_EQUAL(CleanedGraphs, (TVector<TString>{"graph1"}));
+        UNIT_ASSERT_VALUES_EQUAL(CountGraphDescriptions(), 2);
+    }
+
+    Y_UNIT_TEST_F(ShouldRetryGraphDeletionAfterCleanupFailure, TSdkCheckpoints) {
+        CheckCleanupFailure(false);
+    }
+
+    Y_UNIT_TEST_F(ShouldRetryGcAfterCleanupFailure, TSdkCheckpoints) {
+        CheckCleanupFailure(true);
     }
 
     Y_UNIT_TEST_F(ShouldNotDeleteUnmarkedCheckpoints, TSdkCheckpoints)
