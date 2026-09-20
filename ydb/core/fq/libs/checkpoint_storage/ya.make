@@ -2,6 +2,7 @@ LIBRARY()
 
 SRCS(
     gc.cpp
+    pq_graph_cleanup.cpp
     storage_proxy.cpp
     storage_service.cpp
     storage_settings.cpp
@@ -23,6 +24,9 @@ PEERDIR(
     ydb/library/security
     ydb/library/yql/dq/actors/compute
     ydb/library/yql/dq/proto
+    ydb/library/yql/providers/common/token_accessor/client
+    ydb/library/yql/providers/pq/gateway/abstract
+    ydb/library/yql/providers/pq/proto
     ydb/public/sdk/cpp/adapters/issue
     ydb/public/sdk/cpp/src/client/scheme
     ydb/public/sdk/cpp/src/client/table

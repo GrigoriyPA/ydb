@@ -317,6 +317,135 @@ Y_UNIT_TEST_SUITE(KqpStreamingQueriesWithDeferredCommits) {
     }
 
     // Test what for graph without checkpoints exactly once write tx commited on finish
+    Y_UNIT_TEST_TWIN_F(DropStreamingQueryCancelsOpenPublications, LocalTopics, TStreamingWithSchemaSecretsTestFixture) {
+        InternalInitFederatedQuerySetupFactory = true;
+        auto& featureFlags = *SetupAppConfig().MutableFeatureFlags();
+        featureFlags.SetEnableExactlyOnceTopicsWriting(true);
+        featureFlags.SetEnableTopicDeferredPublish(true);
+
+        const auto inputTopic = TStringBuilder() << Name_ << "Input";
+        const auto outputTopic1 = TStringBuilder() << Name_ << "Output1";
+        const auto outputTopic2 = TStringBuilder() << Name_ << "Output2";
+        CreateTopic(inputTopic, std::nullopt, LocalTopics);
+        CreateTopic(outputTopic1, std::nullopt, LocalTopics);
+        CreateTopic(outputTopic2, std::nullopt, LocalTopics);
+        std::shared_ptr<TDeferredPublishClient> client;
+        TString source;
+        if constexpr (LocalTopics) {
+            client = GetDeferredPublishClient(true, BUILTIN_ACL_ROOT);
+        } else {
+            CreatePqSourceBasicAuth("pqSource", /* useSchemaSecrets */ true);
+            source = "`pqSource`.";
+            client = GetDeferredPublishClient(false, "", NYdb::CreateLoginCredentialsProviderFactory({.User = "root", .Password = "1234"}));
+        }
+        const auto unrelated = CreatePublication("unrelated-publication", "unrelated-publication", *client);
+
+        for (bool stopBeforeDrop : {false, true}) {
+            const auto queryName = TStringBuilder() << Name_ << (stopBeforeDrop ? "Stopped" : "Running");
+            ExecQuery(fmt::format(R"(
+                CREATE STREAMING QUERY `{query}` WITH (CHECKPOINT_INTERVAL = "PT1H") AS
+                DO BEGIN
+                    INSERT INTO {source}`{output1}` WITH (DELIVERY_GUARANTEE = "exactly_once")
+                    SELECT * FROM {source}`{input}`;
+                    INSERT INTO {source}`{output2}` WITH (DELIVERY_GUARANTEE = "exactly_once")
+                    SELECT * FROM {source}`{input}`;
+                END DO;
+            )", "query"_a = queryName, "source"_a = source, "input"_a = inputTopic,
+                "output1"_a = outputTopic1, "output2"_a = outputTopic2));
+            CheckScriptExecutionsCount(1, 1);
+            Sleep(TDuration::Seconds(1));
+            WriteTopicMessage(inputTopic, "unpublished", 0, LocalTopics);
+            WaitFor(TEST_OPERATION_TIMEOUT, "both sink publications are open", [&] {
+                const auto result = client->ListPublications().ExtractValueSync();
+                UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+                return result.GetPublications().size() == 3;
+            });
+            ValidatePublicationsCount(2, queryName, *client);
+
+            if (stopBeforeDrop) {
+                ExecQuery(fmt::format("ALTER STREAMING QUERY `{}` SET (RUN = FALSE);", queryName));
+                CheckScriptExecutionsCount(1, 0);
+                ValidatePublicationsCount(2, queryName, *client);
+            }
+            ExecQuery(fmt::format("DROP STREAMING QUERY `{}`;", queryName));
+            ValidatePublicationsCount(0, queryName, *client);
+            ValidatePublicationsCount(1, "unrelated-publication", *client);
+            CheckScriptExecutionsCount(0, 0);
+        }
+        const auto canceled = client->CancelPublication(unrelated).ExtractValueSync();
+        UNIT_ASSERT_C(canceled.IsSuccess(), canceled.GetIssues().ToString());
+        DropTopic(inputTopic, LocalTopics);
+        DropTopic(outputTopic1, LocalTopics);
+        DropTopic(outputTopic2, LocalTopics);
+    }
+
+    Y_UNIT_TEST_TWIN_F(CheckpointGcCancelsRemovedSinkPublications, LocalTopics, TStreamingWithSchemaSecretsTestFixture) {
+        InternalInitFederatedQuerySetupFactory = true;
+        auto& featureFlags = *SetupAppConfig().MutableFeatureFlags();
+        featureFlags.SetEnableExactlyOnceTopicsWriting(true);
+        featureFlags.SetEnableTopicDeferredPublish(true);
+
+        ExecQuery("GRANT ALL ON `/Root` TO `" BUILTIN_ACL_ROOT "`");
+        const auto inputTopic = TStringBuilder() << Name_ << "Input";
+        const auto outputTopic = TStringBuilder() << Name_ << "Output";
+        CreateTopic(inputTopic, std::nullopt, LocalTopics);
+        CreateTopic(outputTopic, std::nullopt, LocalTopics);
+        std::shared_ptr<TDeferredPublishClient> client;
+        TString source;
+        if constexpr (LocalTopics) {
+            client = GetDeferredPublishClient(true, BUILTIN_ACL_ROOT);
+        } else {
+            CreatePqSourceBasicAuth("pqSource", /* useSchemaSecrets */ true);
+            source = "`pqSource`.";
+            client = GetDeferredPublishClient(false, "", NYdb::CreateLoginCredentialsProviderFactory({.User = "root", .Password = "1234"}));
+        }
+        const auto queryName = TStringBuilder() << Name_ << "Query";
+        ExecQuery(fmt::format(R"(
+            CREATE STREAMING QUERY `{query}` WITH (CHECKPOINT_INTERVAL = "PT1H") AS
+            DO BEGIN
+                INSERT INTO {source}`{output}` WITH (DELIVERY_GUARANTEE = "exactly_once")
+                SELECT * FROM {source}`{input}`;
+            END DO;
+        )", "query"_a = queryName, "source"_a = source, "input"_a = inputTopic, "output"_a = outputTopic));
+        CheckScriptExecutionsCount(1, 1);
+        Sleep(TDuration::Seconds(1));
+        const auto checkpointId = GetStreamingQueryCheckpointId(queryName);
+        WriteTopicMessage(inputTopic, "unpublished", 0, LocalTopics);
+        WaitFor(TEST_OPERATION_TIMEOUT, "sink publication is open", [&] {
+            const auto result = client->ListPublications().ExtractValueSync();
+            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+            return result.GetPublications().size() == 1;
+        });
+        const auto publications = ValidatePublicationsCount(1, queryName, *client);
+        UNIT_ASSERT(publications[0].WriterIdentity);
+        const TString writer(*publications[0].WriterIdentity);
+        const auto retained = CreatePublication(writer + ":999:0", writer, *client);
+
+        // Replacing the deferred sink avoids its startup cleanup: the old graph's
+        // last checkpoint must trigger cancellation through checkpoint GC.
+        ExecQuery(fmt::format(R"(
+            ALTER STREAMING QUERY `{query}` SET (FORCE = TRUE, CHECKPOINT_INTERVAL = "PT1S") AS
+            DO BEGIN
+                INSERT INTO {source}`{output}` SELECT * FROM {source}`{input}`;
+            END DO;
+        )", "query"_a = queryName, "source"_a = source, "input"_a = inputTopic, "output"_a = outputTopic));
+        CheckScriptExecutionsCount(2, 1);
+        UNIT_ASSERT_VALUES_EQUAL(GetStreamingQueryCheckpointId(queryName), checkpointId);
+        WaitFor(TEST_OPERATION_TIMEOUT, "old graph publications are canceled by GC", [&] {
+            const auto result = client->ListPublications().ExtractValueSync();
+            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+            return result.GetPublications().size() == 1;
+        });
+        ValidatePublicationsCount(1, queryName, *client);
+        const auto retainedResult = client->DescribePublication(retained).ExtractValueSync();
+        UNIT_ASSERT_C(retainedResult.IsSuccess(), retainedResult.GetIssues().ToString());
+        ExecQuery(fmt::format("DROP STREAMING QUERY `{}`;", queryName));
+        const auto canceled = client->CancelPublication(retained).ExtractValueSync();
+        UNIT_ASSERT_C(canceled.IsSuccess(), canceled.GetIssues().ToString());
+        DropTopic(inputTopic, LocalTopics);
+        DropTopic(outputTopic, LocalTopics);
+    }
+
     Y_UNIT_TEST_TWIN_F(StreamingQueryDeferredComitPublicationWithoutCheckpoints, LocalTopics, TStreamingWithSchemaSecretsTestFixture) {
         InternalInitFederatedQuerySetupFactory = true;
         {

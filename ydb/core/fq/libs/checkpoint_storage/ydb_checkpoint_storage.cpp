@@ -609,7 +609,8 @@ public:
     explicit TCheckpointStorage(
         const TExternalStorageSettings& config,
         const IEntityIdGenerator::TPtr& entityIdGenerator,
-        const IYdbConnection::TPtr& ydbConnection);
+        const IYdbConnection::TPtr& ydbConnection,
+        TCheckpointGraphCleanup graphCleanup);
 
     ~TCheckpointStorage() = default;
 
@@ -668,7 +669,10 @@ private:
     TFuture<TCreateCheckpointResult> CreateCheckpointImpl(const TCoordinatorId& coordinator, const TCheckpointContextPtr& context);
 
 private:
+    TFuture<TIssues> DeleteCheckpoints(const TString& graphId, const std::optional<TCheckpointId>& checkpointUpperBound);
+
     IEntityIdGenerator::TPtr EntityIdGenerator;
+    const TCheckpointGraphCleanup GraphCleanup;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -676,10 +680,12 @@ private:
 TCheckpointStorage::TCheckpointStorage(
     const TExternalStorageSettings& config,
     const IEntityIdGenerator::TPtr& entityIdGenerator,
-    const IYdbConnection::TPtr& ydbConnection)
+    const IYdbConnection::TPtr& ydbConnection,
+    TCheckpointGraphCleanup graphCleanup)
     : YdbConnection(ydbConnection)
     , Config(config)
     , EntityIdGenerator(entityIdGenerator)
+    , GraphCleanup(std::move(graphCleanup))
 {
 }
 
@@ -955,45 +961,7 @@ TFuture<ICheckpointStorage::TGetCheckpointsResult> TCheckpointStorage::GetCheckp
 }
 
 TFuture<TIssues> TCheckpointStorage::DeleteGraph(const TString& graphId) {
-    auto future = YdbConnection->GetTableClient()->RetryOperation(
-        [prefix = YdbConnection->GetTablePathPrefix(), graphId, settings = DefaultExecDataQuerySettings()] (ISession::TPtr session) {
-            // TODO: use prepared queries
-            auto query = Sprintf(R"(
-                --!syntax_v1
-                PRAGMA TablePathPrefix("%s");
-                DECLARE $graph_id AS String;
-
-                DELETE
-                FROM %s
-                WHERE graph_id = $graph_id;
-
-                DELETE
-                FROM %s
-                WHERE graph_id = $graph_id;
-            )", prefix.c_str(),
-                CoordinatorsSyncTable,
-                CheckpointsMetadataTable);
-
-            auto params = std::make_shared<NYdb::TParamsBuilder>();
-            params->
-                 AddParam("$graph_id")
-                    .String(graphId)
-                    .Build();
-
-            auto future = session->ExecuteDataQuery(
-                query,
-                TTxControl::BeginAndCommitTx(),
-                std::move(params),
-                settings);
-
-            return future.Apply(
-                [] (const TFuture<TDataQueryResult>& future) {
-                    TStatus status = future.GetValue();
-                    return status;
-            });
-        }, GetRetryOperationSettings());
-
-    return StatusToIssues(future);
+    return DeleteCheckpoints(graphId, std::nullopt);
 }
 
 TFuture<TIssues> TCheckpointStorage::MarkCheckpointsGC(
@@ -1058,75 +1026,112 @@ TFuture<TIssues> TCheckpointStorage::DeleteMarkedCheckpoints(
     const TString& graphId,
     const TCheckpointId& checkpointUpperBound)
 {
+    return DeleteCheckpoints(graphId, checkpointUpperBound);
+}
+
+TFuture<TIssues> TCheckpointStorage::DeleteCheckpoints(
+    const TString& graphId,
+    const std::optional<TCheckpointId>& checkpointUpperBound)
+{
     auto future = YdbConnection->GetTableClient()->RetryOperation(
-        [prefix = YdbConnection->GetTablePathPrefix(), graphId, checkpointUpperBound, settings = DefaultExecDataQuerySettings()] (ISession::TPtr session) {
-            // TODO: use prepared queries
+        [prefix = YdbConnection->GetTablePathPrefix(), graphId, checkpointUpperBound,
+         graphCleanup = GraphCleanup, settings = DefaultExecDataQuerySettings()](ISession::TPtr session) {
             using namespace fmt::literals;
-            const TString query = fmt::format(R"sql(
+            TString filter = "graph_id = $graph_id";
+            TString declarations = "DECLARE $graph_id AS String;";
+            if (checkpointUpperBound) {
+                declarations += "DECLARE $coordinator_generation AS Uint64; DECLARE $seq_no AS Uint64;";
+                filter += fmt::format(R"sql( AND status = {}
+                    AND (coordinator_generation < $coordinator_generation OR
+                        (coordinator_generation = $coordinator_generation AND seq_no < $seq_no)))sql",
+                    static_cast<ui32>(ECheckpointStatus::GC));
+            }
+
+            const auto makeParams = [graphId, checkpointUpperBound] {
+                auto params = std::make_shared<NYdb::TParamsBuilder>();
+                params->AddParam("$graph_id").String(graphId).Build();
+                if (checkpointUpperBound) {
+                    params->AddParam("$coordinator_generation").Uint64(checkpointUpperBound->CoordinatorGeneration).Build()
+                        .AddParam("$seq_no").Uint64(checkpointUpperBound->SeqNo).Build();
+                }
+                return params;
+            };
+
+            const TString queryPrefix = fmt::format(R"sql(
                 --!syntax_v1
                 PRAGMA TablePathPrefix("{table_path_prefix}");
-                DECLARE $graph_id AS String;
-                DECLARE $coordinator_generation AS Uint64;
-                DECLARE $seq_no AS Uint64;
+                {declarations}
 
-                $refs =
-                  SELECT
-                    COUNT(*) AS refs, graph_description_id
-                  FROM {checkpoints_metadata_table_name}
-                  WHERE graph_id = $graph_id AND status = {gc_status}
-                    AND (coordinator_generation < $coordinator_generation OR
-                      (coordinator_generation = $coordinator_generation AND seq_no < $seq_no))
-                    AND graph_description_id != "" -- legacy condition (excludes old records without graph description)
-                  GROUP BY graph_description_id;
+                $refs = SELECT COUNT(*) AS refs, graph_description_id
+                    FROM {metadata} WHERE {filter} AND graph_description_id != ""
+                    GROUP BY graph_description_id;
 
-                $update =
-                  SELECT
-                    checkpoints_graphs_description.id AS id,
-                    checkpoints_graphs_description.ref_count - refs.refs AS ref_count
-                  FROM $refs AS refs
-                    INNER JOIN {checkpoints_graphs_description_table_name}
-                      ON refs.graph_description_id = checkpoints_graphs_description.id;
-
-                UPDATE {checkpoints_graphs_description_table_name}
-                  ON SELECT * FROM $update WHERE ref_count > 0;
-
-                DELETE FROM {checkpoints_graphs_description_table_name}
-                  ON SELECT * FROM $update WHERE ref_count = 0;
-
-                DELETE FROM {checkpoints_metadata_table_name}
-                WHERE graph_id = $graph_id AND status = {gc_status}
-                  AND (coordinator_generation < $coordinator_generation OR
-                    (coordinator_generation = $coordinator_generation AND seq_no < $seq_no));
+                $update = SELECT graphs.id AS id, graphs.ref_count - refs.refs AS ref_count,
+                        graphs.graph_description AS graph_description
+                    FROM $refs AS refs INNER JOIN {descriptions} AS graphs
+                        ON refs.graph_description_id = graphs.id;
             )sql",
-            "table_path_prefix"_a = prefix,
-            "checkpoints_metadata_table_name"_a = CheckpointsMetadataTable,
-            "checkpoints_graphs_description_table_name"_a = CheckpointsGraphsDescriptionTable,
-            "gc_status"_a = static_cast<ui32>(ECheckpointStatus::GC)
-            );
+                "table_path_prefix"_a = prefix,
+                "declarations"_a = declarations,
+                "metadata"_a = CheckpointsMetadataTable,
+                "descriptions"_a = CheckpointsGraphsDescriptionTable,
+                "filter"_a = filter);
 
-            auto params = std::make_shared<NYdb::TParamsBuilder>();
-            params->
-                 AddParam("$graph_id")
-                    .String(graphId)
-                    .Build()
-                .AddParam("$coordinator_generation")
-                    .Uint64(checkpointUpperBound.CoordinatorGeneration)
-                    .Build()
-                .AddParam("$seq_no")
-                    .Uint64(checkpointUpperBound.SeqNo)
-                    .Build();
+            TString deleteQuery = queryPrefix + fmt::format(R"sql(
+                UPDATE {descriptions} ON SELECT id, ref_count FROM $update WHERE ref_count > 0;
+                DELETE FROM {descriptions} ON SELECT id FROM $update WHERE ref_count = 0;
+                DELETE FROM {metadata} WHERE {filter};
+            )sql",
+                "descriptions"_a = CheckpointsGraphsDescriptionTable,
+                "metadata"_a = CheckpointsMetadataTable,
+                "filter"_a = filter);
+            if (!checkpointUpperBound) {
+                deleteQuery += TStringBuilder() << "DELETE FROM " << CoordinatorsSyncTable << " WHERE graph_id = $graph_id;";
+            }
 
-            auto future = session->ExecuteDataQuery(
-                query,
-                TTxControl::BeginAndCommitTx(),
-                std::move(params),
-                settings);
+            // Keep the descriptions and their checkpoint references until all external
+            // cleanup has succeeded. A failure or a concurrent GC rolls back deletion.
+            return session->ExecuteDataQuery(
+                queryPrefix + "SELECT graph_description FROM $update WHERE ref_count = 0;",
+                TTxControl::BeginTx(), makeParams(), settings).Apply(
+                [session, makeParams, settings, deleteQuery, graphCleanup](const TFuture<TDataQueryResult>& future) -> TFuture<TStatus> {
+                    const auto& result = future.GetValue();
+                    if (!result.IsSuccess()) {
+                        return MakeFuture<TStatus>(result);
+                    }
+                    session->UpdateTransaction(result.GetTransaction());
 
-            return future.Apply(
-                [] (const TFuture<TDataQueryResult>& future) {
-                    TStatus status = future.GetValue();
-                    return status;
-            });
+                    auto cleanup = MakeFuture(TIssues{});
+                    if (graphCleanup) {
+                        auto parser = result.GetResultSetParser(0);
+                        while (parser.TryNextRow()) {
+                            NProto::TCheckpointGraphDescription graphDesc;
+                            if (!graphDesc.ParseFromString(*parser.ColumnParser("graph_description").GetOptionalString())) {
+                                cleanup = MakeFuture(TIssues{NYql::TIssue("Failed to parse checkpoint graph description for cleanup")});
+                                break;
+                            }
+                            cleanup = cleanup.Apply([graphCleanup, graphDesc = std::move(graphDesc)](const TFuture<TIssues>& future) {
+                                return future.GetValue() ? future : graphCleanup(graphDesc);
+                            });
+                        }
+                    }
+
+                    return cleanup.Apply([session, makeParams, settings, deleteQuery](const TFuture<TIssues>& future) -> TFuture<TStatus> {
+                        TIssues issues;
+                        try {
+                            issues = future.GetValue();
+                        } catch (const std::exception& e) {
+                            issues.AddIssue(NYql::TIssue(TStringBuilder() << "Checkpoint graph cleanup failed: " << e.what()));
+                        }
+                        if (issues) {
+                            return session->Rollback().Apply([issues](const TFuture<TStatus>&) {
+                                return MakeErrorStatus(EStatus::GENERIC_ERROR, issues.ToString(), NYql::TSeverityIds::S_ERROR);
+                            });
+                        }
+                        return session->ExecuteDataQuery(deleteQuery, TTxControl::ContinueAndCommitTx(), makeParams(), settings)
+                            .Apply([](const TFuture<TDataQueryResult>& future) { return TStatus(future.GetValue()); });
+                    });
+                });
         }, GetRetryOperationSettings());
 
     return StatusToIssues(future);
@@ -1206,10 +1211,11 @@ TExecDataQuerySettings TCheckpointStorage::DefaultExecDataQuerySettings() {
 TCheckpointStoragePtr NewYdbCheckpointStorage(
     const TExternalStorageSettings& config,
     const IEntityIdGenerator::TPtr& entityIdGenerator,
-    const IYdbConnection::TPtr& ydbConnection)
+    const IYdbConnection::TPtr& ydbConnection,
+    TCheckpointGraphCleanup graphCleanup)
 {
     Y_ABORT_UNLESS(entityIdGenerator);
-    return new TCheckpointStorage(config, entityIdGenerator, ydbConnection);
+    return new TCheckpointStorage(config, entityIdGenerator, ydbConnection, std::move(graphCleanup));
 }
 
 } // namespace NFq
