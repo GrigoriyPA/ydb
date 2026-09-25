@@ -2874,10 +2874,22 @@ private:
 
         TPropertyValidator validator(*SchemeTx.MutableCreateStreamingQuery()->MutableProperties());
         CHECK_STATUS(validator.SaveRequired(ESqlSettings::QUERY_TEXT_FEATURE, &TPropertyValidator::ValidateNotEmpty));
+        CHECK_STATUS_RET(force, validator.ExtractDefault(EName::Force, "false", &TPropertyValidator::ValidateBool));
         CHECK_STATUS(validator.SaveDefault(EName::Run, "true", &TPropertyValidator::ValidateBool));
         CHECK_STATUS(validator.SaveDefault(EName::ResourcePool, ""));
         CHECK_STATUS(validator.SaveDefault(EName::WatermarkLateEventsPolicy, "drop", &TPropertyValidator::ValidateEnum<NYql::NHoppingWindow::EPolicy>));
-        CHECK_STATUS(validator.SaveDefault(EName::StreamingDisposition, DefaultStreamingDisposition));
+        CHECK_STATUS_RET(streamingDisposition, validator.ExtractOptional(EName::StreamingDisposition));
+        auto dispositionValue = streamingDisposition.DetachResult().value_or(DefaultStreamingDisposition);
+        if (SchemeInfo && AppData()->FeatureFlags.GetEnableStreamingQueryStateRecompute()) {
+            NYql::NPq::NProto::StreamingDisposition disposition;
+            Y_VALIDATE(disposition.ParseFromString(dispositionValue), "Failed to parse StreamingDisposition");
+            if (!disposition.has_output_start_time()) {
+                disposition.set_replay_state(true);
+                disposition.set_replay_force(force.GetResult() == "true");
+            }
+            dispositionValue = disposition.SerializeAsString();
+        }
+        CHECK_STATUS(validator.Save(EName::StreamingDisposition, dispositionValue));
         CHECK_STATUS(validator.SaveDefault(EName::CheckpointInterval, "", &TPropertyValidator::ValidateInterval<TPropertyValidator::MAX_PROTOBUF_DURATION_MICROSECONDS>));
         CHECK_STATUS(validator.Save(
             EName::QueryTextRevision,
@@ -3001,11 +3013,14 @@ private:
         CHECK_STATUS_RET(watermarkLateEventsPolicy, validator.ExtractOptional(EName::WatermarkLateEventsPolicy, &TPropertyValidator::ValidateEnum<NYql::NHoppingWindow::EPolicy>));
 
         const auto queryTextValue = queryText.DetachResult();
-        if (queryTextValue && force.GetResult() != "true") {
+        auto streamingDispositionValue = streamingDisposition.DetachResult();
+        NYql::NPq::NProto::StreamingDisposition requestedDisposition;
+        Y_VALIDATE(requestedDisposition.ParseFromString(streamingDispositionValue.value_or(DefaultStreamingDisposition)), "Failed to parse StreamingDisposition");
+        const bool replayState = queryTextValue && AppData()->FeatureFlags.GetEnableStreamingQueryStateRecompute();
+        if (queryTextValue && force.GetResult() != "true" && !replayState && !requestedDisposition.has_output_start_time()) {
             return TStatus::Fail(Ydb::StatusIds::PRECONDITION_FAILED, "Changing the query text will result in the loss of the checkpoint. Please use FORCE=true to change the request text");
         }
 
-        const auto streamingDispositionValue = streamingDisposition.DetachResult();
         auto queryTestRevision = previousSettings.QueryTextRevision;
         if (queryTextValue) {
             queryTestRevision++;
@@ -3016,6 +3031,16 @@ private:
         } else if (watermarkLateEventsPolicy.GetResult()
             && *watermarkLateEventsPolicy.GetResult() != (previousSettings.WatermarkLateEventsPolicy ? previousSettings.WatermarkLateEventsPolicy : "drop")) {
             queryTestRevision++;
+        }
+
+        if (replayState) {
+            NYql::NPq::NProto::StreamingDisposition disposition;
+            Y_VALIDATE(disposition.ParseFromString(streamingDispositionValue.value_or(DefaultStreamingDisposition)), "Failed to parse StreamingDisposition");
+            if (!disposition.has_output_start_time()) {
+                disposition.set_replay_state(true);
+                disposition.set_replay_force(force.GetResult() == "true");
+            }
+            streamingDispositionValue = disposition.SerializeAsString();
         }
 
         CHECK_STATUS(validator.Save(ESqlSettings::QUERY_TEXT_FEATURE, queryTextValue.value_or(previousSettings.QueryText)));

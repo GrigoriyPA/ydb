@@ -21,6 +21,7 @@ message TDqPqTopicSourceState {
         string Cluster = 2;
         uint64 Partition = 3;
         uint64 Offset = 4;
+        optional uint64 LastWriteTimeUs = 6;
     }
 }
 

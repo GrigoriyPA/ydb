@@ -2337,6 +2337,7 @@ private:
                 ast_compressed,
                 ast_compression_method,
                 graph_compressed IS NOT NULL AS has_graph,
+                streaming_disposition,
                 retry_state,
                 user_token
             FROM `.metadata/script_executions`
@@ -2432,6 +2433,19 @@ private:
             }
 
             StateSaved = result.ColumnParser("has_graph").GetBool();
+            if (const auto& serialized = result.ColumnParser("streaming_disposition").GetOptionalJson()) {
+                NJson::TJsonValue json;
+                if (!NJson::ReadJsonTree(*serialized, &json)) {
+                    Finish(Ydb::StatusIds::INTERNAL_ERROR, "Streaming disposition is corrupted");
+                    return;
+                }
+                NYql::NPq::NProto::StreamingDisposition disposition;
+                DeserializeBinaryProto(json, disposition);
+                // ALTER must report replay preparation errors. Compilation alone
+                // is insufficient: the disposition is cleared after the initial
+                // checkpoint confirms that the recovery plan was applied.
+                StateSaved &= !disposition.replay_state() && !disposition.has_output_start_time();
+            }
         }
 
         {   // Lease info
@@ -4051,6 +4065,7 @@ private:
                 script_secret_names,
                 retry_state,
                 start_ts,
+                streaming_disposition,
                 graph_compressed IS NOT NULL AS has_graph
             FROM `.metadata/script_executions`
             WHERE database = $database AND execution_id = $execution_id AND
@@ -4126,6 +4141,23 @@ private:
                 RetryState = std::move(*retryState);
             } else {
                 return;
+            }
+
+            if (Request.OperationStatus == Ydb::StatusIds::BAD_REQUEST) {
+                if (const auto& serialized = result.ColumnParser("streaming_disposition").GetOptionalJson()) {
+                    NJson::TJsonValue json;
+                    if (!NJson::ReadJsonTree(*serialized, &json)) {
+                        Finish(Ydb::StatusIds::INTERNAL_ERROR, "Streaming disposition is corrupted");
+                        return;
+                    }
+                    NYql::NPq::NProto::StreamingDisposition disposition;
+                    DeserializeBinaryProto(json, disposition);
+                    if (disposition.replay_state() || disposition.has_output_start_time()) {
+                        // Unsupported replay cannot succeed on retry. Report it
+                        // to ALTER while the initial checkpoint is still pending.
+                        RetryState.ClearRetryPolicyMapping();
+                    }
+                }
             }
 
             const auto& serializedMeta = result.ColumnParser("meta").GetOptionalJsonDocument();

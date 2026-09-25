@@ -35,6 +35,13 @@ message TDqPqFederatedCluster {
 
 // For streaming queries only
 message StreamingDisposition {
+    // Internal text-change recovery policy. Keep the requested disposition for
+    // fallback when history replay is impossible and replay_force is enabled.
+    bool replay_state = 6;
+    bool replay_force = 7;
+    // Inclusive output start time. Initialize from this graph, without an old checkpoint.
+    google.protobuf.Timestamp output_start_time = 8;
+
     message FromTime {
         google.protobuf.Timestamp timestamp = 1;
     }

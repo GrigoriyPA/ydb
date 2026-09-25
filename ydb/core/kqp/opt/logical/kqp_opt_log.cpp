@@ -16,6 +16,7 @@
 #include <ydb/library/yql/dq/type_ann/dq_type_ann.h>
 #include <ydb/library/yql/providers/dq/common/yql_dq_settings.h>
 #include <ydb/library/yql/providers/dq/expr_nodes/dqs_expr_nodes.h>
+#include <ydb/library/yql/providers/pq/proto/dq_io.pb.h>
 
 #include <yql/essentials/core/yql_aggregate_expander.h>
 #include <yql/essentials/core/yql_expr_type_annotation.h>
@@ -186,7 +187,11 @@ protected:
                 false,
                 TDuration::MilliSeconds(TDqSettings::TDefault::WatermarksLateArrivalDelayMs),
                 KqpCtx.Config->GetEnableWatermarks(),
-                defaultLatePolicy
+                defaultLatePolicy,
+                KqpCtx.UserRequestContext && KqpCtx.UserRequestContext->IsStreamingQuery
+                    && (KqpCtx.Config->FeatureFlags.GetEnableStreamingQueryStateRecompute()
+                        || (KqpCtx.UserRequestContext->StreamingDisposition
+                            && KqpCtx.UserRequestContext->StreamingDisposition->has_output_start_time()))
             );
         } else if (KqpCtx.Config->FeatureFlags.GetEnableStreamingAggregation() && KqpCtx.Config->EnableStreamingAggregation.Get().GetOrElse(false)) {
             output = RewriteAsStreamingAggregation(aggregate, ctx, getParents);

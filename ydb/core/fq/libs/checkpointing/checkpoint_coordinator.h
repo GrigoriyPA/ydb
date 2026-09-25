@@ -6,6 +6,7 @@
 #include <ydb/core/fq/libs/checkpointing/events/events.h>
 #include <ydb/core/fq/libs/checkpointing_common/defs.h>
 #include <ydb/core/fq/libs/checkpoint_storage/events/events.h>
+#include <ydb/core/fq/libs/state/dq_state_load_plan.h>
 #include <ydb/library/accessor/accessor.h>
 #include <ydb/library/actors/core/actor.h>
 #include <ydb/library/yql/dq/actors/compute/dq_compute_actor.h>
@@ -31,6 +32,10 @@ public:
 
     TCheckpointCoordinatorSettings();
     TCheckpointCoordinatorSettings(const NFq::NConfig::TCheckpointCoordinatorConfig& config);
+    bool ReplayState = false;
+    bool ReplayForce = false;
+    TMaybe<TInstant> OutputStartTime;
+    TReplayTopicClientFactory ReplayTopicClientFactory;
 
 private:
     YDB_ACCESSOR(TDuration, CheckpointingPeriod, DefaultCheckpointingPeriod);
@@ -63,6 +68,7 @@ public:
     void Handle(const TEvCheckpointStorage::TEvRegisterCoordinatorResponse::TPtr&);
     void Handle(const NYql::NDq::TEvDqCompute::TEvNewCheckpointCoordinatorAck::TPtr&);
     void Handle(const TEvCheckpointStorage::TEvGetCheckpointsMetadataResponse::TPtr&);
+    void Handle(const TEvCheckpointCoordinator::TEvPrepareStateLoadPlanResult::TPtr&);
     void Handle(const NYql::NDq::TEvDqCompute::TEvRestoreFromCheckpointResult::TPtr&);
     void Handle(const TEvCheckpointCoordinator::TEvScheduleCheckpointing::TPtr&);
     void Handle(const TEvCheckpointStorage::TEvCreateCheckpointResponse::TPtr&);
@@ -88,6 +94,7 @@ public:
 
         hFunc(TEvCheckpointStorage::TEvRegisterCoordinatorResponse, Handle)
         hFunc(TEvCheckpointStorage::TEvGetCheckpointsMetadataResponse, Handle)
+        hFunc(TEvCheckpointCoordinator::TEvPrepareStateLoadPlanResult, Handle)
         hFunc(TEvCheckpointStorage::TEvCreateCheckpointResponse, Handle)
         hFunc(TEvCheckpointStorage::TEvSetCheckpointPendingCommitStatusResponse, Handle)
         hFunc(TEvCheckpointStorage::TEvCompleteCheckpointResponse, Handle)
@@ -121,6 +128,7 @@ private:
     void PassAway() override;
     void RestoreFromOwnCheckpoint(const TCheckpointMetadata& checkpoint);
     void TryToRestoreOffsetsFromForeignCheckpoint(const TCheckpointMetadata& checkpoint);
+    void PrepareOutputStartTimeReplay();
     void StartAllTasks();
 
     void OnError(NYql::NDqProto::StatusIds::StatusCode statusCode, const TString& message, const NYql::TIssues& subIssues);
@@ -219,6 +227,8 @@ private:
     THashMap<TCheckpointId, TPendingCheckpoint, TCheckpointIdHash> PendingCheckpoints;
     THashMap<TCheckpointId, TPendingCheckpoint, TCheckpointIdHash> PendingCommitCheckpoints;
     TMaybe<TPendingRestoreCheckpoint> PendingRestoreCheckpoint;
+    TMaybe<TCheckpointMetadata> PendingPrepareStateLoadPlanCheckpoint;
+    TActorId StateLoadPlanResolver;
     std::unique_ptr<TPendingInitCoordinator> PendingInit;
     TScheduleCheckpointContext ScheduleCheckpointContext;
     bool GraphIsRunning = false;

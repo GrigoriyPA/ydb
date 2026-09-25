@@ -3,11 +3,11 @@
 
 #include <ydb/core/fq/libs/checkpointing/events/events.h>
 #include <ydb/core/fq/libs/config/protos/checkpoint_coordinator.pb.h>
+#include <ydb/core/fq/libs/state/dq_state_load_plan.h>
 
 #include <ydb/library/actors/core/log.h>
 #include <ydb/library/actors/core/hfunc.h>
 #include <ydb/library/yql/dq/actors/dq.h>
-#include <ydb/core/fq/libs/state/dq_state_load_plan.h>
 
 #include <util/string/builder.h>
 #include <util/system/env.h>
@@ -105,6 +105,10 @@ void TCheckpointCoordinator::Handle(NFq::TEvCheckpointCoordinator::TEvReadyState
         {"actorsToWaitForCount", ActorsToWaitFor.size()});
 
     if (ActorsToTrigger.empty()) {
+        if (StateLoadMode == FederatedQuery::EMPTY && Settings.OutputStartTime) {
+            OnError(NYql::NDqProto::StatusIds::BAD_REQUEST, "OUTPUT_START_TIME requires topic inputs", {});
+            return;
+        }
         YDB_LOG_DEBUG("No ingress tasks, coordinator was disabled",
             {"coordinatorId", CoordinatorId});
         StartAllTasks();
@@ -221,9 +225,16 @@ void TCheckpointCoordinator::Handle(const TEvCheckpointStorage::TEvRegisterCoord
         transport->EventsQueue.Send(new NYql::NDq::TEvDqCompute::TEvNewCheckpointCoordinator(CoordinatorId.Generation, CoordinatorId.GraphId));
     }
 
-    const bool needCheckpointMetadata = StateLoadMode == FederatedQuery::StateLoadMode::FROM_LAST_CHECKPOINT || StreamingDisposition.has_from_last_checkpoint();
+    if (StateLoadMode == FederatedQuery::StateLoadMode::EMPTY && Settings.OutputStartTime) {
+        PrepareOutputStartTimeReplay();
+        return;
+    }
+
+    const bool needCheckpointMetadata = StateLoadMode == FederatedQuery::StateLoadMode::FROM_LAST_CHECKPOINT
+        || StreamingDisposition.has_from_last_checkpoint() || Settings.ReplayState;
     if (needCheckpointMetadata) {
-        const bool loadGraphDescription = StateLoadMode == FederatedQuery::StateLoadMode::EMPTY && StreamingDisposition.has_from_last_checkpoint(); // Continue mode
+        const bool loadGraphDescription = StateLoadMode == FederatedQuery::StateLoadMode::EMPTY
+            && (StreamingDisposition.has_from_last_checkpoint() || Settings.ReplayState);
         YDB_LOG_INFO("Send TEvGetCheckpointsMetadataRequest",
             {"coordinatorId", CoordinatorId},
             {"stateLoadMode", FederatedQuery::StateLoadMode_Name(StateLoadMode)},
@@ -287,12 +298,18 @@ void TCheckpointCoordinator::Handle(const TEvCheckpointStorage::TEvGetCheckpoint
     if (!checkpoints.empty()) {
         const auto& checkpoint = checkpoints.at(0);
         CheckpointIdGenerator = std::make_unique<TCheckpointIdGenerator>(CoordinatorId, checkpoint.CheckpointId);
-        const bool needRestoreOffsets = StateLoadMode == FederatedQuery::StateLoadMode::EMPTY && StreamingDisposition.has_from_last_checkpoint();
+        const bool needRestoreOffsets = StateLoadMode == FederatedQuery::StateLoadMode::EMPTY
+            && (StreamingDisposition.has_from_last_checkpoint() || Settings.ReplayState);
         if (needRestoreOffsets) {
             TryToRestoreOffsetsFromForeignCheckpoint(checkpoint);
         } else {
             RestoreFromOwnCheckpoint(checkpoint);
         }
+        return;
+    }
+
+    if (Settings.ReplayState && !Settings.ReplayForce) {
+        OnError(NYql::NDqProto::StatusIds::BAD_REQUEST, "Cannot replay history without a previous checkpoint", {});
         return;
     }
 
@@ -332,14 +349,45 @@ void TCheckpointCoordinator::TryToRestoreOffsetsFromForeignCheckpoint(const TChe
         return;
     }
 
-    NYql::TIssues issues;
-    THashMap<ui64, NYql::NDqProto::NDqStateLoadPlan::TTaskPlan> plan;
-    const bool result = MakeContinueFromStreamingOffsetsPlan(
+    PendingPrepareStateLoadPlanCheckpoint = checkpoint;
+    TStateLoadPlanResolverSettings settings;
+    settings.StorageProxy = StorageProxy;
+    settings.GraphId = CoordinatorId.GraphId;
+    settings.Checkpoint.SetId(checkpoint.CheckpointId.SeqNo);
+    settings.Checkpoint.SetGeneration(checkpoint.CheckpointId.CoordinatorGeneration);
+    settings.CoordinatorGeneration = CoordinatorId.Generation;
+    settings.Replay = Settings.ReplayState;
+    settings.Force = settings.Replay ? Settings.ReplayForce : StreamingDisposition.from_last_checkpoint().force();
+    settings.ContinueFromOffsets = StreamingDisposition.has_from_last_checkpoint();
+    settings.TopicClientFactory = Settings.ReplayTopicClientFactory;
+    StateLoadPlanResolver = Register(CreateStateLoadPlanResolver(
         checkpoint.Graph->GetTasks(),
         GraphParams.GetTasks(),
-        StreamingDisposition.from_last_checkpoint().force(),
-        plan,
-        issues);
+        std::move(settings)));
+}
+
+void TCheckpointCoordinator::PrepareOutputStartTimeReplay() {
+    // A synthetic restore barrier applies the initial states before any input
+    // is read. No checkpoint metadata or task state is needed for this mode.
+    CheckpointIdGenerator = std::make_unique<TCheckpointIdGenerator>(CoordinatorId);
+    const auto checkpointId = CheckpointIdGenerator->NextId();
+    PendingPrepareStateLoadPlanCheckpoint.ConstructInPlace(CoordinatorId.GraphId, checkpointId,
+        ECheckpointStatus::Completed, TInstant::Zero(), TInstant::Zero());
+    RestoringFromForeignCheckpoint = true;
+    TStateLoadPlanResolverSettings settings;
+    settings.OutputStartTimeUs = Settings.OutputStartTime->MicroSeconds();
+    settings.UseSourceDisposition = StreamingDisposition.GetDispositionCase() != FederatedQuery::StreamingDisposition::DISPOSITION_NOT_SET;
+    settings.TopicClientFactory = Settings.ReplayTopicClientFactory;
+    StateLoadPlanResolver = Register(CreateStateLoadPlanResolver({}, GraphParams.GetTasks(), std::move(settings)));
+}
+
+void TCheckpointCoordinator::Handle(const TEvCheckpointCoordinator::TEvPrepareStateLoadPlanResult::TPtr& ev) {
+    YQL_ENSURE(PendingPrepareStateLoadPlanCheckpoint && ev->Sender == StateLoadPlanResolver, "Unexpected state load plan result");
+    StateLoadPlanResolver = {};
+    const auto& checkpoint = *PendingPrepareStateLoadPlanCheckpoint;
+    const auto result = ev->Get()->Result;
+    const auto& plan = ev->Get()->Plan;
+    auto issues = std::move(ev->Get()->Issues);
 
     if (issues) {
         YDB_LOG_INFO("Issues while building continue-from-streaming-offsets restore plan",
@@ -385,6 +433,7 @@ void TCheckpointCoordinator::TryToRestoreOffsetsFromForeignCheckpoint(const TChe
                     taskPlan));
         }
     }
+    PendingPrepareStateLoadPlanCheckpoint.Clear();
 }
 
 void TCheckpointCoordinator::Handle(const NYql::NDq::TEvDqCompute::TEvRestoreFromCheckpointResult::TPtr& ev) {
@@ -864,6 +913,9 @@ void TCheckpointCoordinator::Handle(const TEvCheckpointCoordinator::TEvRunGraph:
 }
 
 void TCheckpointCoordinator::PassAway() {
+    if (StateLoadPlanResolver) {
+        Send(StateLoadPlanResolver, new TEvents::TEvPoison());
+    }
     YDB_LOG_DEBUG("PassAway",
         {"coordinatorId", CoordinatorId});
     for (const auto& [actorId, transport] : AllActors) {

@@ -14062,6 +14062,60 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
         UNIT_ASSERT_LE(actual, after);
     }
 
+    Y_UNIT_TEST(StreamingQueryOutputStartTimeWithReadFrom) {
+        auto kikimr = SetupStreamingSource();
+        auto& runtime = *kikimr->GetTestServer().GetRuntime();
+        auto db = kikimr->GetQueryClient();
+        const auto timestamp = TInstant::ParseIso8601("2025-05-04T11:30:34.336938Z");
+        const std::vector<std::pair<TString, TInstant>> outputTimes = {
+            {"Timestamp(\"1970-01-01T00:00:00Z\")", TInstant::Zero()},
+            {"$timestamp", timestamp},
+            {"Just($timestamp)", timestamp},
+            {"$timestamp + Interval(\"PT1S\")", timestamp + TDuration::Seconds(1)},
+        };
+        for (const bool alter : {false, true}) {
+            for (const TString& readFrom : {"", "EARLIEST", "LATEST", "$timestamp - Interval(\"PT2S\")"}) {
+                NYql::NPq::NProto::StreamingDisposition expected;
+                if (readFrom == "EARLIEST") {
+                    expected.mutable_oldest();
+                } else if (readFrom == "LATEST") {
+                    expected.mutable_fresh();
+                } else if (readFrom) {
+                    *expected.mutable_from_time()->mutable_timestamp() = NProtoInterop::CastToProto(timestamp - TDuration::Seconds(2));
+                }
+                for (const auto& [output, outputTime] : outputTimes) {
+                    *expected.mutable_output_start_time() = NProtoInterop::CastToProto(outputTime);
+                    const TString query = TStringBuilder()
+                        << "$timestamp = Timestamp(\"2025-05-04T11:30:34.336938Z\"); "
+                        << (alter ? "ALTER STREAMING QUERY MyQuery SET (" : "CREATE OR REPLACE STREAMING QUERY MyQuery WITH (")
+                        << "RUN = FALSE, OUTPUT_START_TIME = " << output
+                        << (readFrom ? TString(", READ_FROM = ") + readFrom : TString()) << ")"
+                        << (alter ? ";" : " AS DO BEGIN INSERT INTO MySource.MyTopic SELECT * FROM MySource.MyTopic END DO;");
+                    const auto result = db.ExecuteQuery(query, NQuery::TTxControl::NoTx()).ExtractValueSync();
+                    UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, query << "\n" << result.GetIssues().ToString());
+                    CheckObjectProperties(runtime, "/Root/MyQuery", {
+                        {"streaming_disposition", expected.SerializeAsString()},
+                        {"run", "false"},
+                    });
+                }
+            }
+        }
+
+        const auto before = TInstant::Now() - TDuration::Seconds(1);
+        const auto result = db.ExecuteQuery("ALTER STREAMING QUERY MyQuery SET (OUTPUT_START_TIME = CurrentUtcTimestamp() - Interval(\"PT1S\"));",
+            NQuery::TTxControl::NoTx()).ExtractValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+        const auto after = TInstant::Now() - TDuration::Seconds(1);
+        const auto entry = Navigate(runtime, runtime.AllocateEdgeActor(), "/Root/MyQuery", NSchemeCache::TSchemeCacheNavigate::EOp::OpUnknown);
+        const auto& properties = entry->ResultSet.at(0).StreamingQueryInfo->Description.GetProperties().GetProperties();
+        NYql::NPq::NProto::StreamingDisposition disposition;
+        UNIT_ASSERT(disposition.ParseFromString(properties.at("streaming_disposition")));
+        UNIT_ASSERT(disposition.has_output_start_time());
+        const auto actual = NProtoInterop::CastFromProto(disposition.output_start_time());
+        UNIT_ASSERT_GE(actual, before);
+        UNIT_ASSERT_LE(actual, after);
+    }
+
     void CheckStreamingQuerySettingError(const TStatus& result, const TString& query, const TString& expectedError,
         EStatus expectedStatus = EStatus::GENERIC_ERROR)
     {
@@ -14112,6 +14166,25 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
             << (alter ? "ALTER STREAMING QUERY MyQuery SET (" : "CREATE STREAMING QUERY MyQuery WITH (")
             << setting << ")"
             << (alter ? ";" : " AS DO BEGIN INSERT INTO MySource.MyTopic SELECT * FROM MySource.MyTopic END DO;");
+    }
+
+    Y_UNIT_TEST_TWIN(StreamingQueryOutputStartTimeValidation, Alter) {
+        auto kikimr = SetupStreamingSource();
+        auto db = kikimr->GetQueryClient();
+        for (const TString& value : {
+            "EARLIEST", "LATEST", "\"2025-05-04T11:30:34.336938Z\"", "\"1746358234000000\"",
+            "1234567", "TRUE", "NULL", "Date(\"2025-05-04\")", "Datetime(\"2025-05-04T11:30:34Z\")",
+            "Interval(\"PT1S\")", "Nothing(Timestamp?)", "Just(Just(Timestamp(\"2025-05-04T11:30:34Z\")))",
+            "CAST(\"not a timestamp\" AS Timestamp)", "Timestamp(\"1970-01-01T00:00:00Z\") - Interval(\"PT1S\")",
+            "Just(1234567)", "[Timestamp(\"2025-05-04T11:30:34Z\")]",
+        }) {
+            const auto query = StreamingQueryWithSetting(Alter, "OUTPUT_START_TIME = " + value);
+            for (const auto mode : {NQuery::EExecMode::Explain, NQuery::EExecMode::Execute}) {
+                const auto result = db.ExecuteQuery(query, NQuery::TTxControl::NoTx(),
+                    NQuery::TExecuteQuerySettings().ExecMode(mode)).ExtractValueSync();
+                CheckStreamingQuerySettingError(result, query, "Timestamp");
+            }
+        }
     }
 
     Y_UNIT_TEST(StreamingQuerySettingFilledOptionalLiterals) {
@@ -14203,6 +14276,8 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
         for (const TString& setting : {
             "READ_FROM = $timestamp",
             "READ_FROM = $timestamp + Interval(\"PT1S\")",
+            "OUTPUT_START_TIME = $timestamp",
+            "OUTPUT_START_TIME = $timestamp + Interval(\"PT1S\")",
             "RESOURCE_POOL = \"prefix_\" || $pool",
         }) {
             const TString query = TStringBuilder()
@@ -14243,6 +14318,8 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
         for (const TString& setting : {
             "READ_FROM = Unwrap($rows)",
             "READ_FROM = Unwrap($rows + Interval(\"PT1S\"))",
+            "OUTPUT_START_TIME = Unwrap($rows)",
+            "OUTPUT_START_TIME = Unwrap($rows + Interval(\"PT1S\"))",
             "RESOURCE_POOL = Unwrap(CAST($rows AS String))",
         }) {
             const TString query = prefix + StreamingQueryWithSetting(Alter, setting);
@@ -14265,7 +14342,7 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
             {"Just(TypeHandle(Timestamp))", "Expected persistable data, but got: Optional<Resource"},
         };
         for (const auto& [value, expectedError] : cases) {
-            for (const TString& setting : {"READ_FROM", "RESOURCE_POOL"}) {
+            for (const TString& setting : {"READ_FROM", "OUTPUT_START_TIME", "RESOURCE_POOL"}) {
                 const auto query = StreamingQueryWithSetting(Alter, setting + " = " + value);
                 for (const auto mode : {NQuery::EExecMode::Explain, NQuery::EExecMode::Execute}) {
                     const auto result = db.ExecuteQuery(query, NQuery::TTxControl::NoTx(),
@@ -14279,7 +14356,7 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
     Y_UNIT_TEST_TWIN(StreamingQuerySettingEvaluationFailure, Alter) {
         auto kikimr = SetupStreamingSource();
         auto db = kikimr->GetQueryClient();
-        for (const TString& setting : {"READ_FROM", "RESOURCE_POOL"}) {
+        for (const TString& setting : {"READ_FROM", "OUTPUT_START_TIME", "RESOURCE_POOL"}) {
             const auto query = StreamingQueryWithSetting(Alter, setting + R"( =
                 Unwrap(CAST("not a timestamp" AS Timestamp), "invalid read-from timestamp"))");
             for (const auto mode : {NQuery::EExecMode::Explain, NQuery::EExecMode::Execute}) {

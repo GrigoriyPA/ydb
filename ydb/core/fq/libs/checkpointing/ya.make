@@ -14,8 +14,8 @@ PEERDIR(
     ydb/core/fq/libs/config/protos
     ydb/core/fq/libs/checkpointing_common
     ydb/core/fq/libs/checkpoint_storage/events
-    ydb/library/yql/dq/actors/compute
     ydb/core/fq/libs/state
+    ydb/library/yql/dq/actors/compute
 )
 
 YQL_LAST_ABI_VERSION()

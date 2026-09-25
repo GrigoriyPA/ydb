@@ -349,6 +349,9 @@ void TDqPqReadActorBase::SaveState(const NDqProto::TCheckpoint& /*checkpoint*/, 
         partitionState->SetCluster(cluster);
         partitionState->SetPartition(partition);
         partitionState->SetOffset(*info.Offset);
+        if (info.LastMessageWriteTime) {
+            partitionState->SetLastWriteTimeUs(info.LastMessageWriteTime.MicroSeconds());
+        }
     }
 
     SRC_LOG_D("SessionId: " << GetSessionId() << " SaveState, offsets: " << LogPartitionToOffset());
@@ -378,11 +381,16 @@ void TDqPqReadActorBase::LoadState(const TSourceState& state) {
 
         Partitions.reserve(Partitions.size() + stateProto.PartitionsSize());
         for (const auto& partitionProto : stateProto.GetPartitions()) {
-            auto& offset = Partitions[TPartitionKey{partitionProto.GetCluster(), partitionProto.GetPartition()}].Offset;
+            auto& info = Partitions[TPartitionKey{partitionProto.GetCluster(), partitionProto.GetPartition()}];
+            auto& offset = info.Offset;
             if (offset) {
                 offset = Min(*offset, partitionProto.GetOffset());
             } else {
                 offset = partitionProto.GetOffset();
+            }
+            if (partitionProto.HasLastWriteTimeUs()) {
+                const auto time = TInstant::MicroSeconds(partitionProto.GetLastWriteTimeUs());
+                info.LastMessageWriteTime = info.LastMessageWriteTime ? Min(info.LastMessageWriteTime, time) : time;
             }
         }
 

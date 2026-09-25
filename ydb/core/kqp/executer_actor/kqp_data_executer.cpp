@@ -1252,7 +1252,13 @@ private:
         NFq::NProto::TGraphParams graphParams;
         if (Request.QueryPhysicalGraph) {
             for (const auto& task : Request.QueryPhysicalGraph->GetTasks()) {
-                *graphParams.AddTasks() = task.GetDqTask();
+                auto& persistedTask = *graphParams.AddTasks();
+                persistedTask = task.GetDqTask();
+                // Physical graph persistence omits programs because they are
+                // stored in the prepared query. Checkpoint recovery needs them
+                // to inspect the previous graph after a text change.
+                const auto& stage = TasksGraph.GetStageInfo(NYql::NDq::TStageId(task.GetTxId(), task.GetDqTask().GetStageId()));
+                *persistedTask.MutableProgram() = stage.Meta.GetStage(stage.Id).GetProgram();
             }
         }
 
@@ -1288,8 +1294,17 @@ private:
             return;
         }
 
+        NFq::TCheckpointCoordinatorSettings setting;
         FederatedQuery::StreamingDisposition streamingDisposition;
         if (const auto disposition = context->StreamingDisposition) {
+            setting.ReplayState = disposition->replay_state();
+            setting.ReplayForce = disposition->replay_force();
+            if (disposition->has_output_start_time()) {
+                const auto& timestamp = disposition->output_start_time();
+                YQL_ENSURE(timestamp.seconds() >= 0 && timestamp.nanos() >= 0 && timestamp.nanos() < 1000000000
+                    && timestamp.nanos() % 1000 == 0, "Invalid OUTPUT_START_TIME timestamp");
+                setting.OutputStartTime = TInstant::Seconds(timestamp.seconds()) + TDuration::MicroSeconds(timestamp.nanos() / 1000);
+            }
             switch (disposition->GetDispositionCase()) {
                 case NYql::NPq::NProto::StreamingDisposition::kOldest:
                     *streamingDisposition.mutable_oldest() = disposition->oldest();
@@ -1323,7 +1338,28 @@ private:
             counters = counters->GetSubgroup("path", context->StreamingQueryPath);
         }
 
-        NFq::TCheckpointCoordinatorSettings setting;
+        if ((setting.ReplayState || setting.OutputStartTime) && FederatedQuerySetup) {
+            THashMap<TString, TString> secureParams;
+            for (const auto& transaction : Request.Transactions) {
+                for (const auto& stage : transaction.Body->GetStages()) {
+                    TasksGraph.FillExternalSourceSecureParams(secureParams, stage);
+                }
+            }
+            setting.ReplayTopicClientFactory = [
+                driver = FederatedQuerySetup->Driver,
+                gateway = FederatedQuerySetup->PqGatewayFactory->CreatePqGateway(),
+                credentials = FederatedQuerySetup->CredentialsFactory,
+                secureParams = std::move(secureParams)
+            ](const NYql::NPq::NProto::TDqPqTopicSource& source) {
+                const auto* token = secureParams.FindPtr(source.GetToken().GetName());
+                auto settings = gateway->GetTopicClientSettings();
+                settings.Database(source.GetDatabase())
+                    .DiscoveryEndpoint(source.GetEndpoint())
+                    .SslCredentials(NYdb::TSslCredentials(source.GetUseSsl()))
+                    .CredentialsProviderFactory(credentials->Create(token ? *token : TString{}, source.GetAddBearerToToken()));
+                return gateway->GetTopicClient(*driver, settings);
+            };
+        }
         if (const auto& checkpointInterval = context->CheckpointInterval) {
             setting.SetCheckpointingPeriod(*checkpointInterval);
         }

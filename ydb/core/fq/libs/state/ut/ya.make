@@ -5,7 +5,11 @@ SRCS(
 )
 
 PEERDIR(
+    ydb/library/actors/testlib
+    ydb/library/testlib/pq_helpers
     ydb/library/yql/providers/dq/api/protos
+    yql/essentials/parser/pg_wrapper
+    yql/essentials/public/udf/service/exception_policy
 )
 
 YQL_LAST_ABI_VERSION()
